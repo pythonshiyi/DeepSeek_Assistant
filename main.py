@@ -1382,7 +1382,7 @@ class AssistantApp:
         t = self._theme()
         self.root.title(f"{APP_NAME} {APP_NAME_EN} v{VERSION}")
         # 窗口几何：记忆优先（config window_geometry），否则默认 1280x820 居中；
-        # 屏幕内校验：窗口不得完全跑出屏幕（分辨率变化后仍可达）
+        # 屏幕内校验：尺寸超屏收缩、位置不可见时居中（分辨率变化后仍可达）
         geo = str(self.cfg.get("window_geometry") or "").strip()
         if geo and re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", geo):
             try:
@@ -1390,9 +1390,24 @@ class AssistantApp:
                 w, h = int(m.group(1)), int(m.group(2))
                 x, y = int(m.group(3)), int(m.group(4))
                 sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-                if (w >= LAYOUT["window_min_w"] and h >= LAYOUT["window_min_h"]
-                        and -200 <= x < sw - 100 and -200 <= y < sh - 100):
-                    self.root.geometry(geo)
+                if w >= LAYOUT["window_min_w"] and h >= LAYOUT["window_min_h"]:
+                    # 尺寸超出屏幕（分辨率变小/换显示器）：收缩到屏幕内，避免
+                    # 窗口整体偏右下方、底部在屏幕外
+                    if w > sw:
+                        w = sw
+                    if h > sh:
+                        h = sh
+                    # 位置校正：窗口完全落在屏幕内（多显示器负坐标/屏幕变化时
+                    # 左移或上移，保证启动即可见可用）
+                    if x < 0:
+                        x = 0
+                    if y < 0:
+                        y = 0
+                    if x + w > sw:
+                        x = max(0, sw - w)
+                    if y + h > sh:
+                        y = max(0, sh - h)
+                    self.root.geometry(f"{w}x{h}+{x}+{y}")
                     self._window_geo_restored = True
             except (AttributeError, TypeError, ValueError):
                 pass
