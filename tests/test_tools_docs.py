@@ -298,10 +298,11 @@ class TestQrcode(unittest.TestCase):
         self.assertIn("output", dc.qrcode(action="generate", text="x"))
 
     def test_read_without_pyzbar(self):
-        # 当前环境未安装 pyzbar → 应降级提示而非崩溃
+        # 模拟 pyzbar 缺失（CI 环境可能装有带 DLL 的 pyzbar wheel）→ 应降级提示而非崩溃
         p = os.path.join(self.ws, "q.png")
         dc.qrcode(action="generate", text="x", output=p)
-        out = dc.qrcode(action="read", image_path=p)
+        with mock.patch.dict("sys.modules", {"pyzbar": None, "pyzbar.pyzbar": None}):
+            out = dc.qrcode(action="read", image_path=p)
         self.assertIn("pyzbar", out)
 
     def test_read_missing_image(self):
