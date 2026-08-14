@@ -85,14 +85,45 @@ class TestCallApi(unittest.TestCase):
 
     def test_headers_limit(self):
         out = dc.call_api("https://example.com",
-                          headers={f"H{i}": "v" for i in range(12)})
+                          headers={f"H{i}": "v" for i in range(20)})
         self.assertIn("错误", out)
 
     def test_timeout_clamped(self):
         fc = FakeClient(FakeResp(content=b'{}'))
         with mock.patch("deepseek_client._http_client", return_value=fc):
             dc.call_api("https://example.com", timeout=999)
-        self.assertEqual(fc.calls[0][2]["timeout"], 60)
+        self.assertEqual(fc.calls[0][2]["timeout"], 180)
+
+    def test_whitelist_allows_private_host(self):
+        """白名单命中的内网主机放行，其余仍拦截。
+
+        注：127.0.0.1 回环本就走「本地开发验证」放行路径（与 fetch_url 同规则），
+        白名单的实际价值是显式放行 10.x / 192.168.x 等内网地址。
+        """
+        dc.CALL_API_ALLOWED_HOSTS = ["10.0.0.5"]
+        try:
+            fc = FakeClient(FakeResp(content=b'{"ok":1}'))
+            with mock.patch("deepseek_client._http_client", return_value=fc):
+                out = dc.call_api("http://10.0.0.5:8000/api")
+            self.assertIn("HTTP 200", out)
+            # 未在白名单的内网地址仍拦截
+            self.assertIn("已阻止", dc.call_api("http://10.0.0.6/x"))
+            self.assertIn("已阻止", dc.call_api("http://192.168.1.1/x"))
+        finally:
+            dc.CALL_API_ALLOWED_HOSTS = []
+
+    def test_whitelist_cleared(self):
+        """白名单可清空：清空后内网地址恢复拦截。"""
+        dc.CALL_API_ALLOWED_HOSTS = ["10.0.0.5"]
+        try:
+            fc = FakeClient(FakeResp(content=b'{}'))
+            with mock.patch("deepseek_client._http_client", return_value=fc):
+                out = dc.call_api("http://10.0.0.5:8000/x")
+            self.assertNotIn("已阻止", out)  # 白名单时放行
+            dc.CALL_API_ALLOWED_HOSTS = []
+            self.assertIn("已阻止", dc.call_api("http://10.0.0.5/x"))
+        finally:
+            dc.CALL_API_ALLOWED_HOSTS = []
 
 
 class TestSystemStatus(unittest.TestCase):

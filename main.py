@@ -436,6 +436,7 @@ DEFAULT_CONFIG = {
     "autostart": False,       # 开机自启（注册表 Run 键）
     "strict_tools": False,    # strict 工具模式（Beta）：模型严格遵循工具 JSON Schema
     "update_url": "",         # 更新检查源（latest.json，如 https://example.com/latest.json）
+    "call_api_allowed_hosts": [],  # call_api 内网/回环白名单（精确主机名，建议 IP；如 ["127.0.0.1"]）
 }
 
 VERSION = "2.12.10"
@@ -996,6 +997,15 @@ def normalize_config(cfg):
     else:
         cfg["enabled_tools"] = list(BUILTIN_TOOL_NAMES)
     cfg["system_prompt"] = str(cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT))
+    # call_api 内网白名单：用户显式放行的本地/内网服务主机（精确匹配，建议 IP）
+    try:
+        raw_allow = cfg.get("call_api_allowed_hosts") or []
+        if isinstance(raw_allow, list):
+            _dc.CALL_API_ALLOWED_HOSTS = [
+                str(h).strip() for h in raw_allow if str(h).strip()
+            ]
+    except Exception:
+        _dc.CALL_API_ALLOWED_HOSTS = []
 
     try:
         cfg["max_context_chars"] = max(10000, int(cfg.get("max_context_chars", 500000)))

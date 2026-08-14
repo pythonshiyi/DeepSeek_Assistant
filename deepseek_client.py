@@ -373,7 +373,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "call_api",
-            "description": "通用外部 API 调用（万能接口）：GET/POST/PUT/DELETE/PATCH，支持自定义查询参数/JSON 体/表单体/请求头。可对接任意开放 API（天气/翻译/大模型/企业服务等）。安全限制：仅公网 http(s) 地址（禁内网/回环），响应 ≤200KB，超时 ≤60s",
+            "description": "通用外部 API 调用（万能接口）：GET/POST/PUT/DELETE/PATCH，支持自定义查询参数/JSON 体/表单体/请求头。可对接任意开放 API（天气/翻译/大模型/企业服务等）。安全限制：仅公网 http(s) 地址（禁内网/回环，除非在配置 call_api_allowed_hosts 白名单中显式放行），响应 ≤500KB，超时 ≤180s",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -382,8 +382,8 @@ TOOLS = [
                     "params": {"type": "object", "description": "可选：查询参数对象（如 {\"limit\": 10}）"},
                     "json_body": {"type": "object", "description": "可选：JSON 请求体对象"},
                     "data": {"type": "string", "description": "可选：表单/原始请求体"},
-                    "headers": {"type": "object", "description": "可选：自定义请求头（≤8 个，如 {\"Authorization\": \"Bearer xxx\"}）"},
-                    "timeout": {"type": "integer", "description": "可选：超时秒数（1-60，默认 15）"},
+                    "headers": {"type": "object", "description": "可选：自定义请求头（≤16 个，如 {\"Authorization\": \"Bearer xxx\"}）"},
+                    "timeout": {"type": "integer", "description": "可选：超时秒数（1-180，默认 15）"},
                 },
                 "required": ["url"],
             },
@@ -3670,9 +3670,25 @@ def search_realtime(query="", num=5, source="hn"):
         return f"错误：实时信息获取失败: {e}"
 
 
-CALL_API_MAX_BYTES = 200 * 1024  # 响应体上限 200KB
+CALL_API_MAX_BYTES = 500 * 1024  # 响应体上限 500KB（与 fetch_url 输出对齐）
 CALL_API_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD")
-CALL_API_MAX_HEADERS = 8
+CALL_API_MAX_HEADERS = 16
+# 内网/回环白名单（main 从 config 的 call_api_allowed_hosts 注入）：
+# 命中精确主机名的请求跳过 SSRF 拦截——用于用户显式放行的本地服务
+# （如 127.0.0.1:8000 的本地 API），其余内网地址照常拦截。仅精确匹配，
+# 建议填 IP 而非域名（避免 DNS 重绑定绕过）。
+CALL_API_ALLOWED_HOSTS = []
+
+
+def _call_api_host_allowed(url):
+    try:
+        host = _url_host(url)
+        if not host:
+            return False
+        allow = {str(h).strip().lower() for h in CALL_API_ALLOWED_HOSTS if str(h).strip()}
+        return host.lower() in allow
+    except Exception:
+        return False
 
 
 def call_api(url, method="GET", params=None, json_body=None, data=None,
@@ -3695,13 +3711,13 @@ def call_api(url, method="GET", params=None, json_body=None, data=None,
     if not url or not str(url).startswith(("http://", "https://")):
         return "错误：url 必须以 http:// 或 https:// 开头"
     err = _safe_url(url)
-    if err:
-        return f"错误：{err}"
+    if err and not _call_api_host_allowed(url):
+        return f"错误：{err}（如需访问本地/内网服务，可在配置 call_api_allowed_hosts 中加入该主机白名单）"
     method = str(method or "GET").strip().upper()
     if method not in CALL_API_METHODS:
         return f"错误：method 仅支持 {'/'.join(CALL_API_METHODS)}"
     try:
-        timeout = max(1, min(60, int(timeout or 15)))
+        timeout = max(1, min(180, int(timeout or 15)))
     except (TypeError, ValueError):
         timeout = 15
     hdrs = {}
