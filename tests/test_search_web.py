@@ -431,6 +431,68 @@ class TestSearchWeb(unittest.TestCase):
         self.assertNotIn("example.com/0", out)
         self.assertNotIn("example.com/4", out)
 
+    # ===== search_realtime 实时通道 =====
+
+    def test_realtime_search(self):
+        payload = {"hits": [
+            {"title": "DeepSeek V4 发布", "url": "https://x.com/a",
+             "points": 500, "num_comments": 88, "objectID": "1"},
+            {"title": "无 URL 的帖子", "url": "",
+             "points": 0, "num_comments": 0, "objectID": "2"},
+        ]}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+
+        captured = {}
+
+        class FakeClient:
+            def get(self, url, **kw):
+                captured["params"] = kw.get("params")
+                return FakeResp()
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient()):
+            out = dc.search_realtime(query="deepseek", num=2)
+        self.assertIn("DeepSeek V4 发布（👍500 💬88）", out)
+        self.assertIn("https://x.com/a", out)
+        # 无 URL 时回退 HN 讨论链接
+        self.assertIn("news.ycombinator.com/item?id=2", out)
+        self.assertEqual(captured["params"]["hitsPerPage"], 2)
+
+    def test_realtime_top_stories(self):
+        class FakeResp:
+            def __init__(self, data):
+                self._data = data
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._data
+
+        calls = []
+
+        class FakeClient:
+            def get(self, url, **kw):
+                calls.append(url)
+                if "topstories" in url:
+                    return FakeResp([101, 102, 103])
+                return FakeResp({"title": f"story-{url.split('/')[-1].split('.')[0]}",
+                                 "url": "", "score": 42, "id": 101})
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient()):
+            out = dc.search_realtime(num=2)
+        self.assertIn("Hacker News 实时热点（2 条）", out)
+        self.assertIn("story-101（👍42）", out)
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_realtime_invalid_source(self):
+        self.assertIn("错误", dc.search_realtime(source="reddit"))
+
 
 if __name__ == "__main__":
     unittest.main()

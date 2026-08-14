@@ -353,6 +353,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_realtime",
+            "description": "实时信息通道（Hacker News）：不传 query 返回当前热点榜（含点赞数），传 query 走全文搜索（含点赞/评论数）。适合查询正在发生的热点、技术社区讨论、实时新闻（弥补 search_web 实时性短板）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "可选：搜索关键词；留空返回实时热点榜"},
+                    "num": {"type": "integer", "description": "可选：返回条数（1-20，默认 5）"},
+                    "source": {"type": "string", "description": "可选：数据源（当前仅支持 hn）"},
+                },
+                "required": [],
+            },
+        },
+    },
     # ===== 只读查询（需文件在允许目录内）=====
     {
         "type": "function",
@@ -1287,11 +1303,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "rss_fetch",
-            "description": "RSS 订阅管理：list 列出订阅 / add 添加源 / remove 移除源 / fetch 抓取最新条目（含标题/链接/时间/摘要）。可配合 schedule_task 生成每日简报",
+            "description": "RSS 订阅管理：list 列出订阅 / preset 一键添加精选源（机器之心/量子位/少数派/IT之家/开源中国/HN）/ add 添加源 / remove 移除源 / fetch 抓取最新条目（含标题/链接/时间/摘要）。可配合 schedule_task 生成每日简报",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "description": "list / add / remove / fetch"},
+                    "action": {"type": "string", "description": "list / preset / add / remove / fetch"},
                     "url": {"type": "string", "description": "add / fetch 时必填：RSS 源地址（http(s)）"},
                     "limit": {"type": "integer", "description": "可选：返回条数上限（默认 10，最大 20）"},
                     "since_hours": {"type": "integer", "description": "可选：只返回最近 N 小时的新条目（默认 24，0=全部）"},
@@ -3546,6 +3562,84 @@ def search_github(query, num=5, language=""):
         stars = it.get("stargazers_count", 0)
         lines.append(f"{i}. {it.get('full_name', '?')} ⭐{stars}\n   {it.get('html_url', '')}\n   {desc}".rstrip())
     return "\n\n".join(lines)
+
+
+def search_realtime(query="", num=5, source="hn"):
+    """实时信息通道：Hacker News（热点/搜索），绕开通用搜索引擎的实时性短板。
+
+    HN 无 query 时返回 Top Stories 热点；有 query 时走 Algolia 全文搜索
+    （含 points/评论数/时间）。Reddit 等源在当前网络不可达，未接入。
+    """
+    try:
+        num = max(1, min(20, int(num)))
+    except (TypeError, ValueError):
+        num = 5
+    src = str(source or "hn").strip().lower()
+    try:
+        if src != "hn":
+            return f"错误：暂不支持数据源 {src}（当前仅 hn）"
+        q = str(query or "").strip()
+        if q:
+            if len(q) > 120:
+                return "错误：搜索词过长（上限 120 字符）"
+            resp = _http_client().get(
+                "https://hn.algolia.com/api/v1/search",
+                params={"query": q, "hitsPerPage": num},
+                headers={"User-Agent": _SEARCH_UA},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            hits = (resp.json() or {}).get("hits") or []
+            if not hits:
+                return f"Hacker News 未找到与「{q}」相关的结果"
+            lines = [f"Hacker News 搜索结果（{len(hits)} 条）:"]
+            for i, h in enumerate(hits, 1):
+                title = str(h.get("title") or "").strip()[:120]
+                url = str(h.get("url") or "").strip() or (
+                    f"https://news.ycombinator.com/item?id={h.get('objectID')}"
+                )
+                pts = h.get("points") or 0
+                cmts = h.get("num_comments") or 0
+                lines.append(f"{i}. {title}（👍{pts} 💬{cmts}）\n   {url}")
+            return "\n\n".join(lines)
+        # 无 query：实时热点榜
+        resp = _http_client().get(
+            "https://hacker-news.firebaseio.com/v0/topstories.json",
+            headers={"User-Agent": _SEARCH_UA},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        ids = (resp.json() or [])[:num]
+        if not ids:
+            return "Hacker News 热点暂时为空"
+        items = []
+        for sid in ids:
+            try:
+                r = _http_client().get(
+                    f"https://hacker-news.firebaseio.com/v0/item/{sid}.json",
+                    headers={"User-Agent": _SEARCH_UA},
+                    timeout=8,
+                )
+                it = r.json()
+                if it and it.get("title"):
+                    items.append(it)
+            except Exception:
+                continue
+            if len(items) >= num:
+                break
+        if not items:
+            return "Hacker News 热点获取失败"
+        lines = [f"Hacker News 实时热点（{len(items)} 条）:"]
+        for i, it in enumerate(items, 1):
+            title = str(it.get("title") or "").strip()[:120]
+            url = str(it.get("url") or "").strip() or (
+                f"https://news.ycombinator.com/item?id={it.get('id')}"
+            )
+            pts = it.get("score") or 0
+            lines.append(f"{i}. {title}（👍{pts}）\n   {url}")
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"错误：实时信息获取失败: {e}"
 
 
 def _atomic_write(path, content):
@@ -6405,11 +6499,25 @@ def _save_rss_sources(sources):
         return False
 
 
+# 精选 RSS 预置源（action=preset 一键添加）：中文 AI/科技/开发者为主
+RSS_PRESET_SOURCES = [
+    {"name": "机器之心", "url": "https://www.jiqizhixin.com/rss"},
+    {"name": "量子位", "url": "https://www.qbitai.com/feed"},
+    {"name": "少数派", "url": "https://sspai.com/feed"},
+    {"name": "IT之家", "url": "https://www.ithome.com/rss/"},
+    {"name": "开源中国", "url": "https://www.oschina.net/news/rss"},
+    {"name": "Hacker News", "url": "https://news.ycombinator.com/rss"},
+]
+
+
 def rss_fetch(action="list", url="", limit=10, since_hours=24):
-    """RSS 订阅管理（list/add/remove）+ 抓取最新条目（标题/链接/时间/摘要）。"""
+    """RSS 订阅管理（list/add/remove/preset）+ 抓取最新条目（标题/链接/时间/摘要）。
+
+    action=preset 一键添加精选科技/AI 源（机器之心/量子位/少数派/IT之家/开源中国/HN）。
+    """
     act = str(action or "list").strip().lower()
-    if act not in ("list", "add", "remove", "fetch"):
-        return "错误：action 仅支持 list / add / remove / fetch"
+    if act not in ("list", "add", "remove", "fetch", "preset"):
+        return "错误：action 仅支持 list / add / remove / fetch / preset"
     if act in ("add", "fetch") and not str(url or "").strip():
         return f"错误：{act} 需要 url（RSS 源地址）"
     try:
@@ -6423,11 +6531,19 @@ def rss_fetch(action="list", url="", limit=10, since_hours=24):
     if act == "list":
         sources = _load_rss_sources()
         if not sources:
-            return "当前没有 RSS 订阅（用 action=add url=... 添加）"
+            return "当前没有 RSS 订阅（用 action=preset 一键添加精选源，或 action=add url=... 手动添加）"
         lines = [f"共 {len(sources)} 个订阅源："]
         for i, s in enumerate(sources, 1):
             lines.append(f"{i}. {s.get('name') or s.get('url')} | {s.get('url')}")
         return "\n".join(lines)
+    if act == "preset":
+        sources = _load_rss_sources()
+        existing = {s.get("url") for s in sources}
+        added = [s for s in RSS_PRESET_SOURCES if s["url"] not in existing]
+        if not added:
+            return "精选源均已订阅"
+        _save_rss_sources(sources + added)
+        return f"已添加 {len(added)} 个精选源：" + "、".join(s["name"] for s in added)
     if act == "add":
         u = str(url).strip()
         if len(u) > 2048 or not u.startswith(("http://", "https://")):
@@ -7220,6 +7336,7 @@ TOOL_CALL_MAP = {
     "fetch_blocked": _run_fetch_blocked,
     "search_web": search_web,
     "search_github": search_github,
+    "search_realtime": search_realtime,
     "database_query": database_query,
     "tts_save": tts_save,
     "image_process": image_process,
