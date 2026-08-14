@@ -322,10 +322,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_web",
-            "description": "联网搜索最新信息，返回相关网页的标题、链接与摘要（最多 5 条）。适合查询实时新闻、最新资讯、不熟悉的事实等；找到有用链接后可配合 fetch_url 抓取全文",
+            "description": "联网搜索最新信息，返回相关网页的标题、链接与摘要（Bing + DuckDuckGo 并行聚合去重，默认最多 5 条，可指定 num 最多 20 条）。适合查询实时新闻、最新资讯、不熟悉的事实等；找到有用链接后可配合 fetch_url 抓取全文",
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "搜索关键词（建议简洁明确）"}},
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词（建议简洁明确）"},
+                    "num": {"type": "integer", "description": "可选：返回条数（1-20，默认 5）"},
+                    "offset": {"type": "integer", "description": "可选：翻页偏移（0 起，如 5 表示第 6-10 条）"},
+                    "since": {"type": "string", "description": "可选：起始日期过滤（YYYY-MM-DD，只搜该日期之后的结果）"},
+                    "until": {"type": "string", "description": "可选：截止日期过滤（YYYY-MM-DD，只搜该日期之前的结果）"},
+                    "site": {"type": "string", "description": "可选：限定站点域名（如 openai.com），只返回该站结果"},
+                },
                 "required": ["query"],
             },
         },
@@ -3248,8 +3255,15 @@ def _decode_ddg_url(link):
     return link
 
 
-def _search_bing(query):
-    url = f"https://www.bing.com/search?q={quote(query)}&count=10&setlang=zh-CN"
+def _search_bing(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until=""):
+    url = (
+        f"https://www.bing.com/search?q={quote(query)}"
+        f"&count={num}&first={offset + 1}&setlang=zh-CN"
+    )
+    # 时间范围过滤（Bing filters 语法：ex1:"起..止"，可只给一端）
+    if since or until:
+        daterange = f"{since}..{until}" if since and until else f"{since or ''}..{until or ''}"
+        url += f"&filters=ex1:%22{daterange}%22"
     resp = _http_client().get(
         url,
         headers={"User-Agent": _SEARCH_UA, "Accept-Language": "zh-CN,zh;q=0.9"},
@@ -3265,13 +3279,15 @@ def _search_bing(query):
         snip_m = re.search(r"<p[^>]*>(.*?)</p>", rest, re.S)
         snippet = _strip_tags(snip_m.group(1)) if snip_m else ""
         results.append({"title": title, "url": link, "snippet": snippet})
-        if len(results) >= SEARCH_MAX_RESULTS:
+        if len(results) >= num:
             break
     return results
 
 
-def _search_duckduckgo(query):
+def _search_duckduckgo(query, num=SEARCH_MAX_RESULTS, since=""):
     url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+    if since:
+        url += f"&df={since}"
     resp = _http_client().get(
         url,
         headers={"User-Agent": _SEARCH_UA},
@@ -3291,33 +3307,89 @@ def _search_duckduckgo(query):
                 "snippet": _strip_tags(snippet or ""),
             }
         )
-        if len(results) >= SEARCH_MAX_RESULTS:
+        if len(results) >= num:
             break
     return results
 
 
-def search_web(query):
-    """联网搜索：Bing 为主源，DuckDuckGo 兜底，返回标题/链接/摘要。"""
+def _search_dedup(results):
+    """按规范化 URL 去重（去尾部斜杠/fragment），保留首次出现。"""
+    seen, out = set(), []
+    for r in results:
+        key = str(r.get("url") or "").rstrip("/").split("#")[0]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def _search_safe(results):
+    """结果链接安全过滤：只保留 http(s) 公网链接（回环不放行：
+    搜索结果来自外部，是 SSRF 注入源，恶意站点可注入 localhost 链接）。"""
+    return [r for r in results if not _safe_url(r["url"], allow_loopback=False)]
+
+
+def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site=""):
+    """联网搜索：Bing + DuckDuckGo 并行聚合，支持条数/翻页/时间/站点过滤。
+
+    Args:
+        query: 搜索关键词
+        num: 返回条数（1-20，默认 5）
+        offset: 翻页偏移（0 起，如 5 表示第 6-10 条；DuckDuckGo 不支持翻页）
+        since/until: 时间范围过滤（YYYY-MM-DD，可只给一端；DDG 仅支持 since）
+        site: 限定站点域名（如 "openai.com"，自动追加 site:）
+    """
     if not query or not str(query).strip():
         return "错误：搜索词为空"
-    if len(str(query)) > 200:
+    try:
+        num = max(1, min(20, int(num)))
+        offset = max(0, min(200, int(offset)))
+    except (TypeError, ValueError):
+        num, offset = SEARCH_MAX_RESULTS, 0
+    for tag, val in (("since", since), ("until", until)):
+        if val and not re.match(r"^\d{4}-\d{2}-\d{2}$", str(val)):
+            return f"错误：{tag} 日期格式应为 YYYY-MM-DD"
+    q = str(query).strip()
+    if len(q) > 200:
         return "错误：搜索词过长（上限 200 字符）"
-    last_err = None
-    for fn in (_search_bing, _search_duckduckgo):
+    site = str(site or "").strip()
+    if site:
+        if len(site) > 100 or not re.match(r"^[A-Za-z0-9.\-]+$", site):
+            return "错误：site 参数应为域名（如 openai.com）"
+        q = f"{q} site:{site}"
+    since = str(since or "").strip()
+    until = str(until or "").strip()
+
+    # 双引擎并行（Bing 支持 offset/时间范围；DDG 支持 since），聚合互补
+    import concurrent.futures as _cf
+
+    def _run(fn, **kw):
         try:
-            results = fn(str(query).strip())
+            return fn(q, **kw)
         except Exception as e:
-            last_err = e
+            return [("err", e)]
+
+    with _cf.ThreadPoolExecutor(max_workers=2) as ex:
+        f_bing = ex.submit(_run, _search_bing, num=max(num, 10), offset=offset, since=since, until=until)
+        f_ddg = ex.submit(_run, _search_duckduckgo, num=max(num, 10), since=since)
+        bing = f_bing.result()
+        ddg = f_ddg.result()
+
+    # 引擎结果先各自安全过滤；任一侧整体异常时记录但不中断
+    last_err = None
+    merged = []
+    for src in (bing, ddg):
+        if src and isinstance(src[0], tuple) and src[0][0] == "err":
+            last_err = src[0][1]
             continue
-        # 结果链接安全过滤：搜索引擎返回的链接理论上可信，但恶意站点/广告可
-        # 注入 javascript:/file: 等——只保留 http(s) 公网链接（回环不放行：
-        # 搜索结果来自外部，是 SSRF 注入源，恶意站点可注入 localhost 链接）
-        safe = [r for r in results if not _safe_url(r["url"], allow_loopback=False)]
-        if safe:
-            lines = [f"搜索结果（{len(safe)} 条）:"]
-            for i, r in enumerate(safe, 1):
-                lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}".rstrip())
-            return "\n\n".join(lines)
+        merged.extend(_search_safe(src))
+    merged = _search_dedup(merged)[:num]
+    if merged:
+        lines = [f"搜索结果（{len(merged)} 条）:"]
+        for i, r in enumerate(merged, 1):
+            lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}".rstrip())
+        return "\n\n".join(lines)
     detail = f": {last_err}" if last_err is not None else ""
     return f"错误：搜索失败（两个搜索源均不可用{detail}）"
 

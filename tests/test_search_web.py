@@ -137,6 +137,107 @@ class TestSearchWeb(unittest.TestCase):
             results = dc._search_bing("x")
         self.assertLessEqual(len(results), dc.SEARCH_MAX_RESULTS)
 
+    # ===== 搜索增强（num/offset/时间/site/聚合去重）=====
+
+    def test_aggregates_both_sources(self):
+        """两引擎都可用时结果合并（去重后按 Bing 优先顺序输出）。"""
+        def fake_get(url, **kw):
+            return FakeResp(BING_HTML if "bing.com" in url else DDG_HTML)
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient2(fake_get)):
+            result = dc.search_web("AI 新闻", num=10)
+        self.assertIn("AI 最新进展发布", result)   # Bing 结果
+        self.assertIn("DuckDuckGo 结果一", result)  # DDG 结果补充
+        self.assertIn("（4 条）", result)           # 2 + 2 无重复
+
+    def test_dedup_same_url(self):
+        """两引擎返回相同 URL 时只保留一条。"""
+        def fake_get(url, **kw):
+            return FakeResp(BING_HTML if "bing.com" in url else DDG_HTML.replace(
+                "%2Fddg1", "%2Fai-news"))  # DDG HTML 内 URL 为编码形式
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient2(fake_get)):
+            result = dc.search_web("AI 新闻", num=10)
+        self.assertIn("（3 条）", result)  # 2 + 2 - 1 重复
+        self.assertEqual(result.count("https://example.com/ai-news"), 1)
+
+    def test_num_parameter_capped(self):
+        """num 指定条数：请求 count=num，输出不超过 num 条。"""
+        captured = []
+
+        def fake_get(url, **kw):
+            captured.append(url)
+            return FakeResp(BING_HTML)
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient2(fake_get)):
+            result = dc.search_web("AI 新闻", num=1)
+        bing_url = next(u for u in captured if "bing.com" in u)
+        self.assertIn("count=1", bing_url)
+        self.assertIn("（1 条）", result)
+
+    def test_num_clamped(self):
+        """num 越界钳制：0 → 1，超大 → 20。"""
+        with patch_http(BING_HTML):
+            r0 = dc.search_web("x", num=0)
+        self.assertIn("（1 条）", r0)
+        with patch_http(BING_HTML):
+            rbig = dc.search_web("x", num=999)
+        self.assertIn("（2 条）", rbig)  # mock 只有 2 条
+
+    def test_offset_in_url(self):
+        """offset 翻页：Bing URL 带 first=offset+1。"""
+        captured = []
+
+        def fake_get(url, **kw):
+            captured.append(url)
+            return FakeResp(BING_HTML)
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient2(fake_get)):
+            dc.search_web("x", offset=5)
+        bing_url = next(u for u in captured if "bing.com" in u)
+        self.assertIn("first=6", bing_url)
+
+    def test_since_until_in_url(self):
+        """时间过滤：Bing 带 filters 日期范围，DDG 带 df=since。"""
+        captured = []
+
+        def fake_get(url, **kw):
+            captured.append(url)
+            return FakeResp(BING_HTML if "bing.com" in url else DDG_HTML)
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient2(fake_get)):
+            dc.search_web("x", since="2026-08-01", until="2026-08-15")
+        bing_url = next(u for u in captured if "bing.com" in u)
+        ddg_url = next(u for u in captured if "duckduckgo.com" in u)
+        self.assertIn("filters=ex1:%222026-08-01..2026-08-15%22", bing_url)
+        self.assertIn("df=2026-08-01", ddg_url)
+
+    def test_site_filter_appended(self):
+        """site 限定：query 自动追加 site: 域名。"""
+        captured = []
+
+        def fake_get(url, **kw):
+            captured.append(url)
+            return FakeResp(BING_HTML if "bing.com" in url else DDG_HTML)
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient2(fake_get)):
+            dc.search_web("OpenAI", site="openai.com")
+        for u in captured:
+            self.assertIn("site%3Aopenai.com", u)  # quote() 编码 site:
+
+    def test_invalid_site_rejected(self):
+        with patch_http(BING_HTML):
+            r = dc.search_web("x", site="bad site!")
+        self.assertIn("错误", r)
+
+    def test_invalid_date_rejected(self):
+        with patch_http(BING_HTML):
+            r1 = dc.search_web("x", since="2026/08/01")
+        self.assertIn("错误", r1)
+        with patch_http(BING_HTML):
+            r2 = dc.search_web("x", until="昨天")
+        self.assertIn("错误", r2)
+
 
 if __name__ == "__main__":
     unittest.main()
