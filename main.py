@@ -6606,6 +6606,39 @@ class AssistantApp:
         except Exception:
             return ""
 
+    def _record_reflection(self, ok_n, fail_n, fail_items):
+        """自动经验复盘：任务有失败时把结构化经验沉淀到长期记忆。
+
+        内容：最近任务主题 + 成功/失败统计 + 失败工具与错误首行（去重）。
+        记忆随每次请求注入，AI 跨会话遇到同类任务能主动规避已知坑——
+        这是「越用越聪明」的经验沉淀（成功模式已由 patterns.json 覆盖，
+        此处只记失败，避免记忆膨胀；隐私模式跳过）。
+        """
+        try:
+            if self.cfg.get("privacy_mode"):
+                return
+            import deepseek_client as _dc_ref
+
+            topic = ""
+            for mm in reversed(self.messages):
+                if mm.get("role") == "user" and mm.get("content"):
+                    topic = " ".join(str(mm["content"]).split())[:60]
+                    break
+            lines = [f"任务复盘：{topic or '未命名任务'}"]
+            lines.append(f"- 工具 {ok_n} 成功 / {fail_n} 失败")
+            seen = set()
+            for fi in (fail_items or [])[:6]:
+                key = str(fi.get("tool") or "?")
+                if key in seen:
+                    continue
+                seen.add(key)
+                err = str(fi.get("error") or "")[:90]
+                lines.append(f"- ⚠ {key}: {err}")
+            lines.append(f"- 时间：{datetime.now():%Y-%m-%d %H:%M}")
+            _dc_ref.write_memory("\n".join(lines), "经验复盘")
+        except Exception:
+            logging.exception("自动经验复盘写入失败")
+
     def show_tasklog(self):
         t = self._theme()
         data = self._load_tasklog()
@@ -10775,6 +10808,9 @@ class AssistantApp:
             elif fail_n > 0 and not self.cfg.get("privacy_mode"):
                 # 失败模式积累：供后续任务注入「已知失败模式」帮助 AI 规避
                 self._append_failures(fail_items)
+                # 自动经验复盘：把本次失败经验沉淀到长期记忆（跨会话复用，
+                # 记忆随每次请求注入，AI 下次遇到同类任务能主动规避）
+                self._record_reflection(ok_n, fail_n, fail_items)
             if ok_n >= 1:
                 self._record_tasklog()
             if aborted:

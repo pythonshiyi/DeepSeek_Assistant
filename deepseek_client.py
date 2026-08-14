@@ -369,6 +369,34 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_api",
+            "description": "通用外部 API 调用（万能接口）：GET/POST/PUT/DELETE/PATCH，支持自定义查询参数/JSON 体/表单体/请求头。可对接任意开放 API（天气/翻译/大模型/企业服务等）。安全限制：仅公网 http(s) 地址（禁内网/回环），响应 ≤200KB，超时 ≤60s",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "完整 API 地址（http/https）"},
+                    "method": {"type": "string", "description": "请求方法：GET/POST/PUT/DELETE/PATCH/HEAD（默认 GET）"},
+                    "params": {"type": "object", "description": "可选：查询参数对象（如 {\"limit\": 10}）"},
+                    "json_body": {"type": "object", "description": "可选：JSON 请求体对象"},
+                    "data": {"type": "string", "description": "可选：表单/原始请求体"},
+                    "headers": {"type": "object", "description": "可选：自定义请求头（≤8 个，如 {\"Authorization\": \"Bearer xxx\"}）"},
+                    "timeout": {"type": "integer", "description": "可选：超时秒数（1-60，默认 15）"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system_status",
+            "description": "系统资源自检：CPU 使用率、内存占用、工作区磁盘剩余、网络连通性（api.github.com/bing/api.deepseek.com）。适合任务前环境体检、排查网络/资源问题",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
     # ===== 只读查询（需文件在允许目录内）=====
     {
         "type": "function",
@@ -3640,6 +3668,127 @@ def search_realtime(query="", num=5, source="hn"):
         return "\n\n".join(lines)
     except Exception as e:
         return f"错误：实时信息获取失败: {e}"
+
+
+CALL_API_MAX_BYTES = 200 * 1024  # 响应体上限 200KB
+CALL_API_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD")
+CALL_API_MAX_HEADERS = 8
+
+
+def call_api(url, method="GET", params=None, json_body=None, data=None,
+             headers=None, timeout=15):
+    """通用外部 API 调用（自主 AI 的"万能接口"）。
+
+    支持 GET/POST/PUT/DELETE/PATCH/HEAD，自定义查询参数/JSON 体/表单体/请求头。
+    安全约束：仅 http(s) 公网地址（SSRF 防护，与 fetch_url 同规则）；请求头
+    禁止 CRLF 注入；响应体 ≤200KB 截断；超时上限 60s。
+
+    Args:
+        url: 完整 API 地址（http/https）
+        method: 请求方法（默认 GET）
+        params: 可选，查询参数 dict（如 {"limit": 10}）
+        json_body: 可选，JSON 请求体 dict
+        data: 可选，表单/原始请求体
+        headers: 可选，自定义请求头 dict（≤8 个）
+        timeout: 可选，超时秒数（1-60，默认 15）
+    """
+    if not url or not str(url).startswith(("http://", "https://")):
+        return "错误：url 必须以 http:// 或 https:// 开头"
+    err = _safe_url(url)
+    if err:
+        return f"错误：{err}"
+    method = str(method or "GET").strip().upper()
+    if method not in CALL_API_METHODS:
+        return f"错误：method 仅支持 {'/'.join(CALL_API_METHODS)}"
+    try:
+        timeout = max(1, min(60, int(timeout or 15)))
+    except (TypeError, ValueError):
+        timeout = 15
+    hdrs = {}
+    if headers:
+        if not isinstance(headers, dict):
+            return "错误：headers 必须是键值对象"
+        if len(headers) > CALL_API_MAX_HEADERS:
+            return f"错误：headers 最多 {CALL_API_MAX_HEADERS} 个"
+        for k, v in headers.items():
+            k, v = str(k).strip(), str(v or "").strip()
+            if not k or not re.match(r"^[A-Za-z0-9\-]+$", k):
+                return f"错误：请求头名称不合法：{k}"
+            if "\r" in v or "\n" in v:
+                return "错误：请求头值禁止包含换行（防 CRLF 注入）"
+            hdrs[k] = v
+    try:
+        kw = {"params": params} if params else {}
+        if json_body is not None:
+            kw["json"] = json_body
+        if data is not None:
+            kw["data"] = data
+        resp = _http_client().request(
+            method, url, headers=hdrs or None, timeout=timeout, **kw
+        )
+        body = resp.content
+        truncated = len(body) > CALL_API_MAX_BYTES
+        text = body[:CALL_API_MAX_BYTES].decode("utf-8", errors="replace")
+        # JSON 美化输出（若可解析），便于阅读
+        try:
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                import json as _json
+                text = _json.dumps(_json.loads(text), ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        head = f"HTTP {resp.status_code} · {method} {url.split('?')[0][:80]}"
+        if truncated:
+            head += f" · 响应已截断（>200KB，显示前 200KB）"
+        return f"{head}\n\n{text}" if text.strip() else head
+    except Exception as e:
+        return f"错误：API 调用失败（{type(e).__name__}: {str(e)[:120]}）"
+
+
+def system_status():
+    """系统资源自检：CPU / 内存 / 磁盘 / 网络连通性（自主 AI 的"体检"能力）。
+
+    psutil 可选（缺失时 CPU/内存降级提示）；网络连通性探测
+    api.github.com / bing / api.deepseek.com 三个关键端点。
+    """
+    lines = ["系统状态："]
+    try:
+        import psutil
+
+        cpu = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        lines.append(f"- CPU：{cpu:.0f}% 使用（{psutil.cpu_count()} 核）")
+        lines.append(
+            f"- 内存：{mem.used / 1024 ** 3:.1f}GB / {mem.total / 1024 ** 3:.1f}GB"
+            f"（{mem.percent:.0f}%）"
+        )
+    except ImportError:
+        lines.append("- CPU/内存：需安装 psutil（pip install psutil）获得详情")
+    except Exception as e:
+        lines.append(f"- CPU/内存：读取失败（{e}）")
+    try:
+        base = permissions.WORKSPACE_DIR or os.getcwd()
+        du = shutil.disk_usage(base)
+        lines.append(
+            f"- 磁盘（工作区）：剩余 {du.free / 1024 ** 3:.1f}GB / 总 {du.total / 1024 ** 3:.1f}GB"
+        )
+    except Exception:
+        pass
+    reach = []
+    for host, port in (
+        ("api.github.com", 443),
+        ("www.bing.com", 443),
+        ("api.deepseek.com", 443),
+    ):
+        try:
+            import socket
+
+            s = socket.create_connection((host, port), timeout=1.5)
+            s.close()
+            reach.append(f"{host} ✓")
+        except Exception:
+            reach.append(f"{host} ✗")
+    lines.append("- 网络：" + " ".join(reach))
+    return "\n".join(lines)
 
 
 def _atomic_write(path, content):
@@ -7337,6 +7486,8 @@ TOOL_CALL_MAP = {
     "search_web": search_web,
     "search_github": search_github,
     "search_realtime": search_realtime,
+    "call_api": call_api,
+    "system_status": system_status,
     "database_query": database_query,
     "tts_save": tts_save,
     "image_process": image_process,

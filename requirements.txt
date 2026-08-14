@@ -42,3 +42,5 @@ faster-whisper>=1.0.0
 playwright>=1.40.0
 # 可选：被墙站点抓取主路径（fetch_blocked，Chrome 指纹可过 Cloudflare；缺失时自动降级标准库 TLS-in-TLS）
 curl_cffi>=0.7.0
+# 可选：系统资源自检（system_status 的 CPU/内存详情；缺失时降级为磁盘+网络）
+psutil>=5.9.0
