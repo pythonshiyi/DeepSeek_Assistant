@@ -1,0 +1,29 @@
+{
+  "format": "wtplugin",
+  "version": 1,
+  "meta": {
+    "name": "会议纪要助手",
+    "description": "会议内容转结构化纪要（主题/参会/决策/待办/风险），含一键生成流程",
+    "author": "鲸语",
+    "version": "1.0.0",
+    "icon": "📋"
+  },
+  "requires": [],
+  "contents": {
+    "skills": [
+      {
+        "name": "会议纪要模板",
+        "text": "将以下会议内容整理为结构化纪要（主题 / 参会 / 决策 / 待办（标注负责人与期限）/ 风险）：\n{{TEXT}}"
+      }
+    ],
+    "workflows": {
+      "会议纪要流程": {
+        "steps": [
+          {
+            "text": "整理会议纪要：使用「会议纪要模板」技能格式化以下内容，完成后用 create_doc 保存到工作区 meeting-notes/ 目录：{{TEXT}}"
+          }
+        ]
+      }
+    }
+  }
+}

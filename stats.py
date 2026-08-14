@@ -4,13 +4,17 @@ import os
 import threading
 from datetime import date
 
+from shared import is_peak_hour
+
+# 元 / 百万 tokens（2026-08-17 起生效的 V4 正式版峰谷定价——此处为高峰时段价格，
+# 空闲时段价格为高峰的一半，estimate_cost 按当前时段自动打折）
+# 官方价格：缓存命中输入 / 缓存未命中输入 / 输出
 PRICING = {
-    # 元 / 百万 tokens（2026-07 官方价格：缓存未命中输入 / 缓存命中 / 输出）
-    "deepseek-v4-flash": {"prompt": 1.0, "completion": 2.0, "cache_hit": 0.02},
-    "deepseek-v4-pro": {"prompt": 3.0, "completion": 6.0, "cache_hit": 0.025},
+    "deepseek-v4-flash": {"prompt": 3.0, "completion": 9.0, "cache_hit": 0.10},
+    "deepseek-v4-pro": {"prompt": 9.0, "completion": 27.0, "cache_hit": 0.30},
 }
 
-DEFAULT_PRICE = {"prompt": 1.0, "completion": 2.0, "cache_hit": 0.02}
+DEFAULT_PRICE = {"prompt": 3.0, "completion": 9.0, "cache_hit": 0.10}
 
 _EMPTY_DAY = {"prompt": 0, "completion": 0, "cache_hit": 0, "cache_miss": 0}
 _LOCK = threading.Lock()
@@ -119,7 +123,10 @@ def model_total(data, model):
 
 
 def estimate_cost(usage, model):
-    """按定价估算费用（元）。"""
+    """按定价估算费用（元）。高峰时段按表价，空闲时段（9:00 前/12-14/18:00 后）打 5 折。
+
+    PRICING 存高峰价：官方峰谷定价规定「空闲时段价格为高峰时段价格的一半」。
+    """
     price = PRICING.get(model, DEFAULT_PRICE)
     miss = usage.get("prompt", 0) - usage.get("cache_hit", 0)
     miss = max(0, miss)
@@ -128,6 +135,8 @@ def estimate_cost(usage, model):
         + usage.get("cache_hit", 0) * price["cache_hit"]
         + usage.get("completion", 0) * price["completion"]
     ) / 1_000_000
+    if not is_peak_hour():
+        cost /= 2
     return cost
 
 

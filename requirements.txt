@@ -20,6 +20,10 @@ pyzbar>=0.1.9
 diskcache>=5.6
 # 可选：音视频处理（media_ffmpeg，内置 ffmpeg 二进制）
 imageio-ffmpeg>=0.4.9
+# 可选：公众号写作工具 HTML 输出（wechat_writer/output.py）
+markdown>=3.5
+# 可选：系统托盘常驻（未安装时托盘功能自动禁用；需 Pillow 生成图标）
+pystray>=0.19.5
 # 可选：图片处理（image_process / image_understand / 屏幕截图）
 Pillow>=10.0
 # 可选：Office 文档（create_doc 的 .docx 支持 / docx_read）

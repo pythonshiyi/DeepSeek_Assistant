@@ -8,6 +8,9 @@ data/
 backups/
 evolutions/
 
+# ===== 本地配置（用户自定义，不入库） =====
+wechat_writer/config.json
+
 # ===== 内部开发文档（一次性诊断产物，不入库） =====
 full_access_report.md
 

@@ -83,8 +83,11 @@ def save_article(article, config, drafts_dir=None, archive_dir=None, data_dir=No
 
 def _to_html(title, md_text):
     """极简 md → HTML（段落/标题/列表/代码块/粗体/引用）。"""
-    import markdown
-
+    try:
+        import markdown
+    except ImportError:
+        logger.warning("HTML 输出需要 markdown 包（pip install markdown），本次跳过 HTML 生成")
+        return ""
     body = markdown.markdown(
         md_text,
         extensions=["fenced_code", "tables", "sane_lists"],

@@ -273,5 +273,97 @@ class TestRenderAllScaling(PerfBase):
         self.assertIn("回答59第二段", content)
 
 
+class TestFinishAborted(PerfBase):
+    """修复回归：生成被截断/中断时 _finish 必须报告「任务中断」而非「任务完成」。"""
+
+    def _round_with_fail_tool(self):
+        self.app._begin_assistant()
+        self.app._push_tool("write_file", {"path": "x"}, "错误：内容超限")
+        self.app._drain_ui_queue()
+        self.app._flush_pending()
+        self.app._push_content("部分回复")
+        self.app._drain_ui_queue()
+        self.app._flush_pending()
+
+    def test_aborted_marks_interrupted(self):
+        self._round_with_fail_tool()
+        self.app._round_aborted = True  # 模拟 on_truncated 已置位（max_tokens 截断）
+        self.app._finish()
+        text = self.app.chat_text.get("1.0", "end")
+        self.assertIn("[任务中断]", text)
+        self.assertNotIn("[任务完成]", text)
+        self.assertIn("继续生成", text)  # 提供继续路径指引
+
+    def test_normal_marks_completed(self):
+        self._round_with_fail_tool()
+        self.app._finish()
+        text = self.app.chat_text.get("1.0", "end")
+        self.assertIn("[任务完成]", text)
+        self.assertNotIn("[任务中断]", text)
+
+    def test_aborted_resets_flag(self):
+        """_round_aborted 是单轮状态：本轮中断标记用完即复位，不污染下一轮。"""
+        self._round_with_fail_tool()
+        self.app._round_aborted = True
+        self.app._finish()
+        self.assertFalse(self.app._round_aborted)
+
+    def test_pure_chat_aborted_notice(self):
+        """纯对话（无工具）被截断 → 显示「回复中断」提示。"""
+        self.app._begin_assistant()
+        self.app._push_content("一半的内容")
+        self.app._drain_ui_queue()
+        self.app._flush_pending()
+        self.app._round_aborted = True
+        self.app._finish()
+        text = self.app.chat_text.get("1.0", "end")
+        self.assertIn("[回复中断]", text)
+
+
+class TestCompressFacts(PerfBase):
+    """压缩事实提炼：摘要器输出「关键事实」小节并注入摘要消息。"""
+
+    def _long_history(self, n=10):
+        msgs = [{"role": "system", "content": "s"}]
+        for i in range(n):
+            msgs.append({"role": "user", "content": f"问题{i}"})
+            msgs.append({"role": "assistant", "content": f"回答{i}"})
+        return msgs
+
+    def test_compress_extracts_facts(self):
+        from unittest import mock
+
+        self.app.messages = self._long_history()
+        self.app._current["pinned"] = []
+
+        class _Msg:
+            content = "早期对话摘要内容。\n\n关键事实：\n- 用户偏好简洁回答\n- 决定采用方案B"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        class _Completions:
+            def create(self, **kw):
+                return _Resp()
+
+        class _Client:
+            model = "deepseek-v4-flash"
+
+            class client:
+                chat = type("Chat", (), {"completions": _Completions()})()
+
+        with mock.patch.object(self.app, "ensure_client", return_value=_Client()):
+            ok = self.app._compress_old_history()
+        self.assertTrue(ok)
+        sys_msg = self.app.messages[1]
+        self.assertEqual(sys_msg["role"], "system")
+        self.assertIn("[历史对话摘要]", sys_msg["content"])
+        self.assertIn("关键事实", sys_msg["content"])     # 事实清单随摘要注入
+        self.assertIn("方案B", sys_msg["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

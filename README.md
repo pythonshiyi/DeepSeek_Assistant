@@ -1,27 +1,8 @@
-# 🐋 鲸语 WhaleTalk · AI 对话助手 / AI Desktop Assistant
+# 鲸语 WhaleTalk · AI 对话助手
 
-[![CI](https://github.com/pythonshiyi/DeepSeek_Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/pythonshiyi/DeepSeek_Assistant/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/pythonshiyi/DeepSeek_Assistant?color=blue)](https://github.com/pythonshiyi/DeepSeek_Assistant/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
+基于 DeepSeek V4 API 深度优化的 Windows 桌面 AI 对话助手，充分发挥 V4 的 Agent 能力、1M 上下文与性价比优势。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
 
-> **中文为主 · English follows**（完整中文介绍 + 完整英文简介）
-
-**鲸语 WhaleTalk** 是一款基于 DeepSeek V4 API 深度优化的 Windows 桌面 AI 对话助手，充分发挥 V4 的 Agent 能力、1M 上下文与性价比优势。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
-
-*WhaleTalk is a Windows desktop AI assistant deeply optimized for the DeepSeek V4 API, unleashing its full Agent capabilities, 1M-token context, and cost-performance advantages. WhaleTalk is an independent product brand with no affiliation to DeepSeek.*
-
-## 目录 / Table of Contents
-
-- [中文介绍（完整）](#中文介绍完整)
-- [English Introduction (Full)](#english-introduction-full)
-- [贡献指南 / Contributing](CONTRIBUTING.md)
-- [安全策略 / Security](SECURITY.md)
-- [品牌与关注 / Follow Us](#品牌与关注--follow-us)
-
-## 中文介绍（完整）
-
-### 品牌
+## 品牌
 
 - 中文名：鲸语（寓意"深海鲸歌对话"），英文名：WhaleTalk
 - 品牌视觉：深海蓝渐变 + 蓝鲸徽标（启动界面、应用图标同一视觉家族）
@@ -42,15 +23,36 @@
 - 快速动作：聊天区右键「⚡ 快速动作」一键对消息发起解释代码 / 总结要点 / 中英互译 / 润色 / 生成单元测试
 - 高性能长对话：思考/工具在流式期间即渲染为折叠卡片，生成结束零全量重渲染——每轮耗时与对话长度无关（实测 40 轮会话单轮结束 <0.5s，150 轮全量刷新 <0.15s）
 - 思考过程与工具调用可折叠卡片：流式实时折叠结构，点击标题展开/收起
-- 思考模式选择器：禁用 (none) / 低思考 (low) / 高思考 (high) / 最大思考 (max) / 极高思考 (xhigh)
+- 思考模式选择器（官方完整映射档位）：禁用 (none) / 低思考 (low) / 中等思考 (medium) / 高思考 (high) / 极高思考 (xhigh) / 最大思考 (max) / 智能路由 (auto)
+- **思考成本优化**：无工具调用的历史轮次发送时自动剥离 thinking 内容（官方规则：该内容会被 API 忽略——不传即省下每轮数千 token 的输入费）；带工具调用的轮次完整回传（官方要求，缺失 400）
+- **缓存友好消息布局**：恒定的 JSON 指令保持在前、可变的记忆注入追加在末尾（system 位置任意），稳定前缀完整匹配官方硬盘缓存——记忆/任务记录刷新不再破坏前缀缓存
+- **菜单 = 导航按钮（精确分类）**：菜单体系按"用户意图聚合"重构——顶级菜单 7 个（文件/编辑/视图/工具/**自动化**/设置/帮助，Alt+F/E/V/T/A/S/H）；工具菜单=中心入口置顶 + 六个精确级联（账户与用量/任务与模板/文件与产物/能力扩展/自我进化/系统）；**自动化独立顶级菜单**（定时/流程/知识库/检查点/任务记录/简报）；设置菜单拆「AI 行为/应用行为」；编辑菜单按消息/复制/查找/数据分组；视图菜单含 F11 全屏；每个菜单项都是直达目标的按钮，不再囫囵吞枣
+- **浏览器式可见性优先**：启动即居中（上下左右居中）；F11 无边框全屏（全屏=上下左右铺满，再按退出）；所有对话框/中心窗口/预览窗**打开即居中于主窗口**（视觉重心略高、屏幕内校验）；列表/详情/权限等所有内容区**标配滚动条**（元素完整可滚动，杜绝截断）；内容适配窗口、不裁剪
+- **应用级尺寸自适应（窗口跟随主窗口）**：中心窗口=**主窗口的 90-95%**（非全屏，浏览器新标签页式接近充满）、全屏时=屏幕 85%（四周留边）；对话框档位/预览窗以**主窗口宽度为参照**放大（1000 宽≈1.0、1474≈1.47、封顶 1.9）；主窗口默认=屏幕 72%×80%（上限 1680x1050）；首次启动字号按屏幕自动提升（用户自定义过的不覆盖）
+- **🛠 工具中心 / 🧩 插件中心（正式页面）**：菜单从"列表"升级为"页面"设计语言——工具中心（Ctrl+Shift+T）三页签：概览（环境/模型/用量/依赖/工作目录/安全卡片 + 高频快捷入口）/ 工具设置 / 权限；插件中心（Ctrl+Shift+P）三页签：我的插件（列表+详情+导入/导出/场景/启停/卸载+拖拽导入）/ 画廊 / 工坊；菜单瘦身为中心入口 + 高频直连，旧入口自动转发
+- **🧩 插件使用方式**：工具=AI 自动调用（tool_calls 循环，与内置工具并存）；技能=输入框「⚡ 指令」菜单一键插入（AI 也会在对话中知晓并建议）；流程=AI 调用 / 定时任务 / 「流程管理」手动运行；场景=插件管理「应用场景配置」随时重应用；**安装后自动弹出引导卡片（含一键试用）**
+- **🛍 插件画廊 + 会话轨迹**：内置 3 个示例插件（📕小红书文案 / 📊周报生成器 / 📋会议纪要助手）带图标展示，卡片式列表 + 详情区能力明细 + 已安装状态；安装走引导流程；「会话轨迹」升级为 blocks 级混合时间线（消息/思考/工具调用含参数/系统事件），Harness 式 Trajectory 的鲸语版
+- **🧩 插件工坊（AI 造插件）**：工具菜单「插件工坊」——描述需求，AI 通过 `create_plugin` 工具自动生成并安装插件（工具/技能/流程/场景），生成后立即生效，可随时停用/卸载；安装走权限审批闸门；「插件管理」中可导出 .wtplugin 分享
+- **🧩 插件体系（.wtplugin，零代码能力扩展）**：一切皆插件理念的终端用户实现——插件 = 工具/技能（提示词模板）/流程/一键场景的组合包，单文件 JSON 可分享给他人安装；工具菜单「插件管理」：导入（含依赖自检与内容预览）/导出分享/停用启用/卸载（精确移除本插件条目，不影响手动添加的同名能力）
+- **🔌 依赖状态**：工具菜单一键查看全部可选能力清单（17 项：Pillow/pystray/playwright/faster-whisper/PyMuPDF/reportlab/feedparser 等），已装 ✅ / 缺失 ⚠ + 安装命令——打包 exe 与排查可选功能缺失的利器
+- **压缩事实提炼**：上下文压缩时，摘要器同时输出「关键事实」清单（事实/决策/待办），随摘要注入后续对话供长期引用
+- **产物应用内预览**：双击 md/txt/代码/JSON/CSV 等在应用内预览（Markdown 走 mdparse 渲染，粗体/代码/链接样式可点击），图片等比缩放预览；右上角「用系统程序打开」随时回退；可执行文件等保持系统打开
+- **📰 每日简报（主动助手）**：`daily_brief` 工具一键生成当日 AI/科技简报——复用 WeChat Writer 采集引擎（RSS+搜索）→ LLM 提炼要点与点评 +「今日趋势」→ 保存工作区 briefs/；工具菜单「生成今日简报」入口，可配合定时任务每日晨报
+- **模型对比参数化**：工具 →「模型对比」弹窗选择/输入任意两个模型（内置 + Profile 模型名均可，可自由输入），分会话对比结果
+- **更新包应用内下载**：配置 update_url 后，发现新版本时直链安装包（.exe/.zip 等）在应用内下载到「下载/WhaleTalk 更新」，完成提示打开所在文件夹（无需跳转浏览器）
+- **自动断点 + 一键续跑**：工具链每完成一步自动持久化检查点（auto 标记）；任务中断/停止/崩溃/重启后，聊天区出现可点击「▶ 从断点继续」一键恢复任务上下文续跑；任务正常完成自动清除断点（手动保存的检查点不受影响）
+- **预算感知思考降档**：接近月度预算 80% 时，auto/max 思考档自动降为 high 并提示（尊重用户手动选择的 low/medium/high）
+- **高峰错峰执行**：定时任务可标记「错峰」——触发时刻处于高峰时段（9-12 / 14-18）时自动顺延到最近空闲时段执行（12:00 / 18:00，官方峰谷定价空闲价仅为高峰一半），AI 安排巡检/周报等任务时可选，省一半费用
+- **strict 工具模式（Beta）**：设置菜单一键开启（自动启用 Beta API）——工具 schema 自动规范化为 strict 格式（全部属性 required + additionalProperties=false，递归处理嵌套对象），模型输出 Function 调用严格遵循 JSON Schema，减少参数格式错误
+- **JSON 输出自校验**：输出自动 `json.loads` 校验，解析失败自动追加修正提示重试一次（官方说明 JSON 输出有概率返回非法内容，应用层自动救回）
 - JSON 输出开关：response_format 结构化输出，自动注入 JSON 指令且不污染会话上下文
 - Beta API 开关：开启后使用 /beta 端点，启用对话前缀续写与 FIM 补全
 - 继续生成：停止/回答后可从当前回复末尾续写（Beta 前缀续写，编辑菜单或聊天区右键）
 - FIM 代码补全：前缀+后缀中间补全（工具菜单，最大 4K）
 - 回复变体：同一问题以不同 seed 多次生成，保存/浏览/恢复任意版本
 - 引用回复：聊天区右键「引用此消息回复」，原文带引用插入输入框
-- 峰谷定价感知：状态栏实时显示高峰时段（9-12 / 14-18 价格 2 倍），每日首次发送前提示一次
-- 缓存警示：修改系统提示词时提示将破坏前缀缓存（命中 0.02 元 vs 未命中 1 元/百万）
+- 峰谷定价感知：状态栏实时显示高峰时段（9-12 / 14-18，高峰价=空闲价 2 倍，2026-08-17 新价生效），每日首次发送前提示一次
+- 缓存警示：修改系统提示词时提示将破坏前缀缓存（按当前模型高峰价动态显示命中/未命中差价）
 - 输入框实时 token 估算：输入时显示「约 X token」
 - 输入历史：Alt+↑/↓ 浏览当前会话已发送的输入（首次按↑自动保存草稿，回到草稿处可继续编辑）
 - Ctrl+Enter 快速发送；Ctrl+Shift+V 将剪贴板 URL 粘贴为 Markdown 链接（非 URL 时放行普通粘贴）
@@ -63,7 +65,7 @@
 - 收藏跳转：收藏列表中双击或「跳转」定位到对应消息
 - 流式智能跟随：生成中上翻历史时不再被强制拉回底部
 - 场景快速切换：通用 / 编程 / Agent / 自定义（自定义温度与 top_p 采样参数）
-- 多模型：deepseek-v4-flash / deepseek-v4-pro，上下文进度条跟随模型窗口
+- 多模型（V4 正式版）：deepseek-v4-flash（DeepSeek-V4-Flash-0731）/ deepseek-v4-pro（DeepSeek-V4-Pro-0813），1M 上下文 / 最大输出 384K，上下文进度条跟随模型窗口
 - 工具调用（Agent 模式）：内置工具，自动多轮调用并回传 reasoning_content；参数解析失败时自动把错误回传模型自主修正
   - 信息类：get_date（日期+时间+时区）/ get_weather / search_web（联网搜索，Bing 主源 + DuckDuckGo 兜底）/ fetch_url（抓取全文）
   - 交互与记忆：ask_user（Agent 主动询问用户，弹窗等待回答）/ request_permission（权限被拒时请求一键加入白名单，弹窗同意/拒绝）/ read_memory / write_memory（长期记忆，与手动维护的记忆库同文件）
@@ -135,6 +137,11 @@
 - 完成通知：生成结束后任务栏闪烁 + 提示音（可配置）
 - 定时任务：到点自动发送指令（工具菜单「定时任务」）
 - 定时/周期调度（cron）：支持标准 5 字段 cron 表达式、每 N 分钟周期、三种动作（发指令 / 项目备份 / 状态提醒+推送）
+- 定时任务补跑：程序未运行时错过的任务，启动时自动补执行一次（time 型补当天、cron 型补最近匹配，不积压不重复轰炸）
+- **三层自动化打通**：配方（成功工具链）→ 流程（workflows.json）→ 定时任务——流程步骤支持 `{"recipe": "配方名", "text": "目标"}` 自动注入已验证工具链；定时任务新增「运行流程」动作（到点自动执行流程，UI 校验流程名存在性）
+- **系统托盘常驻**：pystray 托盘图标（显示/隐藏/退出），设置菜单「关闭时最小化到托盘」一键开关（需安装 pystray）
+- **开机自启**：HKCU Run 键注册（自动探测 venv pythonw / 打包 exe），设置菜单一键开关，后台常驻配合定时任务/Webhook 接收端 24 小时在线
+- **失败模式库**：AI 工具执行失败自动积累（工具/参数/错误/时间，同错去重上限 50 条），注入「已知失败模式」上下文引导 AI 规避已知坑；工具菜单「失败模式库」查看/清空
 - 持续记忆知识图谱：记忆支持类型/实体/关系三元组，语义相似度检索（TF-IDF + bigram，不含关键词也能匹配），图谱查询工具
 - 多模态：文本转语音保存 WAV（tts_save）、图像处理（缩放/裁剪/旋转/水印，image_process）、图片文件 OCR（ocr_image）
 - 数据工具：CSV/Excel 读写（read_csv/write_csv/read_excel/write_excel）、数据可视化图表（chart_data，matplotlib）、MySQL/PostgreSQL 只读查询（database_query_mysql/postgres，db_config.json 配置）
@@ -143,22 +150,19 @@
 - 自我验证闭环：run_tests（自动发现并运行 pytest/unittest）+ verify_output（对照标准答案计算 F1/覆盖率/缺失要点）
 - 浏览器自动化增强：实例复用（连续操作共享页面与登录态，browser_profile 持久化）、表单动作（fill/submit/select）、多步操作不重复导航
 - 沙箱自由执行：run_python(with_site=true) 加载第三方库并访问外网，pip_install 完全体放行任意包
-- 语音输入：🎤 按钮用系统语音识别听写（Windows 语音识别）
 - 剪贴板 OCR：工具菜单「从剪贴板图片提取文字」（Windows OCR）
-- **场景包**：设置面板一键启用「办公 / 开发 / 创作」——自动配好权限、工具、提示词与思考档位，替代手动配置
-- **试玩任务库**：工具菜单 10 个一键试玩任务（写周报/建网站/翻译/检索/测试…），30 秒理解 AI 全流程
+- **自主模式 = 任务能力**：设置面板「自主模式」三选一直接表达任务能力——**🤖 完全智能**：全部工具自动可用（开发/创作任务而生，配合「智能体」人格）；**💬 纯对话**：不调用任何工具；**标准**：按工具中心勾选的工具集。运行时语义不污染工具配置
 - **项目上下文**：开启后自动把工作区内容概览注入每次请求（可开关，60 秒缓存）
 - **任务报告**：工具链执行结束自动生成摘要（调用次数/耗时/token）
 - **一键回滚**：最近产物「还原 .bak」把 AI 改过的文件还原到改动前
 - **省钱报告**：用量统计显示缓存命中节省的估算金额
-- **反馈收集**：消息右键 👍/👎 记录偏好，编辑菜单「反馈记录」查看
 - **对话分享**：编辑菜单「复制分享文本」一键复制 Markdown 分享
 - **🤖 完全智能模式**：设置面板「自主模式」一键开启——允许目录内的写文件 / 运行命令 / 工具链全部自动执行，不再弹任何审批，AI 全自主完成任务；系统目录阻止列表与审计日志仍生效，随时可关闭恢复审批
 - **任务执行面板**：工具链执行时右下角悬浮窗实时显示——当前工具、总耗时、✅/❌ 统计、最近 5 条结果、产物计数，可停止/收起/拖动，结束后自动隐藏
 - **工具卡片结果摘要**：标题升级为 `✅/❌ [工具] write_file · 已写入 ok.txt · 1.2s`；**失败的工具自动展开**显示错误，一目了然
 - **任务完成报告**：`[任务完成] ✅ 工具 2 成功 / 1 失败 · 耗时 12.3s · token 统计`
-- **进程终端**：AI 启动的服务器/长驻进程实时输出到独立终端窗口（工具菜单「进程终端」，启动时自动弹出）——进程下拉切换、停止、清空、自动跟随滚动；配套工具 start_process / stop_process / list_processes（开发场景包默认启用），退出程序自动终止所有后台进程
-- **工作目录机制**：明确 AI 执行任务的"家"——输入框旁「📁 目录」或工具菜单一键指定（自动加入权限允许目录）；状态栏常显当前目录；AI 每次请求都会收到工作目录提示，新任务自动在目录下创建独立子目录；场景包自动重置到工作区
+- **进程终端**：AI 启动的服务器/长驻进程实时输出到独立终端窗口（工具菜单「进程终端」，启动时自动弹出）——进程下拉切换、停止、清空、自动跟随滚动；配套工具 start_process / stop_process / list_processes（完全智能模式全量可用），退出程序自动终止所有后台进程
+- **工作目录机制**：明确 AI 执行任务的"家"——输入框旁「📁 目录」或工具菜单一键指定（自动加入权限允许目录）；状态栏常显当前目录；AI 每次请求都会收到工作目录提示，新任务自动在目录下创建独立子目录
 - **任务质量闭环**：常驻行为指令（先计划再执行 / 完成度自检 / 网页必须启动验证）；任务提到文件时自动读取注入上下文；项目 README/配置自动摘要注入；成功任务工具链自动记忆复用（patterns.json）；environment_info 环境感知工具（Python 版本/已装包/磁盘空间）
 - **🧬 自我进化**：鲸语可感知自身代码库（project_info / read_project_file）并提交改进提案（create_evolution 写入 `evolutions/` 分支，**绝不修改原文件**）；工具菜单「自我进化」查看提案说明 / 差异预览 / **采纳**（自动备份 .evobak 后应用，重启生效）/ **忽略**；EVOLUTION.md 记录改动内容、原因、风险与验证方式
 - **🧬 主动发起与督促**：工具菜单「自我审查（生成报告）」——管理员一键发起，可选重点（全面/性能/安全/体验/代码质量），鲸语自动分析自身并**产出审查报告 MD**（问题总览 / 现状代码 / 替换代码 / 验证方式，写入工作区 code-review/），供开发 AI 直接实施；启动时检测距上次审查超过 `evolution_reminder_days` 天（默认 7）自动提示；「打开审查报告目录」一键直达
@@ -188,9 +192,8 @@
 - **🧬 功能建议（升级方向）**：工具菜单一键发起——鲸语基于对自身架构、用户场景与 DeepSeek 能力特性的理解，提出 6-10 个新功能/升级建议（名称/价值/实现思路/复杂度/优先级），写入工作区 code-review/ 建议文档，供你挑选实施
 - **✅ 产物核验闭环**：写文件工具返回**真实核验结果**（实际字节数 + 已核验存在）；write_code_project 逐文件报告成功/失败明细；verify_files 工具批量核验（写后必须自检，防幻觉）；任务完成报告自动核验 AI 声明创建的每个文件——**缺失立即标记 ⚠，杜绝"声称已建但目录为空"**
 - **📄 会话纪要**：工具菜单一键把当前会话总结为结构化纪要（主题/要点/决策/待办/产物），写入工作区 summaries/
-- **🗺 会话结构导航**：工具菜单查看会话消息时间线（用户/助手/工具），双击一键定位到聊天区原文
-- **🧪 配方管理**：历史成功工具链（patterns.json）可视化管理，命名保存/一键注入复用
-- **🎭 角色库**：7 个预设人格套装（翻译官/代码评审/面试官/写作润色/心理陪伴/周报），一键应用（含缓存警示）
+- **🗺 会话轨迹**：工具菜单查看 blocks 级混合时间线（消息/思考/工具调用/系统事件），双击定位原文
+- **🎭 角色与提示词（完整管理 + 分层职责）**：角色 = 系统提示词预设——统一入口支持**新增/编辑/删除/分类**（内置角色只读，用户角色可管理，按分类分组）；「✍ 自定义」直接编辑当前提示词；当前角色自动识别高亮（设置面板常显）。**三层职责分离**：人格=说什么（角色）· 任务能力=做什么（**自主模式**：完全智能=全部工具 / 纯对话=无工具 / 标准=按工具配置，不覆盖人格）· 模型参数=怎么答（场景：温度/采样/思考默认），设置面板各分组带职责说明，互不冲突
 - **📦 批量任务**：多选文件 + 指令模板（{file} 占位），AI 逐个处理逐个汇报
 - **⌨ 命令面板**：Ctrl+K 唤起，输入过滤全部常用操作，Enter 执行
 - 性能：Markdown 渲染内容级缓存（重渲染零解析成本）、纯文本行快速路径、同轮多工具并行执行、快照惰性落盘（10s 空闲）、大 JSON 紧凑序列化（体积减半）
@@ -226,10 +229,10 @@ python main.py
 |------|--------|------|
 | api_key | "" | DeepSeek API Key |
 | base_url | https://api.deepseek.com | API 端点 |
-| model | deepseek-v4-flash | 模型名（deepseek-v4-flash / deepseek-v4-pro） |
+| model | deepseek-v4-flash | 模型名（deepseek-v4-flash：DeepSeek-V4-Flash-0731 / deepseek-v4-pro：DeepSeek-V4-Pro-0813，亦支持任意 OpenAI 兼容模型名） |
 | scenario | 通用 | 通用 / 编程 / Agent / 自定义 |
-| thinking | high | none / low / high / max / xhigh |
-| max_tokens | 16384 | 最大输出长度（1024-65536） |
+| thinking | high | none / low / medium / high / xhigh / max / auto（官方映射：low→low · medium/high/xhigh→high · max→max） |
+| max_tokens | 16384 | 最大输出长度（1024-393216，V4 上限 384K） |
 | seed | "" | 固定种子，确定性输出 |
 | tools_enabled | true | 启用工具调用 |
 | enabled_tools | [...] | 启用的工具名列表（含自定义工具，工具设置对话框可改） |
@@ -260,6 +263,10 @@ python main.py
 | email_config.json | {} | 邮件配置：`{"smtp": {...}, "imap": {"host","port","user","password","ssl"}}`（send_email 用 smtp，read_email 用 imap） |
 | inbound_port / inbound_token | 0 / "" | Webhook 接收端：本地监听端口与鉴权 token（0=关闭），外部 POST `{"token":…, "text":…}` 远程下达任务 |
 | image_api_key / image_base_url / image_model | "" / "" / gpt-image-1 | 图片生成配置（OpenAI 兼容 images API） |
+| minimize_to_tray | false | 关闭窗口时最小化到系统托盘（需 pystray 已安装） |
+| autostart | false | 开机自启（HKCU Run 键，设置菜单一键开关） |
+| strict_tools | false | strict 工具模式（Beta）：模型严格遵循工具 JSON Schema（需 Beta API，自动开启） |
+| update_url | "" | 更新检查源（latest.json：`{"version": "2.3.0", "url": "https://…/下载页"}`），留空则检查更新提示未配置 |
 
 > 安全提示：`config.json` 中包含你的 API Key，请勿将此文件或项目目录分享/提交到公开仓库；打包 exe 前请先清空 key。
 
@@ -288,7 +295,7 @@ python main.py
 - FIM 补全：「工具 → FIM 代码补全」，输入前缀+可选后缀补全中间代码，结果可一键插入输入框（自动使用 /beta 端点）
 - JSON 输出：设置面板开启后请求携带 response_format，自动注入 JSON 指令（不污染会话上下文），适合结构化输出场景
 - 输入框底部实时显示「约 X token」，发送前即可估算本轮输入占用
-- 状态栏显示「⏰ 高峰时段」表示当前为 DeepSeek 峰谷定价高峰（9:00-12:00 / 14:00-18:00，价格 2 倍），每日首次发送前提示一次
+- 状态栏显示「⏰ 高峰时段」表示当前为 DeepSeek 峰谷定价高峰（9:00-12:00 / 14:00-18:00，高峰价=空闲价 2 倍，2026-08-17 新价：flash 3.0/9.0、pro 9.0/27.0 元每百万，缓存命中 0.10/0.30 元），每日首次发送前提示一次
 - 生成中上翻历史不会被拉回底部；模型思考期间状态栏显示「🤔 思考中…」
 - 收藏消息可在「编辑 → 查看收藏」中双击或「跳转」定位到原文位置
 - 输入历史：输入框按 Alt+↑/↓ 浏览本会话已发送内容（再次按↑到最早一条后返回草稿）
@@ -297,8 +304,12 @@ python main.py
 - 长会话惰性折叠：在 config.json 设置 fold_early_threshold（如 1200）后，早期消息自动折叠为提示行，点击展开
 - 导出历史：文件菜单「导出历史」选择目录，生成 session_时间戳 的 .md / .txt / .html / .jsonl 四份文件
 - 提示词模板中 {{TEXT}} 会被当前输入框内容替换
-- 检查更新：帮助菜单手动检查（更新源为 GitHub Releases，发现新版本自动备份当前源码后打开下载页）；也可在 config.json 开启 check_update 实现启动时自动检查
+- 检查更新：帮助菜单手动检查（需在 main.py 中配置 UPDATE_URL 发布源）
 - 深色主题下标题栏变黑需要 Win11 22H2+，或 Win10 系统「应用模式」为深色；否则标题栏保持系统默认色
+- 系统托盘：设置 →「关闭时最小化到托盘」开启后点 X 最小化到托盘（需已安装 pystray：pip install pystray）；托盘右键可显示/隐藏/退出。提示：Win11 默认折叠托盘图标，若未见图标请点击任务栏托盘区「^」展开；开启后托盘不可用会提示并自动回滚开关
+- 开机自启：设置 →「开机自启」注册 HKCU Run 键（源码运行用 venv pythonw，打包 exe 用 exe 本体），配合定时任务/Webhook 接收端可 24 小时无人值守
+- 失败模式库：工具执行失败会自动积累原因，并注入后续请求供 AI 规避；工具 →「失败模式库」可查看/清空
+- 定时任务补跑：程序未运行时错过的定时任务，下次启动会自动补执行一次（不积压）
 
 ## 版本备份
 
@@ -321,6 +332,34 @@ python main.py
 
 | 版本 | 说明 |
 |------|------|
+| 2.12.10 | **修复公众号写作在思考模型下的 LLM 调用失败**：`run_wechat_writer(topic=...)` 报「LLM 调用失败：模型返回空内容」——切换 `deepseek-v4-pro` 等**思考模型**后，响应 `content` 为空、推理在 `reasoning_content`，wechat_writer 内部 LLM 封装（llm.py）只读 `content` → 空内容。修复：①请求显式 `thinking: disabled`（写作/选题场景内容直出），旧端点 400 时自动降级重试；②响应解析回退 `reasoning_content` 兜底；③**用户显式指定主题（topic_override）跳过历史查重**——去重只约束自动选题，用户决策优先（此前 LLM 精判误伤"DeepSeek Harness"指定主题）；全量测试 475 通过；实测 dry-run 完成（2585 字、质检 100 分） |
+| 2.12.9 | **信源深度扩展 + 按需加载的「飞机包」能力**：①**信源扩充 4 组**——国内论坛组（v2ex / 虎扑 / 吾爱破解）、国际论坛组（reddit / lobste.rs / slashdot / phoronix）、被墙论坛组（linux.do / hostloc / 龙空）、微博贴吧组（RSSHub 公共实例），`enabled_groups` 机制控制启用（**默认仅启用国内可达组**，被墙组需显式加入并配合 use_blocked）；②**fetch_blocked 工具**（按方案文档落地 + 增强）：自动发现 mihomo/clash 订阅缓存 HTTP 节点（并发测速选最快 + **节点池 10 分钟 TTL 缓存**）→ curl_cffi Chrome 指纹过 Cloudflare → 无 curl_cffi 自动降级标准库 TLS-in-TLS；**SSRF 防护内建**（回环放行、内网/元数据阻止）；③**合规设计**——fetch_blocked.py 独立模块，**不进默认启用集**（工具中心勾选才启用），分享/开源剔除该文件即无此能力，规避传播翻墙软件风险；④**公众号写作集成**——`run_wechat_writer` 新增 `use_blocked` 参数；sources.py 被墙源直连超时/失败后**自动经代理升级重试**（linux.do/v2ex 等素材实测进入素材池）；全量测试 470 通过 |
+| 2.12.8 | **修复公众号写作能力降级**：核心工具 `run_wechat_writer`（采集→选题→LLM 写作→质检→存草稿箱）与 `publish_draft` **不在默认启用集 BUILTIN_TOOL_NAMES**（同类 `daily_brief` 却在），v2.12.5 移除场景包后（创作包原含 publish_draft）标准模式失去公众号能力——模型不再调用工具，退化为普通对话写作（无采集/选题/质检链路），即"能力变差"。修复：两工具加入默认启用集（安全属性：只产草稿不发布，发布权在用户；permissions 白名单已含 publish_draft），normalize 升级合并自动为所有旧配置补入；用户 config 已即时修复；dry-run 文案修正（明确"未写入草稿箱"）；回归测试（默认集/升级合并/schema 完整）；dry-run 实测链路完好（2489 字、质检 100 分）；全量测试 451 通过 |
+| 2.12.7 | **修复工具 schema 400（missing field 'items'）**：4 个内置工具（write_csv.rows / write_excel.data / chart_data.data / subagent_run.tasks）的 array 参数缺 `items` 字段，DeepSeek API 直接 400 拒绝整轮请求（`阅读程序` 等场景复现）。已补齐 items（结构化类型或宽松 `{}`）；并新增**递归兜底 `_patch_array_items`**——每次请求前扫描所有工具（含用户自定义工具/插件工具）schema，`type: array` 缺 `items` 自动补齐，防御第三方 schema 遗漏导致的同类 400；深层嵌套（object 属性里的 array）同步覆盖；strict 模式 `_strictify_schema` 本就保留 items 无影响；全量测试 448 通过 |
+| 2.12.6 | **SSRF 防护分层（消除本地开发阻挡）**：修复 `已阻止访问内网/回环地址` 阻挡 `http://localhost:3000` 等本地开发验证——**回环（localhost/127.0.0.0/8/::1）默认放行**（本地服务器验证是最高频正当场景）；**内网/链路本地/保留网段仍阻止**，但工具中心 → 权限页签新增「SSRF 信任主机」白名单（IP/主机名/CIDR 网段，如 192.168.1.0/24、NAS），保存即时生效（写 config.json + 运行时同步）；**云元数据 169.254.169.254 永远硬阻止（白名单不可豁免）**；DNS 重绑定防护保留（域名解析落内网仍拦截，解析到回环按本地验证放行）；**搜索链接过滤保持严格**（结果来自外部，是 SSRF 注入源，回环不放行）；自定义工具 endpoint 回环放行（用户注册的本地服务）；修复工具中心底部「保存更改」回调被误清空的隐藏 bug（上轮保存按钮虽显示但回调丢失，本次彻底生效）；全量测试 445 通过 |
+| 2.12.5 | **自主模式 = 任务能力 + 工具中心保存修复**：①**删除场景包（办公/开发/创作）**——"任务能力"与自主模式语义重叠，完全多余：**完全智能 = 全部工具**（运行时自动启用内置+自定义全部工具，为开发/创作而生）、**纯对话 = 无工具**（不传工具 schema）、**标准 = 按工具中心勾选**；运行时语义不污染 enabled_tools 配置（切换模式不再覆盖手动工具配置）；②**配套提示词设计**——新增内置「智能体」角色（目标先行 / 规划执行 / 产物落地 / 验证闭环 / 结果汇报，思考档 max），完全智能模式切换时状态栏提示建议应用；③**修复工具中心无保存按钮**——工具设置/权限页签面板化后保存回调被丢弃（勾选改动关窗即丢），新增底部「💾 保存更改」统一保存栏（收集两个面板保存回调，面板内提示未保存即不生效的语义）；工具设置页签在完全智能/纯对话模式下显示"勾选仅作为标准模式默认集"；④工具中心概览新增「任务能力」卡片（当前模式语义常显）；⑤代码输出建议从"启用开发场景包"改为"切换完全智能模式"；⑥`_apply_plugin_scenario` 注释/文案同步（与自主模式分层一致）；全量测试通过 |
+| 2.12.4 | **UI 提示校正 + Bug 修复 + 状态可视化**：①**状态栏角色常显**——右段新增「🎭 角色名」（模型 · 角色 · 场景 · 思考），当前人格全程可见；角色识别加缓存（状态栏高频调用防读盘，用户角色保存时失效）；②**场景包确认弹窗**——应用前列影响清单（工具数/思考档/写文件/命令/审批 + 人格保持不变），取消回退下拉；③**修复场景包空值误导**——选空仅清除标记，提示改为「已退出场景包（当前工具/权限保持不变）」而非虚假的"已恢复手动配置"；④**修复插件场景覆盖人格**——与三层分层一致：插件场景只应用任务能力（工具/思考），建议人格提示词**单独弹窗询问**（拒绝保持当前人格）；⑤**修复 OCR 结果丢失**——OCR worker 曾走已删除的语音队列（"speech"）导致识别结果无人消费，改为独立 "ocr" 队列 + 输入框插入；⑥**过时路径文案校正**——菜单重构后所有"工具 → 权限/插件/流程/进化"提示更新为新路径（🛠 工具中心 → 权限、🧩 插件中心、自动化 → 流程管理）；权限拒绝提示（permissions.py）同步更新；⑦欢迎/关于 "90+" → "100+" Agent 工具；⑧错峰图标 ⛰ → 🌙；strict 菜单 label 修正（自动启用 Beta API）；⑨删除使用中的角色时提示"显示为自定义"；⑩工具中心概览新增「人格」卡片；全量测试 433 通过 |
+| 2.12.3 | **角色管理完整化 + 三层职责分离**：①**角色 CRUD**——用户自定义角色（user_roles.json）新增/编辑/删除/分类，内置角色只读（可复制内容到新增）；「角色与提示词」对话框左侧按「内置/我的角色」分组展示（分类二级），当前角色 ✅ 高亮，右侧预览（描述/思考档/提示词全文）+「✍ 自定义」编辑；②**三层职责分离消除冲突**——**场景包不再写 system_prompt**（此前办公/开发/创作直接覆盖人格提示词，与角色冲突）：场景包=任务能力（工具/权限/思考档）、角色=人格（system_prompt）、场景=模型参数（温度/采样）；设置面板各分组加职责说明（"场景=模型采样参数"、"场景包=任务能力（不影响人格）"、"人格=系统提示词"）；③`apply_role` 支持用户角色；`_current_role_name` 在合并集（内置+用户）匹配；④测试——用户角色 CRUD 持久化、识别、应用、场景包不覆盖人格；全量测试 426 通过 |
+| 2.12.2 | **角色与提示词统一（消除重复入口）**：①概念模型明确——**角色 = 系统提示词预设**，两者操作同一字段；②**统一对话框**「角色与提示词」——左侧列表（7 预设 + ✍ 自定义，当前角色 ✅ 高亮）、右侧详情（描述/思考档/提示词全文预览；自定义可直接编辑）；③**当前角色自动识别** `_current_role_name`（提示词与预设完全一致 → 角色名，否则"自定义"）；④**应用点可视化**——设置面板新增「AI 人格」组常显「🎭 当前角色：X」，角色应用/自定义保存/启动均联动；⑤**入口收敛**——删除独立「系统提示词」对话框（edit_system_prompt -52 行）与能力扩展菜单的「角色库」重复入口，设置菜单「AI 行为」唯一入口 + 设置面板直达；⑥`apply_role`/`_apply_custom_prompt` 统一走缓存警示 + 状态联动；⑦测试——角色识别（预设/自定义）、对话框结构（预设+自定义项）、应用状态联动；全量测试 424 通过 |
+| 2.12.1 | **功能减法（方向明确后的收敛）**：移除 4 项被替代/无下游的功能入口——①**语音输入**（System.Speech 质量差，speech_to_text 工具更好）：删除输入框 🎤 按钮、_start_speech/_insert_speech/队列分支（朗读保留）；②**反馈收集**（无下游消费的死功能）：删除右键 👍/👎、反馈记录对话框/菜单/命令面板项（-99 行）；③**示例任务（一键体验）**：从工具菜单移除级联（教学任务完成使命，欢迎页入口保留，_run_playground 保留）；④**配方管理对话框**：被流程体系替代（workflows recipe 步骤已引用 patterns.json 成功模式），删除 show_recipes 与菜单/命令面板入口（底层记录保留）；⑤README 功能清单同步删减；全量测试 420 通过 |
+| 2.12.0 | **菜单 = 导航按钮（精确分类重构）**：①**顶级菜单 7 个**——新增「自动化(A)」独立菜单（定时任务/流程管理/知识库/任务检查点/项目任务记录/每日简报），Alt 快捷键覆盖 F/E/V/T/A/S/H；②**工具菜单精确级联**——中心入口（工具中心/插件中心）置顶直达 + 六个分组级联：账户与用量（查余额/用量/预算/上下文/模型对比）、任务与模板（任务模板▸/示例任务▸/批量/简报/纪要/轨迹）、文件与产物（工作目录/文件树/最近产物/进程终端）、能力扩展（自定义工具/Profile/提示词库/角色库/配方/FIM/依赖状态）、🧬 自我进化、系统（失败模式/推送配置/OCR/数据清理/命令面板）；③**设置菜单分组**——AI 行为（系统提示词/角色库/strict 工具模式）/ 应用行为（完成通知/项目上下文/隐私/自启/托盘）+ 保存配置；④**编辑菜单分组**——消息（重发/重生成/变体/续写）/ 剪贴板与复制 / 查找与轨迹 / 数据与分享（收藏/记忆/反馈/分享/朗读）；⑤视图菜单新增 ⛶ 全屏模式（F11）；⑥**工具中心概览导航网格**——快捷操作行（余额/用量/预算/对比/上下文）+ 导航行（定时/流程/知识库/检查点/任务记录/产物/目录/失败模式/插件中心）9 个聚合按钮；⑦新增 `_menu_by_title` 顶级菜单映射（测试/主题定位）；全量测试 420 通过（新增 test_ui_menu 8 项） |
+| 2.11.3 | **应用级尺寸自适应（窗口跟随主窗口，非屏幕比例）**：①`_hub_size` 改为**以主窗口为参照**——非全屏 = 主窗口 90-95% 宽×高（插件中心 90%×93%、工具中心 92%×94%，浏览器新标签页式接近充满）、F11 全屏 = 屏幕 85%×85%（四周留边视觉舒适）；②`_screen_scale` 基准从屏幕高度改为**主窗口宽度**（1000≈1.0、1474≈1.47、封顶 1.9）——对话框档位/预览窗随主窗口呼吸，大屏窄屏统一比例（1474 主窗下对话框档位 619/766/943）；③实测：主窗口 1474x921 → 插件中心 90%×93%、工具中心 92%×94%、全屏下 1740x979；④测试——hub 跟随主窗口比例、全屏留边、scale 宽度基准值域；全量测试 412 通过 |
+| 2.11.2 | **浏览器式可见性优先（居中/全屏/防截断）**：①**全局居中体系** `_center_geometry`——所有对话框（_dialog_shell）/工具中心/插件中心/文本图片预览窗**打开即居中于主窗口**（视觉重心略高，屏幕内校验，记忆位置仍优先）；②**F11 无边框全屏**——全屏=上下左右铺满无边框（浏览器式），退出恢复原几何；③**防截断**——插件中心两页列表+详情补滚动条（此前无滚动是"元素显示不全"主因）、权限面板补滚动容器（内容多时底部不再被截断）；④主窗口启动居中校验（1474x921+287+105 @1152p）；⑤测试——居中几何屏幕内校验、对话框居中、F11 切换、插件中心滚动条 ≥4；全量测试 410 通过 |
+| 2.11.1 | **屏幕自适应（大屏 PC 适配）**：①`_screen_scale` 自适应系数——基准 900 逻辑高（≈720p），1080p→1.2、2K/4K→1.6 封顶；②**对话框档位按系数放大**（_dialog_shell 内吸附到放大后档位，420/520/640 → 537/665/819 @1.28），消除大屏局促；③**主窗口默认几何**——屏幕 72% 宽 × 80% 高（上限 1680x1050，下限布局最小尺寸），1280x820 → 1474x921 @1152p；④**中心窗口** `_hub_size`——工具中心/插件中心按屏幕 ~54-56%×60-62%（上下限 680-1440 × 520-900）；⑤**预览窗**——文本/图片预览随系数放大（图片适配上限 900x650）；⑥**默认字号提升** `_apply_screen_font_default`——仅当用户未自定义字号时按屏幕高提升（1080p→11、≥1300→13）；⑦测试适配——对话框吸附测试改为通用断言（档位递增/比例/吸附成员），新增系数值域与基准测试；全量测试 406 通过 |
+| 2.11.0 | **UI 设计语言升级：菜单 → 正式页面**：①**工具中心**（Ctrl+Shift+T）——正式窗口三页签：概览（模型/今日用量/依赖就绪度/工作目录/安全状态卡片 + 查余额/用量/预算/知识库/定时/流程快捷入口）/ 工具设置（全部工具启停，`edit_tools` 重构为可嵌入 panel）/ 权限（行动能力闸门，`edit_permissions` 重构为 panel）；②**插件中心**（Ctrl+Shift+P）——三页签：我的插件（图标列表+详情 + 导入/导出/场景重应用/启停/卸载 + **拖拽 .wtplugin 直接导入**）/ 画廊（示例插件+详情+一键安装）/ 工坊（需求输入+AI 生成）；③**菜单瘦身**——工具菜单顶部为两大中心入口 + 高频直连，工具设置/权限/插件三件套移入中心，删除 350+ 行旧对话框重复代码；旧入口（show_plugins 等）自动转发到中心（向后兼容）；④快捷键 Ctrl+Shift+T/P；⑤工具设置/权限面板重构为返回保存回调的 panel 组件（中心与对话框共用）；全量测试 404 通过 |
+| 2.10.0 | **插件体验全面升级**：①**安装后引导卡片**——装完自动弹出引导（使用方式 + 一键试用：技能=直接插入输入框 / 流程=立即运行 / 场景=应用配置），让用户 30 秒感知插件价值；②**共用安装流程** `_install_plugin_file`——解析 → **重复安装检测（同名已装提示覆盖更新：先精确卸载旧条目再装新版）** → 依赖自检确认 → 安装 → 场景询问 → 引导卡片，filedialog 与拖拽导入共用；③**详情渲染** `_plugin_detail_text`——图标 + 名称/版本/作者 + 能力明细（逐个工具/技能/流程步骤数/场景）+ 缺失依赖 + 使用方式；④**画廊升级**——emoji 图标（示例插件 📕📊📋）+ 左列表右详情双栏 + 已安装版本判断 + 安装走引导；⑤**管理升级**——图标列表 + 详情双栏 + **卸载影响清单**（将移除 N 工具/N 技能/N 流程）+ 拖拽 .wtplugin 直接导入（DND）；⑥修复 `_refresh_user_tools_cache` 提升为实例方法（共用安装流程调用）；全量测试 401 通过 |
+| 2.9.1 | **插件调用闭环 + 菜单重组**：①**流程手动运行**——「流程管理」新增「运行选中」按钮（确认后立即 run_workflow，补上用户手动触发流程的缺口）；②**场景重应用**——插件管理新增「应用场景配置」按钮（scenario 随时重应用，不再限于安装时一次）；③**技能注入 AI**——已安装插件技能清单注入动态上下文（`_plugin_skills_hint`），AI 在对话中知晓用户可用模板并在相关任务中直接完成或建议；修复 prompts.load_prompts 丢弃 `_source` 标记导致技能来源不可识别；④**工具菜单重组**——新增「🧩 插件」独立分组（插件管理/画廊/工坊/依赖状态），依赖状态与失败模式库归位（依赖→插件组、失败模式→系统组），消除布局混乱；⑤对话框使用方式提示（工具=AI 自动调用 · 技能=⚡指令 · 流程=AI/手动运行）；全量测试 398 通过 |
+| 2.9.0 | **插件画廊 + 会话轨迹**：①**内置示例插件**——sample_plugins/ 随程序分发 3 个高质量示例（小红书文案助手/周报生成器/会议纪要助手），演示插件能力并为 AI 造插件提供范例；②**插件画廊 UI**——工具菜单「🛍 插件画廊」：示例插件列表（可安装/已安装状态）+ 一键安装（复用 apply_plugin 链路），双击即装；③**会话轨迹视图**——show_session_timeline 从消息级升级为 blocks 级混合时间线（`_timeline_items` 纯函数可测）：用户/助手回复/思考/工具调用（✅❌+参数+结果摘要）/系统事件（压缩、任务完成、中断等 note/error），双击可跳转原文，不可跳转条目（工具/事件/思考）明确提示；④README 插件体系章节补充画廊与 AI 生成说明；全量测试 396 通过 |
+| 2.8.0 | **🧩 插件工坊（AI 造插件，差异化之路核心）**：①`create_plugin` 工具——AI 根据需求生成并安装 .wtplugin 插件：简化工具描述自动转换完整 schema（name/endpoint/method/params），支持工具/技能/流程/场景任意组合，生成后立即生效；②权限整合——create_plugin 加入 ACTION_TOOLS 审批闸门（confirm 模式弹窗确认，auto/full_auto 直接放行）；③插件工坊 UI——工具菜单「插件工坊」：示例需求引导 + 需求输入框 → 发送给 AI（引导 AI 用 create_plugin）；④安装报告含缺失依赖提示，数据文件变更经 mtime 缓存自动失效（无需重启）；⑤默认工具列表加入 create_plugin；全量测试 392 通过（新增 6 项） |
+| 2.7.0 | **🧩 插件体系（零代码能力扩展，差异化之路起点）**：①`.wtplugin` 插件格式——工具/技能（提示词模板）/流程/一键场景的组合包，单文件 JSON 可分享安装；②`plugins.py` 模块——校验/解析/列表/应用/卸载/启停：安装合并进 user_tools.json、prompts.json、workflows.json（条目带 `_source: plugin:<slug>` 来源标记），**卸载/停用精确移除本插件条目，用户手动添加的同名能力不受影响**；③插件管理 UI——工具菜单「🧩 插件管理」：列表（✅/⏸ 状态）+ 详情 + 内容预览 + 依赖自检（requires 缺失提示）+ 导入（filedialog+确认）/导出分享/停用启用/卸载；④插件场景配置一键应用（思考档/系统提示词/推荐工具，联动现有场景机制）；⑤README 新增插件体系章节（格式/安装/卸载/分发说明）；全量测试 386 通过（新增 test_plugins 12 项） |
+| 2.6.0 | **依赖自检 + 压缩事实提炼**：①**依赖状态**——17 项可选能力清单（Pillow/pystray/playwright/faster-whisper/PyMuPDF/reportlab/python-docx/pptx/feedparser/qrcode/pyzbar/diskcache/imageio-ffmpeg/markdown/pywin32/tkinterdnd2/tiktoken）统一检测：已装 ✅ / 缺失 ⚠ + 安装命令，工具菜单「🔌 依赖状态」查看，打包 exe 排查利器；②**压缩事实提炼**——上下文压缩摘要器同时输出「关键事实」清单（事实/决策/待办，每条 - 前缀），随摘要注入后续对话，摘要消息显式标注可长期引用要点；③**启动性能观测**——初始化按阶段计时（配置/UI 构建）写日志，主程序记录启动与运行总时长，为后续优化提供基线；全量测试 374 通过 |
+| 2.5.0 | **主动助手（每日简报）+ 对比参数化**：①**每日简报**——新增 `daily_brief` 工具：复用 WeChat Writer 采集引擎（RSS+搜索+关键词过滤）→ 复用当前对话客户端（模型一致）LLM 提炼要点与点评 +「今日趋势」→ 保存工作区 briefs/brief_YYYYMMDD.md；支持 topic 关键词过滤与 max_items；工具菜单「📰 生成今日简报」一键入口（AI 走工具链，产物入最近产物），可配合 schedule_task 定时生成晨报；②**模型对比参数化**——「模型对比」改为弹窗：两个可输入 Combobox（候选 = 内置模型 + 各 Profile 模型名），支持任意模型名自由输入，相同模型校验；③默认工具列表加入 daily_brief；全量测试 370 通过 |
+| 2.4.0 | **产物应用内预览 + 更新下载**：①**应用内预览**——`_open_path` 统一入口：md/txt/代码/JSON/CSV 等在应用内预览（Markdown 走 mdparse 渲染，粗体/代码/链接/标题样式可点击，链接仅放行 http(s)），图片（PIL）等比缩放适配 800x600，右上角「用系统程序打开」回退；可执行文件等保持系统打开；②**更新包应用内下载**——update_url 配置的 latest.json 中 url 指向直链安装包（.exe/.zip/.7z/.msi）时，应用内下载到「下载/WhaleTalk 更新」目录（后台线程 + 2GB 限流），完成弹窗提示打开所在文件夹，无需跳转浏览器；③预览分类/渲染/图片 4 项 UI 测试；全量测试 364 通过 |
+| 2.3.0 | **任务可靠性（断点续跑 + 省钱）**：①**自动断点**——工具链每完成一步自动持久化检查点（auto 标记 + 任务名/工具链摘要，隐私模式跳过），无需 AI 主动保存；②**一键续跑**——任务中断/停止/崩溃/重启后，聊天区出现可点击「▶ 从断点继续」（一键发送恢复指令，AI 先 task_checkpoint_load 再续跑），正常完成自动清除自动断点（手动检查点保留，task_checkpoint_clear 仅清 auto）；③**预算感知思考降档**——接近月度预算 80% 时 auto/max 思考档自动降 high 并提示（手动选择的 low/medium/high 不干预），纯函数化可测；④**更新通道落地**——检查更新源改为 config.json 的 update_url（支持 latest.json：version+url），未配置时提示明确，启动自动检查联动；全量测试 360 通过 |
+| 2.2.0 | **高峰错峰 + strict 工具模式**：①**高峰错峰执行**——定时任务「错峰」选项：触发时刻处于高峰时段（9-12 / 14-18）时自动顺延到最近空闲时段（12:00 / 18:00，已过则次日 0:00）执行，官方峰谷定价空闲价仅为高峰一半；面板勾选/AI 用 schedule_task(off_peak=True) 皆可，调度器用 defer_until 字段持久化顺延状态（time/cron 当天一次语义保持，every 型自然错峰）；②**strict 工具模式（Beta）**——设置菜单一键开启（自动启用 Beta API）：所有工具 schema 自动规范化为 strict 格式（全部属性 required + additionalProperties=false，递归处理嵌套 object / items / anyOf），模型输出 Function 调用严格遵循 JSON Schema，减少参数格式错误；③错峰顺延时刻纯函数化（_defer_until）可测；全量测试 353 通过 |
+| 2.1.0 | **思考模式深度优化（超越官方开箱体验）**：①思考档位对齐官方完整映射表——恢复 medium/xhigh 档（官方映射 medium→high · high→high · xhigh→high · max→max，修正此前 xhigh→max 的错误假设），UI 提供 none/low/medium/high/xhigh/max 六档 + auto 智能路由；②**思考成本优化**——无工具调用的历史轮次发送时自动剥离 reasoning_content（官方规则：该内容在后续轮次会被 API 忽略，不传即省每轮数千 token 输入费），带工具调用的轮次完整回传（官方要求）；③**缓存友好消息布局**——恒定的 json_hint 保持最前、可变的记忆注入追加在末尾（system 消息位置任意），记忆/项目上下文刷新不再破坏稳定前缀，最大化官方硬盘缓存命中（前缀完整匹配规则）；④**动态注入分离**——长期记忆+工作目录+行为指令走稳定 system 注入，项目上下文/检查点/成功模式/任务记录/失败模式/相关文件走 trailing_text 追加到本轮 user 消息尾部（不污染会话历史）；⑤**JSON 输出自校验重试**——输出自动 json.loads 校验，解析失败自动追加修正提示重试一次（官方明示 JSON 输出有概率非法，应用层救回）；⑥auto 智能路由增强——多步骤指令（编号/步骤式 ≥3 条）自动升级思考深度；全量测试 347 通过 |
+| 2.0.0 | **V4 正式版适配（鲸语正式版 GA）**：①模型适配——DeepSeek-V4-Flash-0731 / DeepSeek-V4-Pro-0813 正式版（MODELS 记录版本号与 1M 上下文 / 384K 输出上限）；②**新峰谷定价体系**（2026-08-17 生效）——PRICING 更新为官方高峰价（flash 3.0/9.0/缓存命中 0.10，pro 9.0/27.0/0.30 元每百万 tokens），estimate_cost 按「空闲时段=高峰一半」自动打折（统计/预算/省钱报告即时准确），峰谷判断下沉 shared.py 与客户端共享；③思考档位对齐官方——移除 xhigh，正式档位 none/low/high/max + auto 智能路由（low/high/max 直接透传 reasoning_effort）；修复 auto 判简单任务时误传 reasoning_effort="none" 的隐患（改走禁用思考+采样参数路径）；④输出上限放宽——max_tokens 上限 65536→393216（V4 最大输出 384K）；⑤缓存警示文案动态化——按当前模型高峰价显示命中/未命中差价（不再写死 0.02/1）；⑥高峰提示文案更新为「按高峰价计费（空闲为一半）」；全量测试 340 通过（新增 V4 GA 适配 10 项） |
+| 1.12.0 | **自动化与常驻体系**：①定时任务补跑——程序未运行时错过的任务启动时自动补执行（time 型补当天一次、cron 型补最近一次匹配，不积压）；②三层自动化打通——流程步骤支持引用配方（`{"recipe": "配方名", "text": "目标"}` 自动注入已验证工具链），定时任务新增 workflow 动作（到点自动运行流程，UI 校验流程存在性）；③系统托盘常驻——pystray 托盘图标（显示/隐藏/退出，回调走 UI 队列线程安全，线程崩溃检测防窗口锁死），设置菜单「关闭时最小化到托盘」开关（不可用/启动失败时提示并回滚）；④开机自启——HKCU Run 键注册（自动探测 venv pythonw / 打包 exe），设置菜单一键开关；⑤失败模式库——AI 工具执行失败自动积累（工具/参数/错误/时间，同错去重上限 50 条），注入「已知失败模式」上下文引导 AI 规避已知坑，工具菜单查看/清空；⑥任务中断检测——**修复"回复到一半误报任务完成"**：`_consume_stream` 捕获 finish_reason，输出达 max_tokens 上限被截断 / 流式连接中途断线 / 工具调用流截断 / 工具轮数耗尽均通过 on_truncated 通知 UI，任务报告区分「任务完成 ✅」与「任务中断 ⚠」（附继续路径指引），纯对话截断显示「回复中断」，桌面通知/任务面板同步区分；⑦代码去重——cron 引擎/PATH_RE/OCR 脚本抽入 shared.py（消除 main 与 deepseek_client 双份实现漂移）；⑧修复 edit_file 正则替换串反向引用被解释（`\1`/`\\` 静默改写，改 lambda 原样替换）、wechat_writer 缺失 markdown 依赖声明、测试死代码断言；全量测试 330 通过 |
 | 1.11.0 | **UI 布局定版（Layout Specification v1.0）**：统一 LAYOUT 尺寸常量系统（窗口 1280x820/minsize 880x620、侧栏 260(200-420)、面板 280(240-480)/文件视图 460、菜单 34/状态栏 30、内容列 560-860）；**核心修复输入区与聊天内容列同宽对齐**（1280 窗口错位 96px→0，四档窗口全部对齐）；窗口几何记忆（config window_geometry 恢复+屏幕内校验）；紧凑模式重校准（≤1120 收侧栏、≤1000 收面板，窄窗优先保聊天，内容列物理容器让步防越界）；对话框三档规范化（420/520/640 + 高 300/420/460/540/620 自动吸附，26 个既有对话框全部归一）；状态栏右段收窄（context 条 120px）；全量测试 312 通过（新增 test_ui_layout 13 项） |
 | 1.11.0 | **UI 定版大版本**（完整清单）：①品牌一致性——导出 MD 头/窗口标题/splash 启动界面统一鲸语品牌（清除 DeepSeek Assistant/DeepSeek 引擎残留），关于/帮助/余额查询/用量统计/导出成功 5 类弹窗从系统 messagebox 升级为品牌对话框，欢迎页更新；②菜单栏——新增「视图」菜单（主题/字号/Markdown/面板显隐/建议开关），工具菜单 6 组功能分区，试玩→示例任务，新增 Alt+F/E/V/T/S/H 菜单快捷键；③状态栏三段式信息分级（左=模式/目录/统计/预算，右=模型/场景/思考）；④主题 token 定版——新增 hover/note/mention/quote_bg/input_placeholder 五色（菜单悬停、时间戳、引用块、占位符全部接入）；⑤字号规范——fsz=8 与 8pt label 全量统一 9pt（main 73 处 + 面板 4 处）；⑥侧栏「会话」→「对话」+ 按钮文案统一；⑦设置面板外观组补字号标签；全量测试 299 通过 |
 | 1.11.0 | **UI 定版大版本**：品牌一致性（导出 MD 头/窗口标题统一鲸语品牌、关于/帮助升级为品牌对话框、欢迎页更新）；菜单栏重构（新增「视图」菜单：主题/字号/Markdown/面板显隐/建议开关；工具菜单按 6 组功能分区：账户与用量/任务与模板/能力管理/数据与文件/自我进化/系统；「试玩任务」更名为「示例任务」）；状态栏三段式信息分级（左=模式/目录/统计/预算，右=模型/场景/思考）；侧栏命名与字号规范（「会话」→「对话」、8pt 小字统一 9pt、新增 toggle_sidebar 左侧栏显隐）；全量测试 299 通过 |
@@ -374,6 +413,32 @@ python main.py
 | JSON 输出返回空内容 | API 概率性空响应，工具已自动重试；可在提问中附 JSON 格式示例缓解 |
 | FIM 补全失败 | FIM 为 Beta 能力，会自动使用 /beta 端点；提示 400 请确认前缀/后缀格式合法 |
 
+## 插件体系（.wtplugin）
+
+鲸语插件 = 零代码能力的组合包（单文件 JSON，可分享安装）。与官方 Agent 框架"一切皆插件"理念殊途同归——官方面向开发者（写 npm 插件），鲸语面向用户（说需求 → AI 生成插件 → 确认导入）。
+
+插件文件格式：
+
+```json
+{
+  "format": "wtplugin",
+  "version": 1,
+  "meta": {"name": "小红书文案助手", "description": "一键生成爆款文案", "author": "…", "version": "1.0.0"},
+  "requires": ["playwright"],            // 可选：依赖的 pip 包（安装时自动自检）
+  "contents": {
+    "tools":     [...],                  // 自定义 HTTP 工具（Agent 可自动调用）
+    "skills":    [...],                  // 技能/提示词模板（⚡ 指令一键插入）
+    "workflows": {"流程名": {"steps": [...]}},  // 自动化流程（可接入定时任务）
+    "scenario":  {"name": "…", "thinking": "high", "system_prompt": "…", "enabled_tools": [...]}
+  }
+}
+```
+
+- 安装：工具 →「插件管理」→ 导入插件文件（内容预览 + 依赖自检 → 确认）
+- **AI 生成**：工具 →「插件工坊」→ 描述需求 → AI 调用 `create_plugin` 自动生成并安装（走权限审批）
+- 卸载/停用：精确移除本插件条目（带 `_source` 来源标记），手动添加的同名能力不受影响
+- 分发：导出 .wtplugin 文件分享，他人导入即获得同款能力
+
 ## 文件结构
 
 ```
@@ -381,6 +446,8 @@ WhaleTalk/（项目目录名可自行更改，程序不依赖目录名）
 ├── main.py              # GUI 入口
 ├── splash.py            # 启动界面（深海蓝鲸主题，淡出动画）
 ├── deepseek_client.py   # API 客户端（流式、思考模式、JSON、续写、FIM、工具调用）
+├── shared.py            # 跨模块共享（cron 引擎 / 路径正则 / Windows OCR 脚本）
+├── plugins.py           # 插件体系（.wtplugin 导入/应用/卸载/启停/依赖自检）
 ├── exporters.py         # 会话导出扩展（HTML / JSONL）
 ├── permissions.py       # 权限模型（白名单/审批/审计，默认全关）
 ├── mdparse.py           # 轻量 Markdown 渲染器
@@ -403,20 +470,21 @@ WhaleTalk/（项目目录名可自行更改，程序不依赖目录名）
 
 ### 🐋 WhaleTalk — AI Desktop Assistant (DeepSeek V4)
 
-WhaleTalk (Chinese: 鲸语, "Whale Song") is a **Windows desktop AI chat assistant** built and deeply optimized around the **DeepSeek V4 API**. It turns V4's agentic power, 1M-token context window, and peak/off-peak pricing into a polished, commercial-grade desktop experience. **WhaleTalk is an independent product brand and has no affiliation with DeepSeek.**
+WhaleTalk (Chinese: 鲸语, "Whale Song") is a **Windows desktop AI chat assistant** built and deeply optimized around the **DeepSeek V4 API**, turning its agentic power, 1M-token context, and peak/off-peak pricing into a polished, commercial-grade desktop experience. **WhaleTalk is an independent product brand with no affiliation to DeepSeek.**
 
-### Highlights
+### Highlights (v2.12)
 
-- **Commercial-grade 3-column layout**: session list · chat area · collapsible settings panel, fully theme-aware (light / pure-black dark), draggable dividers, compact-mode auto-collapse on narrow windows.
-- **Streaming everything**: thoughts, tool calls, and Markdown render live with 40ms batched rendering; incomplete cross-chunk markers are held until generation finishes.
-- **Agent tool system (80+ built-in tools)**: date/weather, web search (Bing + DuckDuckGo fallback), page fetching, file read/write/edit, sandboxed Python (`run_python`), terminals, databases (SQLite/MySQL/PostgreSQL, read-only by default), CSV/Excel, charts, PDF/DOCX/PPTX, RSS, QR codes, KV store, WebDAV, ffmpeg media, image generation/OCR/understanding, screen capture, TTS/STT, email, webhooks, scheduled & cron tasks, parallel subagents, and more — each individually toggleable.
-- **Smart permission & audit model**: whitelist + approval flow (auto/confirm/deny) + audit logs, path-traversal and SSRF protection; **🤖 Full-Auto Mode** lets the AI complete tasks end-to-end without approval prompts while system blocklists and audit logs stay active.
-- **Self-evolution 🧬**: WhaleTalk inspects its own codebase, writes improvement proposals (never modifying original files), one-click adoption with `.evobak` rollback, self-review reports, and feature-suggestion documents for your development AI.
-- **WeChat Writer ✍**: RSS-driven AI article writing (9 source groups → relevance filtering → LLM topic selection → 3-stage writing → quality gate) — drafts only, publication stays in your hands.
-- **Smart context management**: dual character/token thresholds, LLM summarization of old turns, archived Markdown of trimmed content, 99% cache-hit optimization with peak-pricing awareness.
-- **Profiles & multi-account**: multiple API keys / base URLs / models with one-click switching; **API keys encrypted with Windows DPAPI**.
-- **Productivity**: scenario packs (Office/Dev/Creative), task templates, prompt library, character presets, command palette (Ctrl+K), batch tasks, session tags/favorites/branching, conversation export (MD/TXT/HTML/JSONL), usage & budget reports, session minutes, and a task execution panel with per-tool results, durations and pass/fail summaries.
-- **Self-healing & safety**: auto-retry with exponential backoff (429/network), empty-response retry, crash snapshot recovery, single-instance lock, atomic config writes, log rotation, and a privacy mode that persists nothing.
+- **🧩 Plugin system (`.wtplugin`, zero-code extension)**: a plugin bundles tools, skills (prompt templates), workflows, and one-click scenarios into a single shareable JSON file. Import / export / enable / disable / uninstall with dependency checks; **Plugin Workshop** lets the AI generate and install a plugin from a natural-language request (`create_plugin` tool, behind the permission gate); built-in gallery with 3 sample plugins (Xiaohongshu copy, weekly report, meeting minutes).
+- **🛠 Tool Center & Plugin Center (browser-style pages)**: Ctrl+Shift+T / Ctrl+Shift+P open tabbed centers (overview cards, tool settings, permissions; my plugins, gallery, workshop), with drag-and-drop `.wtplugin` import.
+- **Automation menu (new top-level)**: scheduled tasks (cron / HH:MM / every-N-minutes, missed-task catch-up on startup), workflow management, knowledge base, task checkpoints, project task logs, daily briefings — plus system tray (pystray) and auto-start on boot.
+- **100+ Agent tools**: web search & fetch, sandboxed Python (`run_python`), terminals, file read/write/edit with atomic writes, databases (SQLite/MySQL/PostgreSQL, read-only by default), CSV/Excel, charts, PDF/DOCX/PPTX, RSS, QR codes, KV store, WebDAV, ffmpeg media, image generation/OCR/understanding, screen capture, TTS/STT, email, webhooks, parallel subagents, and more — each individually toggleable.
+- **Smart permission & audit model**: whitelist + approval flow (auto/confirm/deny) + audit logs, path-traversal, SSRF, and command-injection protection; **🤖 Full-Auto Mode** for end-to-end autonomous tasks while system blocklists and audit logs stay active.
+- **Self-evolution 🧬**: inspects its own codebase, writes improvement proposals (never touching original files), one-click adoption with `.evobak` rollback, self-review reports, and feature suggestions for your development AI.
+- **Cost-aware engineering**: thinking-cost optimization (strips unused reasoning from history rounds), cache-friendly message layout (stable prefix for official disk-cache hits, ~99% hit rate), peak-pricing alerts, budget control, and real usage statistics.
+- **WeChat Writer ✍**: RSS-driven AI article writing (source groups → relevance filtering → LLM topic selection → 3-stage writing → quality gate) — drafts only, publication stays in your hands.
+- **Smart context management**: dual character/token thresholds, LLM summarization of old turns, Markdown archives of trimmed content.
+- **Screen-adaptive UI**: centers dialogs on the main window, F11 fullscreen, scale-aware dialog sizes and fonts for 1080p/2K/4K displays; light / pure-black themes.
+- **Security**: API keys encrypted with Windows DPAPI (fail-closed), privacy mode that persists nothing, audit logs with sanitized fields.
 
 ### Installation
 
@@ -433,22 +501,21 @@ Requires **Python 3.9+ and Windows 10/11**.
 ### Configuration
 
 1. Apply for an API Key at https://platform.deepseek.com
-2. Paste it into the top "API Key" field on first launch (or edit `config.json`)
+2. Paste it into the "API Key" field on first launch (or edit `config.json`)
 
-Key `config.json` options: `model` (deepseek-v4-flash / deepseek-v4-pro), `scenario` (通用/编程/Agent/自定义), `thinking` (none/low/high/max/xhigh), `max_tokens`, `system_prompt` (keep fixed for max cache hits), context-compression thresholds, `monthly_budget`, `privacy_mode`, `theme`, JSON output, Beta API (prefix continuation + FIM), and `permissions.json` / `webhooks.json` / `db_config.json` / `email_config.json` for agent permissions, push channels, databases, and mail.
+Key options: `model`, `scenario`, `thinking`, `max_tokens`, `system_prompt` (keep fixed for max cache hits), context-compression thresholds, `monthly_budget`, `privacy_mode`, `theme`, JSON output, Beta API, `permissions.json` / `webhooks.json` / `db_config.json` / `email_config.json` for permissions, push channels, databases, and mail.
 
-> **Security note**: `config.json` contains your API Key (DPAPI-encrypted) — never share or commit it. Clear the key before packaging an exe.
+> **Security note**: `config.json` contains your DPAPI-encrypted API Key — never share or commit it. Clear the key before packaging an exe.
 
 ### Data Locations
 
 - Logs: `%USERPROFILE%\Documents\WhaleTalk\logs\assistant.log`
-- History: `%USERPROFILE%\Documents\WhaleTalk\history\` (latest session + lazy-loaded session library)
-- Archives / stats / user tools / prompts: under `%USERPROFILE%\Documents\WhaleTalk\`
+- History / archives / stats / prompts / user tools: under `%USERPROFILE%\Documents\WhaleTalk\`
 - Old-version data directories are auto-migrated on first launch.
 
 ### Tech Stack
 
-Python (Tkinter GUI) · DeepSeek V4 API (OpenAI-compatible streaming) · tiktoken · PyInstaller · Playwright (optional browser automation) · faster-whisper (optional STT) · PyMuPDF/reportlab · diskcache · pyzbar · httpx
+Python (Tkinter GUI) · DeepSeek V4 API (OpenAI-compatible streaming) · tiktoken · PyInstaller · pystray · Playwright (optional) · faster-whisper (optional) · PyMuPDF/reportlab · diskcache · pyzbar · httpx
 
 ---
 

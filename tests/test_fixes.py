@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import deepseek_client as dc
 import permissions
+import main as m
 
 
 class TestRunPythonAstGuard(unittest.TestCase):
@@ -120,9 +121,11 @@ class TestSSRFDnsRebinding(unittest.TestCase):
 
         return mock.patch("socket.getaddrinfo", side_effect=fake_getaddrinfo)
 
-    def test_domain_resolving_to_loopback_blocked(self):
+    def test_domain_resolving_to_loopback(self):
+        """解析到回环：默认放行（本地开发验证）；严格场景（allow_loopback=False）拦截。"""
         with self._patch_getaddrinfo(["127.0.0.1"]):
-            self.assertTrue(dc._is_private_host("evil.example.com"))
+            self.assertFalse(dc._is_private_host("evil.example.com"))
+            self.assertTrue(dc._is_private_host("evil.example.com", allow_loopback=False))
 
     def test_domain_resolving_to_private_blocked(self):
         with self._patch_getaddrinfo(["10.0.0.5", "8.8.8.8"]):
@@ -134,23 +137,62 @@ class TestSSRFDnsRebinding(unittest.TestCase):
             self.assertFalse(dc._is_private_host("public.example.com"))
 
     def test_metadata_hostname_blocked(self):
-        # 主机名字面检查保留：元数据 IP 与 localhost 无需解析直接拦截
+        # 云元数据地址永远阻止（白名单不可豁免）；回环默认放行（本地开发验证）
         self.assertTrue(dc._is_private_host("169.254.169.254"))
-        self.assertTrue(dc._is_private_host("localhost"))
+        self.assertFalse(dc._is_private_host("localhost"))
 
-    def test_plain_ip_variants_still_blocked(self):
-        for host in ("127.0.0.1", "10.1.2.3", "172.16.5.5", "192.168.0.1", "::1", "0.0.0.0"):
+    def test_loopback_allowed_but_private_blocked(self):
+        """回环（localhost/127/::1）默认放行；内网/保留网段仍阻止。"""
+        for host in ("127.0.0.1", "::1", "127.0.0.9"):
+            self.assertFalse(dc._is_private_host(host), host)
+        for host in ("10.1.2.3", "172.16.5.5", "192.168.0.1", "0.0.0.0", "169.254.1.2"):
             self.assertTrue(dc._is_private_host(host), host)
 
+    def test_loopback_strict_when_disallowed(self):
+        """严格场景（搜索过滤等外部注入源）：回环也阻止。"""
+        self.assertTrue(dc._is_private_host("127.0.0.1", allow_loopback=False))
+        self.assertTrue(dc._safe_url("http://localhost:3000/", allow_loopback=False))
+
+    def test_trusted_whitelist_allows_private(self):
+        """SSRF 信任白名单：内网 IP/CIDR/主机名 显式信任后放行；元数据仍阻止。"""
+        dc.set_ssrf_trusted(["192.168.1.10", "10.0.0.0/8", "nas.home.arpa"])
+        try:
+            self.assertFalse(dc._is_private_host("192.168.1.10"))
+            self.assertFalse(dc._is_private_host("10.2.3.4"))       # CIDR
+            self.assertFalse(dc._is_private_host("NAS.HOME.ARPA"))  # 大小写不敏感
+            self.assertTrue(dc._is_private_host("192.168.2.9"))     # 未信任
+            self.assertTrue(dc._is_private_host("169.254.169.254"))  # 元数据永不豁免
+        finally:
+            dc.set_ssrf_trusted([])
+
+    def test_plain_ip_variants_still_blocked(self):
+        for host in ("10.1.2.3", "172.16.5.5", "192.168.0.1", "0.0.0.0"):
+            self.assertTrue(dc._is_private_host(host), host)
+
+    def test_fetch_url_allows_localhost(self):
+        """fetch_url 默认放行回环（本地服务器验证），内网仍拒绝。"""
+        self.assertFalse(dc._safe_url("http://localhost:3000/"))
+        self.assertFalse(dc._safe_url("http://127.0.0.1:5173/"))
+        self.assertTrue(dc._safe_url("http://192.168.1.5/"))
+
     def test_fetch_url_rejects_internal_after_resolve(self):
-        with self._patch_getaddrinfo(["127.0.0.1"]):
+        with self._patch_getaddrinfo(["10.0.0.5"]):
             out = dc.fetch_url("http://rebind.example.com/")
         self.assertIn("SSRF", out) or self.assertIn("阻止", out)
 
 
 class TestCustomToolSSRF(unittest.TestCase):
-    def test_endpoint_internal_rejected(self):
+    def test_endpoint_loopback_allowed(self):
+        """自定义工具 endpoint 为回环（用户注册的本地服务）默认放行。"""
         handler = {"function": {"name": "t", "endpoint": "http://127.0.0.1:8080/api"}}
+        with mock.patch("deepseek_client._http_client") as http:
+            http.return_value.post.return_value.raise_for_status.return_value = None
+            http.return_value.post.return_value.text = "ok"
+            out = dc.DeepSeekClient._run_custom_tool(handler, "{}")
+        self.assertEqual(out, "ok")
+
+    def test_endpoint_internal_rejected(self):
+        handler = {"function": {"name": "t", "endpoint": "http://192.168.1.10:8080/api"}}
         out = dc.DeepSeekClient._run_custom_tool(handler, "{}")
         self.assertIn("endpoint", out)
 
@@ -217,6 +259,97 @@ class TestSearchLocalControlFlow(unittest.TestCase):
         self.assertIn("a.txt", out)
         out2 = dc.search_local(self.ws, "不存在的词xyz")
         self.assertIn("未找到", out2)
+
+
+class TestFailurePatterns(unittest.TestCase):
+    """失败模式库：记录去重 / 注入文本 / 上限裁剪（静态方法，无实例依赖）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dsa_fail_")
+        m.FAILURES_PATH = os.path.join(self.tmp, "failures.json")
+
+    def tearDown(self):
+        import shutil
+
+        m.FAILURES_PATH = os.path.join(m.DATA_DIR, "failures.json")
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_append_dedup_and_cap(self):
+        m.AssistantApp._append_failures([
+            {"tool": "write_file", "args": "{}", "error": "内容超过大小限制", "ts": "t1"},
+            {"tool": "write_file", "args": "{}", "error": "内容超过大小限制", "ts": "t2"},
+            {"tool": "fetch_url", "args": "{}", "error": "网络错误", "ts": "t3"},
+        ])
+        items = m.AssistantApp._load_failures()
+        self.assertEqual(len(items), 2)  # 同工具同错误去重
+        self.assertEqual(items[0]["ts"], "t2")  # 去重时更新时间戳
+
+    def test_injection_text(self):
+        m.AssistantApp._append_failures([
+            {"tool": "edit_file", "args": "{}", "error": "目标文本未找到", "ts": "t"},
+        ])
+        text = m.AssistantApp._failure_patterns_text()
+        self.assertIn("edit_file", text)
+        self.assertIn("目标文本未找到", text)
+        self.assertIn("已知失败模式", text)
+
+    def test_empty_no_injection(self):
+        self.assertEqual(m.AssistantApp._failure_patterns_text(), "")
+
+
+class TestBudgetThinking(unittest.TestCase):
+    """预算感知思考降档：接近预算 80% 时 auto/max 自动降 high，尊重手动档位。"""
+
+    def test_auto_downgraded_near_budget(self):
+        eff, near = m.AssistantApp._budget_thinking(100.0, 90.0, "auto")
+        self.assertEqual(eff, "high")
+        self.assertTrue(near)
+
+    def test_max_downgraded_near_budget(self):
+        eff, near = m.AssistantApp._budget_thinking(100.0, 80.0, "max")
+        self.assertEqual(eff, "high")
+        self.assertTrue(near)
+
+    def test_manual_levels_respected(self):
+        """用户显式选择 low/medium/high 不被降档。"""
+        for level in ("low", "medium", "high"):
+            eff, near = m.AssistantApp._budget_thinking(100.0, 99.0, level)
+            self.assertEqual(eff, level, level)
+            self.assertTrue(near)
+
+    def test_within_budget_no_change(self):
+        eff, near = m.AssistantApp._budget_thinking(100.0, 50.0, "max")
+        self.assertEqual(eff, "max")
+        self.assertFalse(near)
+
+    def test_no_budget_no_change(self):
+        eff, near = m.AssistantApp._budget_thinking(0.0, 999.0, "auto")
+        self.assertEqual(eff, "auto")
+        self.assertFalse(near)
+
+
+class TestAutostart(unittest.TestCase):
+    """开机自启命令构造与注册表写入（mock winreg，不触碰真实注册表）。"""
+
+    def test_command_contains_main(self):
+        if getattr(sys, "frozen", False):
+            self.skipTest("打包环境命令为 exe 自身")
+        cmd = m.AssistantApp._autostart_command()
+        self.assertIn("main.py", cmd)
+        self.assertIn("pythonw", cmd)
+
+    def test_set_autostart_writes_registry(self):
+        with mock.patch("winreg.OpenKey", return_value=object()) as ok, \
+             mock.patch("winreg.SetValueEx") as sv, \
+             mock.patch("winreg.DeleteValue") as dv, \
+             mock.patch("winreg.CloseKey"):
+            self.assertTrue(m.AssistantApp._set_autostart(True))
+            sv.assert_called_once()
+            dv.assert_not_called()
+            ok.assert_called_once()
+            self.assertTrue(m.AssistantApp._set_autostart(False))
+            dv.assert_called_once()
+            sv.assert_called_once()  # 关闭时不再写入
 
 
 if __name__ == "__main__":

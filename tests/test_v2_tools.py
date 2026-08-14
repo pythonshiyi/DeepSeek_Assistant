@@ -5,10 +5,11 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import main as m
 import deepseek_client as dc
 import permissions
 
@@ -270,6 +271,24 @@ class TestCheckpoint(unittest.TestCase):
         self.assertIn("搭建网站", out)
         self.assertIn("启动服务器", out)
 
+    def test_auto_checkpoint_flag(self):
+        """自动断点：auto=True 落盘标记；load 显示标注；正常完成 clear 清除。"""
+        r = dc.task_checkpoint_save(name="自动任务", status="进行中", auto=True)
+        self.assertIn("已保存", r)
+        data = json.load(open(dc.CHECKPOINT_FILE, encoding="utf-8"))
+        self.assertTrue(data.get("auto"))
+        out = dc.task_checkpoint_load()
+        self.assertIn("自动断点", out)
+        # 正常完成 → 自动断点被清除
+        self.assertIn("已清除", dc.task_checkpoint_clear())
+        self.assertIn("没有任务检查点", dc.task_checkpoint_load())
+
+    def test_manual_checkpoint_not_cleared(self):
+        """手动断点：task_checkpoint_clear 不删除。"""
+        dc.task_checkpoint_save(name="手动任务", status="进行中")
+        self.assertIn("手动保存", dc.task_checkpoint_clear())
+        self.assertIn("手动任务", dc.task_checkpoint_load())
+
     def test_load_empty(self):
         self.assertIn("没有任务检查点", dc.task_checkpoint_load())
 
@@ -302,6 +321,133 @@ class TestUsageReport(unittest.TestCase):
     def test_no_data(self):
         dc.STATS_FILE = os.path.join(self.tmp, "none.json")
         self.assertIn("暂无", dc.usage_report())
+
+
+class TestDailyBrief(unittest.TestCase):
+    """每日简报：采集 → LLM 提炼 → 落盘（mock 采集与客户端，真实执行编排）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dsa_brief_")
+        ws = os.path.join(self.tmp, "ws")
+        os.makedirs(ws, exist_ok=True)
+        permissions.init(os.path.join(self.tmp, "perm.json"), ws)
+        data = permissions.get_data()
+        data["filesystem"]["blocked_dirs"] = [
+            d for d in data["filesystem"]["blocked_dirs"] if "AppData" not in d
+        ]
+        permissions.set_full_auto(True)
+        self.ws = ws
+
+    def tearDown(self):
+        permissions.set_full_auto(False)
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake_items(self):
+        from types import SimpleNamespace
+
+        return [
+            SimpleNamespace(title="OpenAI 发布新模型", url="https://e.com/1",
+                            source="机器之心", summary="性能大幅提升", published="2026-08-13 09:00",
+                            fetched=True, full_text=""),
+            SimpleNamespace(title="AI Agent 工具盘点", url="https://e.com/2",
+                            source="量子位", summary="开源工具汇总", published="2026-08-13 10:00",
+                            fetched=True, full_text=""),
+        ]
+
+    def _fake_client(self, brief_text):
+        class _Msg:
+            content = brief_text
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        class _Completions:
+            def create(self, **kw):
+                return _Resp()
+
+        class _Client:
+            model = "deepseek-v4-flash"
+
+            class client:
+                chat = type("Chat", (), {"completions": _Completions()})()
+
+        return _Client()
+
+    def test_tool_registered(self):
+        names = [t["function"]["name"] for t in dc.TOOLS]
+        self.assertIn("daily_brief", names)
+        self.assertIn("daily_brief", dc.TOOL_CALL_MAP)
+
+    def test_generate_and_persist(self):
+        brief = "## 今日 AI 动态\n\n- OpenAI 发布新模型：值得关注\n\n## 今日趋势\n国产模型加速追赶。"
+        old = dc._CLIENT_HOLDER["client"]
+        try:
+            dc._CLIENT_HOLDER["client"] = self._fake_client(brief)
+            with mock.patch("wechat_writer.sources.collect_all", return_value=self._fake_items()):
+                out = dc.daily_brief()
+        finally:
+            dc._CLIENT_HOLDER["client"] = old
+        self.assertIn("今日简报", out)
+        self.assertIn("OpenAI 发布新模型", out)
+        # 落盘工作区 briefs/
+        briefs = os.path.join(self.ws, "briefs")
+        files = os.listdir(briefs) if os.path.isdir(briefs) else []
+        self.assertTrue(any(f.startswith("brief_") and f.endswith(".md") for f in files))
+
+    def test_topic_filter(self):
+        brief = "## 过滤后简报"
+        old = dc._CLIENT_HOLDER["client"]
+        try:
+            dc._CLIENT_HOLDER["client"] = self._fake_client(brief)
+            with mock.patch("wechat_writer.sources.collect_all", return_value=self._fake_items()):
+                out = dc.daily_brief(topic="不存在关键词xyz")
+        finally:
+            dc._CLIENT_HOLDER["client"] = old
+        self.assertIn("暂无资讯素材", out)
+
+    def test_no_client_error(self):
+        old = dc._CLIENT_HOLDER["client"]
+        try:
+            dc._CLIENT_HOLDER["client"] = None
+            with mock.patch("wechat_writer.sources.collect_all", return_value=self._fake_items()):
+                out = dc.daily_brief()
+        finally:
+            dc._CLIENT_HOLDER["client"] = old
+        self.assertIn("没有可用客户端", out)
+
+
+class TestWechatToolDefaults(unittest.TestCase):
+    """公众号写作能力默认可用（防再次被移出默认启用集/运行时不可见）。"""
+
+    def test_builtin_defaults_include_wechat_tools(self):
+        """标准模式默认启用集包含公众号工具（run_wechat_writer / publish_draft）。"""
+        self.assertIn("run_wechat_writer", m.BUILTIN_TOOL_NAMES)
+        self.assertIn("publish_draft", m.BUILTIN_TOOL_NAMES)
+
+    def test_normalize_merges_wechat_tools(self):
+        """旧配置升级：缺失的公众号工具被自动补入 enabled_tools。"""
+        cfg = m.DEFAULT_CONFIG.copy()
+        cfg["enabled_tools"] = ["get_date", "fetch_url"]
+        m.normalize_config(cfg)
+        self.assertIn("run_wechat_writer", cfg["enabled_tools"])
+        self.assertIn("publish_draft", cfg["enabled_tools"])
+
+    def test_wechat_tool_in_schema_and_map(self):
+        """工具 schema 与调用映射完整（模型可见、可执行）。"""
+        names = [t["function"]["name"] for t in dc.TOOLS]
+        self.assertIn("run_wechat_writer", names)
+        self.assertIn("publish_draft", names)
+        self.assertIn("run_wechat_writer", dc.TOOL_CALL_MAP)
+        self.assertIn("publish_draft", dc.TOOL_CALL_MAP)
+        # schema 合法：无 array 参数缺 items
+        self.assertNotIn("array", dc.TOOLS[[i for i, t in enumerate(dc.TOOLS)
+                                            if t["function"]["name"] == "run_wechat_writer"][0]]
+                         ["function"]["parameters"]["properties"].get("dry_run", {}).get("type", "boolean"))
 
 
 class TestLongResultPersist(unittest.TestCase):
@@ -430,6 +576,76 @@ class TestValidationOnly(unittest.TestCase):
             import shutil as _sh
 
             _sh.rmtree(self.tmp2, ignore_errors=True)
+
+    def test_workflow_recipe_step_injects_chain(self):
+        """三层打通：流程步骤引用配方（patterns.json）→ 发送文本注入已验证工具链。"""
+        self.tmp2 = tempfile.mkdtemp(prefix="dsa_wf4_")
+        dc.WORKFLOWS_FILE = os.path.join(self.tmp2, "workflows.json")
+        dc.PATTERNS_FILE = os.path.join(self.tmp2, "patterns.json")
+        with open(dc.WORKFLOWS_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "周报流程": {"steps": [
+                    {"recipe": "周报生成", "text": "汇总本周工作"},
+                    {"text": "再检查一遍"},
+                ]}
+            }, f, ensure_ascii=False)
+        with open(dc.PATTERNS_FILE, "w", encoding="utf-8") as f:
+            json.dump([{"name": "周报生成", "chain": ["read_file", "create_doc"]}], f, ensure_ascii=False)
+        sent = []
+        dc.set_send_callback(lambda t: sent.append(t))
+        dc.set_busy_provider(lambda: False)
+        try:
+            r = dc.run_workflow("周报流程")
+            self.assertIn("启动流程", r)
+            time.sleep(5.5)  # 步骤间有 2s 间隔，等后台线程下发完
+            self.assertEqual(len(sent), 2)
+            self.assertIn("read_file → create_doc", sent[0])   # 配方链注入
+            self.assertIn("汇总本周工作", sent[0])              # 任务目标保留
+            self.assertEqual(sent[1], "再检查一遍")
+        finally:
+            dc.WORKFLOWS_FILE = None
+            dc.PATTERNS_FILE = None
+            import shutil as _sh
+
+            _sh.rmtree(self.tmp2, ignore_errors=True)
+
+    def test_workflow_recipe_missing_falls_back_to_text(self):
+        """配方不存在时降级为纯指令（不阻断流程）。"""
+        self.tmp2 = tempfile.mkdtemp(prefix="dsa_wf5_")
+        dc.WORKFLOWS_FILE = os.path.join(self.tmp2, "workflows.json")
+        dc.PATTERNS_FILE = os.path.join(self.tmp2, "patterns.json")
+        with open(dc.WORKFLOWS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"X": {"steps": [{"recipe": "不存在的配方", "text": "直接干"}]}}, f, ensure_ascii=False)
+        with open(dc.PATTERNS_FILE, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        sent = []
+        dc.set_send_callback(lambda t: sent.append(t))
+        dc.set_busy_provider(lambda: False)
+        try:
+            dc.run_workflow("X")
+            time.sleep(3.5)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("直接干", sent[0])
+            self.assertIn("配方「不存在的配方」不存在", sent[0])
+        finally:
+            dc.WORKFLOWS_FILE = None
+            dc.PATTERNS_FILE = None
+            import shutil as _sh
+
+            _sh.rmtree(self.tmp2, ignore_errors=True)
+
+    def test_schedule_workflow_action(self):
+        """定时任务支持 workflow 动作（到点自动运行流程）。"""
+        self.tmp2 = tempfile.mkdtemp(prefix="dsa_wf6_")
+        dc.SCHEDULES_FILE = os.path.join(self.tmp2, "schedules.json")
+        r = dc.schedule_task(expr_type="cron", expr="30 9 * * 1", content="周报流程", action="workflow", name="每周流程")
+        self.assertIn("已创建", r)
+        data = json.load(open(dc.SCHEDULES_FILE, encoding="utf-8"))
+        self.assertEqual(data[0]["action"], "workflow")
+        self.assertEqual(data[0]["text"], "周报流程")
+        # 缺流程名被拒绝
+        self.assertIn("错误", dc.schedule_task(expr_type="cron", expr="0 9 * * *", content="", action="workflow"))
+        self.assertIn("错误", dc.schedule_task(expr_type="cron", expr="0 9 * * *", content="x", action="fly"))
 
     def test_read_email_missing_config(self):
         dc.EMAIL_CONFIG_FILE = os.path.join(tempfile.gettempdir(), "dsa_missing_email.json")

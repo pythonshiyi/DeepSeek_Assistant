@@ -50,7 +50,11 @@ def load_prompts(path):
         items = []
         for p in data:
             if isinstance(p, dict) and p.get("name") and p.get("text"):
-                items.append({"name": str(p["name"]), "text": str(p["text"])})
+                item = {"name": str(p["name"]), "text": str(p["text"])}
+                # 来源标记（插件技能）：插件卸载时据此识别
+                if p.get("_source"):
+                    item["_source"] = str(p["_source"])
+                items.append(item)
         if not items:
             raise ValueError("为空")
         return items

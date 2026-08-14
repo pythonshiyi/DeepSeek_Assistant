@@ -56,6 +56,9 @@ def load_api_config(config_path=None):
 def chat(messages, max_tokens=4000, temperature=0.7, config_path=None, timeout=120.0):
     """调用 DeepSeek chat completions（非流式），失败重试 2 次指数退避。
 
+    思考模型适配：请求显式禁用思考模式（写作/选题场景直接输出内容，
+    避免响应 content 为空而推理在 reasoning_content）；响应解析仍回退
+    reasoning_content 兜底（部分模型忽略禁用参数时）。
     返回纯文本；全部失败抛 RuntimeError（由调用方降级处理）。
     """
     cfg = load_api_config(config_path)
@@ -68,8 +71,17 @@ def chat(messages, max_tokens=4000, temperature=0.7, config_path=None, timeout=1
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
+        "thinking": {"type": "disabled"},  # 写作场景：不进入思考模式（content 直出）
     }
     import httpx
+
+    def _extract_content(data):
+        """兼容思考模型：content 为空时回退 reasoning_content。"""
+        msg = (data.get("choices") or [{}])[0].get("message") or {}
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            content = str(msg.get("reasoning_content") or "").strip()
+        return content
 
     last_err = None
     for attempt in range(3):
@@ -78,8 +90,15 @@ def chat(messages, max_tokens=4000, temperature=0.7, config_path=None, timeout=1
                 url, json=payload, timeout=timeout,
                 headers={"Authorization": f"Bearer {cfg['api_key']}"},
             )
+            if resp.status_code == 400 and "thinking" in payload:
+                # 旧端点/非思考模型不接受 thinking 参数：去掉后重试一次
+                payload.pop("thinking", None)
+                resp = httpx.post(
+                    url, json=payload, timeout=timeout,
+                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                )
             resp.raise_for_status()
-            content = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+            content = _extract_content(resp.json())
             if not content:
                 raise RuntimeError("模型返回空内容")
             return content

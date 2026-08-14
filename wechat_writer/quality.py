@@ -55,8 +55,12 @@ def _llm_judge_duplicate(title, history_titles, llm_chat=None):
         return False
 
 
-def check(article, config, history_topics=None, history_titles=None, llm_chat=None):
-    """质量检查。article 需有 .title/.content/.topic。返回 QualityReport。"""
+def check(article, config, history_topics=None, history_titles=None, llm_chat=None, skip_dedup=False):
+    """质量检查。article 需有 .title/.content/.topic。返回 QualityReport。
+
+    skip_dedup=True：跳过历史查重通道（用户显式指定主题时——用户决策优先，
+    去重只约束自动选题；字数/来源/敏感词/完整性检查仍然执行）。
+    """
     style = config["style"]
     q = config["quality"]
     text = str(getattr(article, "content", "") or "")
@@ -90,8 +94,8 @@ def check(article, config, history_topics=None, history_titles=None, llm_chat=No
     if sections < 2:
         reasons.append(f"小节不足：{sections} < 2")
         score -= 20
-    # 5 双通道查重
-    if history_topics or history_titles:
+    # 5 双通道查重（用户显式指定主题时跳过：用户决策优先，去重仅约束自动选题）
+    if not skip_dedup and (history_topics or history_titles):
         if history_topics:
             for h in history_topics[-14:]:
                 if jaccard(str(getattr(article, "topic", "") or title), h) > q.get("similarity_threshold", 0.70):

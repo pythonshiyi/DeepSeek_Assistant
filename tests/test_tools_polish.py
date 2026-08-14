@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """工具精修回归测试：get_weather 日期 / send_email 收件人 / read_csv·read_excel 单元格截断 /
 fetch_url 编码 / environment_info 包检测 / PG 语句超时 / cron 值域 / image 系列校验 /
-run_command·start_process cwd / read_file 超长行 / schedule 值域。"""
+run_command·start_process cwd / read_file 超长行 / schedule 值域 / edit_file 替换串原样。"""
+import csv
 import json
 import os
 import sys
@@ -128,8 +129,12 @@ class TestWriteCsvMixedRows(unittest.TestCase):
     def test_dict_with_scalar_row(self):
         out = dc.write_csv(self.p, [{"a": 1, "b": 2}, "标量行"])
         self.assertIn("已写入", out)
-        data = json.load(open(self.p, encoding="utf-8-sig")) if False else open(self.p, encoding="utf-8-sig").read()
-        self.assertIn("1", data)
+        # 混合 dict/标量行健壮化：非 dict 行按空单元格写入，不崩溃且 dict 列头保留
+        with open(self.p, encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0], ["a", "b"])
+        self.assertEqual(rows[1], ["1", "2"])
+        self.assertEqual(len(rows), 3)
 
 
 class TestFetchUrlEncoding(unittest.TestCase):
@@ -289,6 +294,38 @@ class TestScheduleCronRange(unittest.TestCase):
     def test_range_ok(self):
         out = dc.schedule_task(expr_type="cron", expr="*/15 9-18 * * 1-5", content="x")
         self.assertIn("已创建", out)
+
+
+class TestEditFileBackref(unittest.TestCase):
+    """修复回归：正则替换文本中的反斜杠必须原样写入（不能被 re.sub 当分组引用/转义解释）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dsa_eb_")
+        self.ws = _init_perm(self.tmp)
+        self.p = os.path.join(self.ws, "t.txt")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_backslash_in_replacement_kept(self):
+        with open(self.p, "w", encoding="utf-8") as f:
+            f.write("price: 100")
+        r = dc.edit_file(self.p, regex=r"price: (\d+)", new=r"cost: \1 元")
+        self.assertIn("已替换", r)
+        with open(self.p, encoding="utf-8") as f:
+            content = f.read()
+        # 修复前：\1 被解释为分组引用 → "cost: 100 元"；修复后原样为 "cost: \1 元"
+        self.assertEqual(content, "cost: \\1 元")
+
+    def test_text_replace_unaffected(self):
+        with open(self.p, "w", encoding="utf-8") as f:
+            f.write("hello world")
+        r = dc.edit_file(self.p, old="hello", new=r"hi \d")
+        self.assertIn("已替换", r)
+        with open(self.p, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "hi \\d world")
 
 
 class TestCommandCwd(unittest.TestCase):

@@ -62,12 +62,16 @@ def _now_iso():
 
 
 def expand_rss(cfg):
-    """展开信源列表：用户 rss 列表优先；否则按 rss_groups 全部组展开。"""
+    """展开信源列表：用户 rss 列表优先；否则按 enabled_groups 展开（None=全部组）。"""
     rss = cfg["sources"].get("rss")
     if isinstance(rss, list) and rss:
         return [str(u).strip() for u in rss if str(u).strip()]
+    groups = cfg["sources"].get("rss_groups") or {}
+    enabled = cfg["sources"].get("enabled_groups")
+    if enabled is not None:
+        groups = {g: u for g, u in groups.items() if g in set(enabled)}
     out = []
-    for gname, urls in (cfg["sources"].get("rss_groups") or {}).items():
+    for gname, urls in groups.items():
         if isinstance(urls, list):
             out.extend(str(u).strip() for u in urls if str(u).strip())
     return out
@@ -96,11 +100,13 @@ def filter_by_keywords(items, keywords):
     return text_items
 
 
-def collect_rss(urls, since_hours=24, limit_per=10, timeout=RSS_TIMEOUT):
+def collect_rss(urls, since_hours=24, limit_per=10, timeout=RSS_TIMEOUT, use_blocked=False):
     """并发抓取多个 RSS 源，只保留 since_hours 内的条目（无时间字段的保留）。
 
     单源失败跳过；单源抓取有独立超时（内部线程 + join，feedparser 的
     urllib 请求本身无超时，慢源/DNS 挂起会卡死整轮采集——真实事故）。
+    use_blocked=True 时：直连失败/超时的源自动经 fetch_blocked 代理通道
+    重试（抓取 RSS 文本再解析），让被墙论坛（linux.do/hostloc 等）进入素材池。
     返回按发布时间倒序的 Item 列表。
     """
     urls = [u for u in (urls or []) if str(u).strip()]
@@ -117,24 +123,55 @@ def collect_rss(urls, since_hours=24, limit_per=10, timeout=RSS_TIMEOUT):
     cutoff = time.time() - since_hours * 3600 if since_hours and since_hours > 0 else None
     items = []
 
+    def _parse_feed(url_or_text, is_text=False):
+        """feedparser 解析 URL 或文本；失败返回 (None, err)。"""
+        try:
+            if is_text:
+                return feedparser.parse(str(url_or_text)), None
+            return feedparser.parse(str(url_or_text), request_headers={"User-Agent": UA}), None
+        except Exception as e:
+            return None, e
+
     def _one(url):
         out = []
         box = {}
+        direct_err = [None]
 
         def _parse():
-            try:
-                box["parsed"] = feedparser.parse(str(url), request_headers={"User-Agent": UA})
-            except Exception as e:
-                box["err"] = e
+            parsed, err = _parse_feed(url)
+            if err:
+                direct_err[0] = err
+                box["err"] = err
+                return
+            if parsed is None:
+                return
+            box["parsed"] = parsed
 
         t = threading.Thread(target=_parse, daemon=True)
         t.start()
         t.join(timeout)
         if t.is_alive():
             logger.warning("RSS 源超时跳过：%s", url)
-            return out
-        if "err" in box:
+            box["timeout"] = True
+        if "parsed" not in box and use_blocked:
+            # 代理升级：直连超时/失败 → fetch_blocked 抓 RSS 文本再解析
+            try:
+                from fetch_blocked import fetch_blocked as _fb
+                raw = _fb(url)
+                if raw and not str(raw).startswith("错误"):
+                    parsed, err = _parse_feed(raw, is_text=True)
+                    if parsed is not None:
+                        logger.info("RSS 源经代理获取成功：%s", url)
+                        box["parsed"] = parsed
+                    else:
+                        logger.warning("RSS 源代理解析失败 %s: %s", url, err)
+            except Exception as e:
+                logger.warning("RSS 源代理升级失败 %s: %s", url, e)
+        if "err" in box and "parsed" not in box:
             logger.warning("RSS 源失败 %s: %s", url, box["err"])
+            return out
+        if "parsed" not in box:
+            logger.warning("RSS 源超时跳过：%s", url)
             return out
         parsed = box["parsed"]
         for e in (parsed.entries or []):
@@ -259,10 +296,21 @@ def fetch_full_text(item, use_blocked=False):
 
 
 def collect_all(cfg, use_blocked=False):
-    """主入口：RSS + 搜索 合并 → 主题相关性过滤 → 去重 → 截断 → 抓全文（深度模式）。"""
+    """主入口：RSS + 搜索 合并 → 主题相关性过滤 → 去重 → 截断 → 抓全文（深度模式）。
+
+    use_blocked：RSS 直连失败的源自动经 fetch_blocked 代理通道重试，全文抓取
+    同样走代理（被墙论坛素材）。默认从 cfg["sources"]["use_blocked"] 读取，
+    显式传入则覆盖。
+    """
+    if not use_blocked:
+        use_blocked = bool((cfg.get("sources") or {}).get("use_blocked", False))
     items = []
     rss_urls = expand_rss(cfg)
-    items += collect_rss(rss_urls, since_hours=cfg["sources"].get("since_hours", 24))
+    items += collect_rss(
+        rss_urls,
+        since_hours=cfg["sources"].get("since_hours", 24),
+        use_blocked=use_blocked,
+    )
     if len(items) < 3:  # RSS 太少时用搜索兜底
         items += collect_search(cfg["sources"].get("search_keywords") or [])
     # 主题相关性过滤：综合源（IT之家/少数派等）会混入大量非 AI 内容，

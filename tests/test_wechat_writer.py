@@ -66,6 +66,52 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg["sources"]["max_candidates"], 200)
         shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_source_groups_structure(self):
+        """信源扩展：论坛组就位 + 默认仅启用国内可达组。"""
+        cfg = cfg_mod.load_config("/nonexistent/config.json")
+        groups = cfg["sources"]["rss_groups"]
+        for g in ("forums_cn", "forums_global", "forums_blocked", "weibo_tieba"):
+            self.assertIn(g, groups)
+            self.assertTrue(groups[g], f"{g} 组不应为空")
+        self.assertEqual(cfg["sources"]["enabled_groups"],
+                         ["ai_media", "tech", "life_tech", "dev_global", "forums_cn"])
+        self.assertFalse(cfg["sources"]["use_blocked"])
+        # 被墙组默认不展开（防止纯国内网络被墙源拖慢/空转）
+        urls = src_mod.expand_rss(cfg)
+        joined = "\n".join(urls)
+        self.assertNotIn("linux.do", joined)
+        self.assertNotIn("reddit.com", joined)
+        self.assertNotIn("rsshub.app", joined)
+        # 国内论坛组已展开
+        self.assertTrue(any("v2ex.com" in u for u in urls))
+        self.assertTrue(any("52pojie.cn" in u for u in urls))
+        # 用户显式启用被墙组后展开
+        cfg["sources"]["enabled_groups"] = ["ai_media", "forums_cn", "forums_blocked"]
+        urls = src_mod.expand_rss(cfg)
+        self.assertTrue(any("linux.do" in u for u in urls))
+        self.assertTrue(any("hostloc.com" in u for u in urls))
+        # 未知组名被钳制剔除
+        cfg2 = cfg_mod.load_config("/nonexistent/config.json")
+        cfg2["sources"]["enabled_groups"] = ["ai_media", "nonexistent_group"]
+        cfg2 = cfg_mod.load_config.__self__ if False else None
+        tmp = tempfile.mkdtemp()
+        p = os.path.join(tmp, "c.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"sources": {"enabled_groups": ["ai_media", "nonexistent_group"]}}, f)
+        cfg3 = cfg_mod.load_config(p)
+        self.assertEqual(cfg3["sources"]["enabled_groups"], ["ai_media"])
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_use_blocked_normalized(self):
+        """use_blocked 布尔钳制。"""
+        tmp = tempfile.mkdtemp()
+        p = os.path.join(tmp, "c.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"sources": {"use_blocked": "yes"}}, f)
+        cfg = cfg_mod.load_config(p)
+        self.assertIsInstance(cfg["sources"]["use_blocked"], bool)
+        shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestSources(unittest.TestCase):
     def test_collect_rss_empty(self):
@@ -124,6 +170,61 @@ class TestSources(unittest.TestCase):
             out = src_mod.fetch_full_text(it)
         self.assertFalse(out.fetched)
         self.assertEqual(out.summary, it.summary)
+
+    def test_collect_rss_blocked_upgrade_via_proxy(self):
+        """被墙源升级：直连失败/超时后自动经 fetch_blocked 重试并解析 RSS 文本。"""
+        entry = SimpleNamespace(
+            title="linux.do 热帖", link="https://linux.do/t/1",
+            summary="正文", published_parsed=None, updated_parsed=None,
+        )
+        feed = SimpleNamespace(entries=[entry], feed=SimpleNamespace(title="Linux Do"))
+        real_feed = feed
+
+        def direct_fail(url, **k):
+            raise OSError("DNS 污染/被墙")
+
+        def parse_proxy(text, **k):
+            return real_feed
+
+        fp = mock.MagicMock()
+        fp.parse.side_effect = parse_proxy
+        with mock.patch.dict(sys.modules, {"feedparser": fp}), \
+             mock.patch("fetch_blocked.fetch_blocked", return_value="<rss>xml</rss>"):
+            # 让直连失败：parse 返回抛错的第一个调用（feedparser.parse(url) 抛 OSError）
+            fp.parse.side_effect = direct_fail
+            fp.parse.side_effect = lambda url_or_text, **k: (
+                direct_fail(url_or_text) if not str(url_or_text).startswith("<") else real_feed
+            )
+            items = src_mod.collect_rss(
+                ["https://linux.do/latest.rss"], since_hours=24, timeout=1, use_blocked=True
+            )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].title, "linux.do 热帖")
+        self.assertIn("linux.do", items[0].url)
+
+    def test_collect_rss_blocked_upgrade_failure_keeps_running(self):
+        """被墙源升级失败不影响整体（返回空而非抛异常）。"""
+        fp = mock.MagicMock()
+        fp.parse.side_effect = OSError("被墙")
+        with mock.patch.dict(sys.modules, {"feedparser": fp}), \
+             mock.patch("fetch_blocked.fetch_blocked", return_value="错误: 无可用节点"):
+            items = src_mod.collect_rss(
+                ["https://linux.do/latest.rss"], since_hours=24, timeout=1, use_blocked=True
+            )
+        self.assertEqual(items, [])
+
+    def test_collect_all_reads_use_blocked_from_cfg(self):
+        """collect_all 默认从配置读取 use_blocked（显式传入覆盖）。"""
+        cfg = cfg_mod.load_config("/nonexistent/config.json")
+        with mock.patch.object(src_mod, "collect_rss", return_value=[]) as cr, \
+             mock.patch.object(src_mod, "collect_search", return_value=[]):
+            src_mod.collect_all(cfg)
+        self.assertFalse(cr.call_args.kwargs.get("use_blocked", False))
+        cfg["sources"]["use_blocked"] = True
+        with mock.patch.object(src_mod, "collect_rss", return_value=[]) as cr2, \
+             mock.patch.object(src_mod, "collect_search", return_value=[]):
+            src_mod.collect_all(cfg)
+        self.assertTrue(cr2.call_args.kwargs.get("use_blocked"))
 
     def test_keyword_filter_keeps_relevant(self):
         # 造 6 条素材（≥MIN_RELEVANT_KEEP=5 相关才启用过滤）：5 条 AI 相关 + 2 条无关
@@ -371,6 +472,41 @@ class TestMainRunOnce(unittest.TestCase):
         self.assertGreaterEqual(result["chars"], 600)
         self.assertEqual(result["paths"], {})
 
+    def test_user_topic_skips_dedup(self):
+        """用户显式指定主题：质检跳过查重（LLM 精判不再拦截用户决策）。"""
+        fake_llm = self._fake_llm
+
+        def llm_dupe_true(messages, **kw):
+            text = messages[-1]["content"]
+            if "判断以下" in text:
+                return '{"duplicate": true}'  # 历史查重会说重复
+            return fake_llm(messages, **kw)
+
+        with mock.patch("wechat_writer.main.src_mod.collect_all", return_value=self._fake_items()), \
+             mock.patch.object(llm_mod, "chat", side_effect=llm_dupe_true):
+            result = ww_main.run_once(dry_run=True, topic_override="DeepSeek Harness 发布")
+        self.assertTrue(result["ok"], result)  # 用户指定主题不被查重拦截
+        self.assertEqual(result["topic"], "DeepSeek Harness 发布")
+
+    def test_auto_topic_still_deduped(self):
+        """自动选题：查重通道仍然生效（LLM 精判重复即拒绝）。"""
+        # 预填历史（查重只在有历史记录时生效）
+        hist_mod.add(ww_main.HISTORY_PATH, {
+            "date": "2026-08-12", "topic": "AI 资讯盘点", "title": "历史标题", "keywords": "", "path": ""
+        })
+        fake_llm = self._fake_llm
+
+        def llm_dupe_true(messages, **kw):
+            text = messages[-1]["content"]
+            if "判断以下" in text:
+                return '{"duplicate": true}'
+            return fake_llm(messages, **kw)
+
+        with mock.patch("wechat_writer.main.src_mod.collect_all", return_value=self._fake_items()), \
+             mock.patch.object(llm_mod, "chat", side_effect=llm_dupe_true):
+            result = ww_main.run_once(dry_run=True)
+        self.assertFalse(result["ok"])
+
     def test_success_real_writes_and_history(self):
         with mock.patch("wechat_writer.main.src_mod.collect_all", return_value=self._fake_items()), \
              mock.patch.object(llm_mod, "chat", side_effect=self._fake_llm):
@@ -419,6 +555,70 @@ class TestRegisteredTool(unittest.TestCase):
             out = dc.run_wechat_writer()
         self.assertIn("未完成", out)
         self.assertIn("无素材", out)
+
+
+class TestLLMThinkingModel(unittest.TestCase):
+    """思考模型适配：deepseek-v4-pro 等思考模型的 content 可能为空（推理在 reasoning_content）。"""
+
+    def _post_ok(self, *a, **k):
+        resp = mock.MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "", "reasoning_content": "思考过程"}}]
+        }
+        return resp
+
+    def test_reasoning_content_fallback(self):
+        """content 为空时回退 reasoning_content（思考模型响应）。"""
+        httpx_mod = mock.MagicMock()
+        httpx_mod.post.side_effect = self._post_ok
+        with mock.patch.dict(sys.modules, {"httpx": httpx_mod}):
+            out = llm_mod.chat([{"role": "user", "content": "hi"}], max_tokens=100)
+        self.assertEqual(out, "思考过程")
+        # 请求应显式禁用思考模式
+        payload = httpx_mod.post.call_args[1]["json"]
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+
+    def test_thinking_param_downgrade_on_400(self):
+        """旧端点不接受 thinking 参数（400）→ 去掉后重试一次成功。
+
+        注意：payload 为同一 dict 原地 pop，MagicMock 记录的是引用——
+        必须在 side_effect 中捕获快照断言。
+        """
+        captured = []
+        httpx_mod = mock.MagicMock()
+        first = mock.MagicMock()
+        first.raise_for_status.side_effect = __import__("httpx").HTTPStatusError(
+            "400", request=mock.MagicMock(), response=mock.MagicMock(status_code=400))
+        first.status_code = 400
+        second = mock.MagicMock()
+        second.raise_for_status.return_value = None
+        second.status_code = 200
+        second.json.return_value = {"choices": [{"message": {"content": "", "reasoning_content": "思考过程"}}]}
+
+        def fake_post(url, json=None, **kw):
+            captured.append(dict(json or {}))
+            return first if len(captured) == 1 else second
+
+        httpx_mod.post.side_effect = fake_post
+        with mock.patch.dict(sys.modules, {"httpx": httpx_mod}):
+            out = llm_mod.chat([{"role": "user", "content": "hi"}], max_tokens=100)
+        self.assertEqual(out, "思考过程")
+        self.assertIn("thinking", captured[0])    # 第一次：带 thinking
+        self.assertNotIn("thinking", captured[1])  # 第二次：已降级
+
+    def test_truly_empty_still_raises(self):
+        """content 与 reasoning_content 均为空 → 仍报"模型返回空内容"。"""
+        resp = mock.MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.status_code = 200
+        resp.json.return_value = {"choices": [{"message": {"content": ""}}]}
+        httpx_mod = mock.MagicMock()
+        httpx_mod.post.return_value = resp
+        with mock.patch.dict(sys.modules, {"httpx": httpx_mod}):
+            with self.assertRaises(RuntimeError):
+                llm_mod.chat([{"role": "user", "content": "hi"}], max_tokens=100)
 
 
 if __name__ == "__main__":

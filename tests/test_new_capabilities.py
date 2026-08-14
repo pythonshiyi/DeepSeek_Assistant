@@ -1,40 +1,42 @@
 # -*- coding: utf-8 -*-
-"""新能力回归测试：cron 调度 / 记忆语义检索与图谱 / 数据工具 / 自评闭环。"""
+"""新能力回归测试：cron 调度 / 记忆语义检索与图谱 / 数据工具 / 自评闭环 / V4 正式版适配。"""
 import json
 import os
 import sys
 import tempfile
 import unittest
 from datetime import datetime
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import deepseek_client as dc
 import main as m
 import permissions
+import stats
 
 
 class TestCronMatch(unittest.TestCase):
     def test_exact(self):
-        self.assertTrue(m._cron_match("0 3 * * *", datetime(2026, 8, 6, 3, 0)))
-        self.assertFalse(m._cron_match("30 3 * * *", datetime(2026, 8, 6, 3, 0)))
-        self.assertFalse(m._cron_match("0 3 * * *", datetime(2026, 8, 6, 3, 1)))
+        self.assertTrue(m.cron_match("0 3 * * *", datetime(2026, 8, 6, 3, 0)))
+        self.assertFalse(m.cron_match("30 3 * * *", datetime(2026, 8, 6, 3, 0)))
+        self.assertFalse(m.cron_match("0 3 * * *", datetime(2026, 8, 6, 3, 1)))
 
     def test_step(self):
-        self.assertTrue(m._cron_match("*/15 * * * *", datetime(2026, 8, 6, 10, 30)))
-        self.assertFalse(m._cron_match("*/15 * * * *", datetime(2026, 8, 6, 10, 31)))
+        self.assertTrue(m.cron_match("*/15 * * * *", datetime(2026, 8, 6, 10, 30)))
+        self.assertFalse(m.cron_match("*/15 * * * *", datetime(2026, 8, 6, 10, 31)))
 
     def test_range_weekday(self):
-        self.assertTrue(m._cron_match("0 9-18 * * 1-5", datetime(2026, 8, 6, 10, 0)))   # 周四
-        self.assertFalse(m._cron_match("0 9-18 * * 1-5", datetime(2026, 8, 8, 10, 0)))  # 周六
+        self.assertTrue(m.cron_match("0 9-18 * * 1-5", datetime(2026, 8, 6, 10, 0)))   # 周四
+        self.assertFalse(m.cron_match("0 9-18 * * 1-5", datetime(2026, 8, 8, 10, 0)))  # 周六
 
     def test_comma(self):
-        self.assertTrue(m._cron_match("0 3,15 * * *", datetime(2026, 8, 6, 15, 0)))
-        self.assertFalse(m._cron_match("0 3,15 * * *", datetime(2026, 8, 6, 16, 0)))
+        self.assertTrue(m.cron_match("0 3,15 * * *", datetime(2026, 8, 6, 15, 0)))
+        self.assertFalse(m.cron_match("0 3,15 * * *", datetime(2026, 8, 6, 16, 0)))
 
     def test_invalid(self):
-        self.assertFalse(m._cron_match("not a cron", datetime.now()))
-        self.assertFalse(m._cron_match("", datetime.now()))
+        self.assertFalse(m.cron_match("not a cron", datetime.now()))
+        self.assertFalse(m.cron_match("", datetime.now()))
 
 
 class TestMemorySemantic(unittest.TestCase):
@@ -184,6 +186,163 @@ class TestWebhookPayload(unittest.TestCase):
             self.assertIn("未配置", dc.send_webhook_notify("测试"))
         finally:
             dc.WEBHOOK_CONFIG_FILE = old
+
+
+class TestV4GaAdaptation(unittest.TestCase):
+    """V4 正式版适配（DeepSeek-V4-Pro-0813 / Flash-0731）：
+    新峰谷定价 / 思考档位 low·high·max / 模型版本 / 输出上限。"""
+
+    def test_peak_rates_match_official(self):
+        p = stats.pricing()
+        self.assertEqual(p["deepseek-v4-flash"], {"prompt": 3.0, "completion": 9.0, "cache_hit": 0.10})
+        self.assertEqual(p["deepseek-v4-pro"], {"prompt": 9.0, "completion": 27.0, "cache_hit": 0.30})
+
+    def test_estimate_cost_peak_hour(self):
+        usage = {"prompt": 1_000_000, "completion": 0, "cache_hit": 0, "cache_miss": 1_000_000}
+        with mock.patch("stats.is_peak_hour", return_value=True):
+            self.assertAlmostEqual(stats.estimate_cost(usage, "deepseek-v4-flash"), 3.0)
+            self.assertAlmostEqual(stats.estimate_cost(usage, "deepseek-v4-pro"), 9.0)
+
+    def test_estimate_cost_offpeak_half(self):
+        """官方峰谷定价：空闲时段价格为高峰时段的一半。"""
+        usage = {"prompt": 1_000_000, "completion": 0, "cache_hit": 0, "cache_miss": 1_000_000}
+        with mock.patch("stats.is_peak_hour", return_value=False):
+            self.assertAlmostEqual(stats.estimate_cost(usage, "deepseek-v4-flash"), 1.5)
+            self.assertAlmostEqual(stats.estimate_cost(usage, "deepseek-v4-pro"), 4.5)
+
+    def test_cache_hit_pricing(self):
+        usage = {"prompt": 1_000_000, "completion": 0, "cache_hit": 1_000_000, "cache_miss": 0}
+        with mock.patch("stats.is_peak_hour", return_value=True):
+            self.assertAlmostEqual(stats.estimate_cost(usage, "deepseek-v4-pro"), 0.30)
+
+    def test_shared_peak_hours(self):
+        from shared import is_peak_hour as sp
+
+        self.assertTrue(sp(datetime(2026, 8, 13, 10, 0)))
+        self.assertFalse(sp(datetime(2026, 8, 13, 13, 0)))
+        self.assertTrue(sp(datetime(2026, 8, 13, 15, 0)))
+        self.assertFalse(sp(datetime(2026, 8, 13, 20, 0)))
+
+    def test_thinking_modes_ga(self):
+        """思考档位：官方完整映射表（none/low/medium/high/xhigh/max）+ auto 智能路由。"""
+        for k in ("none", "low", "medium", "high", "xhigh", "max", "auto"):
+            self.assertIn(k, dc.THINKING_MODES)
+
+    def test_thinking_effort_ga_levels(self):
+        """官方 effort 映射表：low→low · medium→high · high→high · xhigh→high · max→max。"""
+        self.assertEqual(dc.EFFORT_BY_THINKING["low"], "low")
+        self.assertEqual(dc.EFFORT_BY_THINKING["medium"], "high")
+        self.assertEqual(dc.EFFORT_BY_THINKING["high"], "high")
+        self.assertEqual(dc.EFFORT_BY_THINKING["xhigh"], "high")
+        self.assertEqual(dc.EFFORT_BY_THINKING["max"], "max")
+
+    def test_model_versions_and_output_cap(self):
+        self.assertEqual(dc.MODELS["deepseek-v4-flash"]["version"], "DeepSeek-V4-Flash-0731")
+        self.assertEqual(dc.MODELS["deepseek-v4-pro"]["version"], "DeepSeek-V4-Pro-0813")
+        self.assertEqual(dc.MODELS["deepseek-v4-pro"]["max_output_tokens"], 384 * 1024)
+        self.assertEqual(dc.MODELS["deepseek-v4-flash"]["max_context_tokens"], 1_000_000)
+
+
+class TestOffPeakDefer(unittest.TestCase):
+    """高峰错峰：定时任务在高峰时段命中时顺延到最近空闲时段。"""
+
+    def test_defer_until_peak_hours(self):
+        from datetime import datetime as _dt
+
+        # 上午高峰 10:00 → 顺延 12:00
+        ts = m.AssistantApp._defer_until(_dt(2026, 8, 13, 10, 0))
+        self.assertEqual(_dt.fromtimestamp(ts).strftime("%H:%M"), "12:00")
+        # 下午高峰 15:00 → 顺延 18:00
+        ts = m.AssistantApp._defer_until(_dt(2026, 8, 13, 15, 30))
+        self.assertEqual(_dt.fromtimestamp(ts).strftime("%H:%M"), "18:00")
+        # 高峰末期 11:59 → 顺延 12:00
+        ts = m.AssistantApp._defer_until(_dt(2026, 8, 13, 11, 59))
+        self.assertEqual(_dt.fromtimestamp(ts).strftime("%H:%M"), "12:00")
+
+    def test_defer_until_after_peak(self):
+        """高峰已过但仍在触发窗口（极端情况）→ 次日 0:00，且日期正确。"""
+        from datetime import datetime as _dt
+
+        ts = m.AssistantApp._defer_until(_dt(2026, 8, 13, 13, 30))
+        d = _dt.fromtimestamp(ts)
+        self.assertEqual(d.strftime("%H:%M"), "00:00")
+        self.assertGreater(d.date().isoformat(), "2026-08-13")  # 次日
+
+    def test_schedule_off_peak_flag(self):
+        r = dc.schedule_task(expr_type="cron", expr="30 9 * * 1", content="生成周报",
+                             action="message", off_peak=True)
+        self.assertIn("已创建", r)
+        data = json.load(open(dc.SCHEDULES_FILE, encoding="utf-8"))
+        self.assertTrue(data[0].get("off_peak"))
+        # 默认不开启
+        dc.schedule_task(expr_type="cron", expr="0 9 * * *", content="x")
+        data = json.load(open(dc.SCHEDULES_FILE, encoding="utf-8"))
+        self.assertFalse(data[1].get("off_peak"))
+
+
+class TestStrictTools(unittest.TestCase):
+    """strict 工具模式（Beta）：schema 规范化 + chat 请求应用。"""
+
+    def test_strictify_schema_nested(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    },
+                },
+            },
+        }
+        st = dc._strictify_schema(schema)
+        self.assertEqual(sorted(st["required"]), ["files", "path"])
+        self.assertFalse(st["additionalProperties"])
+        items = st["properties"]["files"]["items"]
+        self.assertEqual(sorted(items["required"]), ["content", "path"])
+        self.assertFalse(items["additionalProperties"])
+
+    def test_strictify_tools_all_strict(self):
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }]
+        out = dc._strictify_tools(tools)
+        self.assertTrue(out[0]["function"]["strict"])
+        self.assertEqual(out[0]["function"]["parameters"]["required"], ["location"])
+        self.assertFalse(out[0]["function"]["parameters"]["additionalProperties"])
+        # 原 schema 不被修改（浅拷贝）
+        self.assertNotIn("strict", tools[0]["function"])
+
+    def test_chat_strict_tools_applied(self):
+        client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        client.client.chat.completions.create = mock.MagicMock()
+        captured = {}
+        client.client.chat.completions.create.side_effect = (
+            lambda **kw: (captured.update(kw) or client.client.chat.completions.create.return_value)
+        )
+        client.client.chat.completions.create.return_value = type("S", (), {
+            "__iter__": lambda self: iter([]),
+            "usage": type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                    "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1})(),
+            "close": lambda self: None,
+        })()
+        client.chat([{"role": "user", "content": "hi"}], tools_enabled=True, strict_tools=True)
+        tools = captured["tools"]
+        self.assertTrue(all(t["function"].get("strict") for t in tools))
+        for t in tools:
+            params = t["function"]["parameters"]
+            self.assertFalse(params.get("additionalProperties", False))
+            self.assertEqual(sorted(params.get("required", [])), sorted(params["properties"].keys()))
 
 
 if __name__ == "__main__":

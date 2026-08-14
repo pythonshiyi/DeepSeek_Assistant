@@ -51,7 +51,7 @@ class TestStreamUsageCapture(unittest.TestCase):
             make_chunk(content="好"),
             make_chunk(usage=usage),  # 末尾 usage chunk：choices 为空
         ]
-        reasoning, content, tool_calls, got = self.client._consume_stream(
+        reasoning, content, tool_calls, finish_reason, got = self.client._consume_stream(
             chunks, None, None, None
         )
         self.assertEqual(content, "你好")
@@ -63,7 +63,7 @@ class TestStreamUsageCapture(unittest.TestCase):
 
     def test_usage_none_when_absent(self):
         chunks = [make_chunk(content="x")]
-        _, _, _, got = self.client._consume_stream(chunks, None, None, None)
+        _, _, _, _, got = self.client._consume_stream(chunks, None, None, None)
         self.assertIsNone(got)
 
     def test_reasoning_and_tool_calls_still_work(self):
@@ -89,7 +89,7 @@ class TestStreamUsageCapture(unittest.TestCase):
             usage=None,
         )
         chunks = [tc_chunk, make_chunk(usage=make_usage())]
-        reasoning, content, tool_calls, got = self.client._consume_stream(
+        reasoning, content, tool_calls, _, got = self.client._consume_stream(
             chunks, None, None, None
         )
         self.assertEqual(reasoning, "思考中")

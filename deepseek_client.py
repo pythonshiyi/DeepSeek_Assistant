@@ -26,6 +26,15 @@ from openai import (
 
 import permissions
 import crypto
+from shared import cron_field_ok, OCR_IMAGE_PS, is_peak_hour  # noqa: F401  # is_peak_hour 由 main.py 经本模块 re-export
+import plugins as plugins_mod
+
+# 按需加载能力：fetch_blocked（机场代理访问被墙站点）。独立模块按用户需要放
+# 入项目目录并启用后才生效；文件缺失/被剔除时功能静默降级（不阻塞主程序）。
+try:
+    from fetch_blocked import fetch_blocked as _fetch_blocked_impl
+except ImportError:
+    _fetch_blocked_impl = None
 
 logger = logging.getLogger("whaletalk")
 
@@ -76,30 +85,38 @@ SCENARIOS = {
 MODELS = {
     "deepseek-v4-flash": {
         "label": "DeepSeek V4 Flash",
+        "version": "DeepSeek-V4-Flash-0731",
         "max_context_tokens": 1_000_000,
+        "max_output_tokens": 384 * 1024,
     },
     "deepseek-v4-pro": {
         "label": "DeepSeek V4 Pro",
+        "version": "DeepSeek-V4-Pro-0813",
         "max_context_tokens": 1_000_000,
+        "max_output_tokens": 384 * 1024,
     },
 }
 
 THINKING_MODES = {
     "none": "禁用思考 (none)",
     "low": "低思考 (low)",
+    "medium": "中等思考 (medium)",
     "high": "高思考 (high)",
+    "xhigh": "极高思考 (xhigh)",
     "max": "最大思考 (max)",
-    "xhigh": "极限思考 (xhigh)",
-    "auto": "智能 (auto)",
+    "auto": "智能路由 (auto)",
 }
 
 EFFORT_BY_THINKING = {
-    # 官方仅支持 none/high/max：low 降级为 high，xhigh 使用最强的 max；auto 动态路由
-    "low": "high",
-    "high": None,
+    # 官方 effort 映射表（deepseek-v4-flash / pro 一致）：
+    #   low→low · medium→high · high→high · xhigh→high · max→max
+    # 全部档位 API 均接受；UI 如实展示档位与映射结果。
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "high",
     "max": "max",
-    "xhigh": "max",
-    "auto": None,
+    "auto": None,  # 鲸语智能路由：启发式映射到 none/low/high/max
 }
 
 _AUTO_COMPLEX_WORDS = ("分析", "设计", "审查", "解释", "重构", "优化", "实现", "编写", "创建", "对比")
@@ -107,7 +124,10 @@ _AUTO_SIMPLE_WORDS = ("你好", "在吗", "谢谢", "再见", "ok", "yes", "no",
 
 
 def _auto_effort(work):
-    """auto 思考档：按任务复杂度启发式路由到 none/high/max（无额外 API 成本）。"""
+    """auto 思考档：按任务复杂度启发式路由到 none/high/max（无额外 API 成本）。
+
+    评分维度：内容长度 / 代码块 / 复杂词 / 多步骤结构 / 简单寒暄扣分。
+    """
     text = ""
     for m in reversed(work):
         if m.get("role") == "user" and m.get("content"):
@@ -122,6 +142,18 @@ def _auto_effort(work):
         score += 1
     if any(w in text for w in _AUTO_SIMPLE_WORDS):
         score -= 1
+    # 多步骤任务：编号/步骤式指令 ≥3 条，或段落数较多 → 升级思考深度
+    step_lines = [
+        ln for ln in text.splitlines()
+        if ln.strip() and (
+            ln.lstrip()[:2].rstrip(".").isdigit()
+            or ln.lstrip().startswith(("步骤", "第一步", "然后", "接着", "- "))
+        )
+    ]
+    if len(step_lines) >= 3:
+        score += 1
+    elif text.count("\n") >= 5:
+        score += 1
     if score >= 2:
         return "max"
     if score == 1:
@@ -267,6 +299,21 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {"url": {"type": "string", "description": "完整 URL，含 http(s)://"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_blocked",
+            "description": "抓取被墙/国际站点（linux.do、Google、archive.org 等）的文本/JSON 内容，自动使用本机机场节点代理 + 浏览器指纹绕过封锁。适用于 fetch_url 超时/失败或被墙的场景",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "目标网址，完整 URL 含 http(s)://"},
+                    "proxy": {"type": "string", "description": "可选：代理节点，形如 https://user:pass@server:port，留空自动发现"},
+                },
                 "required": ["url"],
             },
         },
@@ -581,7 +628,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "输出文件绝对路径"},
-                    "rows": {"type": "array", "description": "数据行（数组的数组，或对象数组）"},
+                    "rows": {"type": "array", "items": {}, "description": "数据行（数组的数组，或对象数组）"},
                     "headers": {"type": "string", "description": "可选：表头，逗号分隔"},
                 },
                 "required": ["path", "rows"],
@@ -613,7 +660,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "输出文件绝对路径"},
-                    "data": {"type": "array", "description": "数据行"},
+                    "data": {"type": "array", "items": {}, "description": "数据行"},
                     "sheet": {"type": "string", "description": "可选：工作表名（默认 Sheet1）"},
                 },
                 "required": ["path", "data"],
@@ -628,7 +675,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "data": {"type": "array", "description": "数据：[[x,y],...] 或 [{\"x\":..,\"y\":..},...] 或 [数值,...]"},
+                    "data": {"type": "array", "items": {}, "description": "数据：[[x,y],...] 或 [{\"x\":..,\"y\":..},...] 或 [数值,...]"},
                     "path": {"type": "string", "description": "输出 PNG 绝对路径"},
                     "kind": {"type": "string", "description": "可选：line/bar/pie/scatter（默认 line）"},
                     "title": {"type": "string", "description": "可选：图表标题"},
@@ -680,7 +727,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "tasks": {"type": "array", "description": "子任务列表（字符串数组，最多 8 个），如 [\"总结文件A\", \"总结文件B\"]"},
+                    "tasks": {"type": "array", "items": {"type": "string"}, "description": "子任务列表（字符串数组，最多 8 个），如 [\"总结文件A\", \"总结文件B\"]"},
                     "parallel": {"type": "integer", "description": "可选：并行数 1-4（默认 2）"},
                     "context": {"type": "string", "description": "可选：共享背景上下文（注入每个子代理）"},
                 },
@@ -1311,14 +1358,86 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "run_wechat_writer",
-            "description": "运行公众号自动写作工具（WeChat Writer）：采集当日 AI 资讯（RSS+搜索）→ 选题（历史去重）→ LLM 写作（大纲/正文/润色）→ 质量门禁 → 存草稿箱（只产草稿不发布）。适合『写一篇今天的 AI 公众号文章』等请求；可 dry_run=true 只预览不落盘，或 topic= 指定主题",
+            "description": "运行公众号自动写作工具（WeChat Writer）：采集当日 AI 资讯（RSS+搜索+论坛）→ 选题（历史去重）→ LLM 写作（大纲/正文/润色）→ 质量门禁 → 存草稿箱（只产草稿不发布）。适合『写一篇今天的 AI 公众号文章』等请求；可 dry_run=true 只预览不落盘，topic= 指定主题，use_blocked=true 时被墙信源（linux.do 等）自动走代理通道",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "dry_run": {"type": "boolean", "description": "可选：true 只预览不写草稿（默认 false）"},
                     "topic": {"type": "string", "description": "可选：指定主题，跳过自动选题"},
+                    "use_blocked": {"type": "boolean", "description": "可选：true 时被墙信源自动经代理通道采集（需 fetch_blocked 能力就绪）"},
                 },
                 "required": [],
+            },
+        },
+    },
+    # ===== 每日简报（主动助手：采集当日资讯 → LLM 提炼 → 落盘） =====
+    {
+        "type": "function",
+        "function": {
+            "name": "daily_brief",
+            "description": "生成每日简报：采集当日 AI/科技资讯（RSS+搜索）→ LLM 提炼要点与点评 → 保存到工作区 briefs/。适合『今天的资讯有什么』『生成今日简报』等请求；可配合 schedule_task 定时生成晨报",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "可选：主题关键词（仅保留相关素材）"},
+                    "max_items": {"type": "integer", "description": "可选：素材上限（默认 8，最大 15）"},
+                },
+                "required": [],
+            },
+        },
+    },
+    # ===== 插件工坊：AI 生成并安装插件（零代码能力扩展） =====
+    {
+        "type": "function",
+        "function": {
+            "name": "create_plugin",
+            "description": "根据用户需求生成并安装鲸语插件：组合自定义工具/技能模板/自动化流程/场景配置，生成后立即生效。适合『添加一个XX工具』『创建一个XX流程』『帮我加个小红书文案技能』等需求",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "插件名称（简短，如 小红书文案助手）"},
+                    "description": {"type": "string", "description": "可选：插件说明"},
+                    "tools": {
+                        "type": "array",
+                        "description": "可选：自定义 HTTP 工具列表，每项 {name, endpoint, description, method, params}（params 为逗号分隔的参数名）",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "工具名（英文标识）"},
+                                "endpoint": {"type": "string", "description": "HTTP 地址（http/https）"},
+                                "description": {"type": "string", "description": "工具描述（AI 何时调用）"},
+                                "method": {"type": "string", "description": "可选：POST/GET（默认 POST）"},
+                                "params": {"type": "string", "description": "可选：参数名，逗号分隔，如 topic, style"},
+                            },
+                        },
+                    },
+                    "skills": {
+                        "type": "array",
+                        "description": "可选：技能/提示词模板，每项 {name, text}（text 中 {{TEXT}} 会被输入框内容替换）",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "技能名"},
+                                "text": {"type": "string", "description": "提示词模板内容"},
+                            },
+                        },
+                    },
+                    "workflows": {
+                        "type": "object",
+                        "description": "可选：自动化流程 {流程名: {steps: [{text: 指令}]}}",
+                        "additionalProperties": {"type": "object"},
+                    },
+                    "scenario": {
+                        "type": "object",
+                        "description": "可选：一键场景配置 {name, thinking, system_prompt, enabled_tools}",
+                    },
+                    "requires": {
+                        "type": "array",
+                        "description": "可选：依赖的 pip 包名列表",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["name"],
             },
         },
     },
@@ -1483,22 +1602,10 @@ def _run_python_blocked(code):
 # 工具结果"失败"前缀统一判定（main/taskpanel 共享，防散落魔法字符串漂移）
 TOOL_RESULT_FAIL_PREFIXES = ("错误", "权限拒绝", "超时", "（用户停止")
 
-# DeepSeek 峰谷定价：高峰时段（北京时间 9:00-12:00 / 14:00-18:00）价格 2 倍
-PEAK_HOURS = ((9, 12), (14, 18))
-
 JSON_HINT_MESSAGE = (
     "[JSON 输出模式] 请严格输出合法的 JSON 对象（已启用 response_format），"
     "不要输出任何 JSON 以外的内容。"
 )
-
-
-def is_peak_hour(now=None):
-    """判断当前是否为 DeepSeek 高峰计费时段（价格 2 倍）。"""
-    try:
-        h = (now or datetime.now()).hour
-        return any(a <= h < b for a, b in PEAK_HOURS)
-    except Exception:
-        return False
 
 def get_date():
     """获取当前日期、具体时间与本地时区。"""
@@ -1650,11 +1757,72 @@ def _url_host(url):
         return None
 
 
-def _is_private_host(host):
+SSRF_TRUSTED = []
+
+
+def _patch_array_items(tools):
+    """递归补齐 array 参数的 items（API 要求 type=array 必须带 items，缺则 400）。"""
+    def fix(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "array" and "items" not in node:
+            node["items"] = {}
+        for v in node.values():
+            if isinstance(v, dict):
+                fix(v)
+            elif isinstance(v, list):
+                for item in v:
+                    fix(item)
+
+    for tool in tools or []:
+        fix((tool.get("function") or {}).get("parameters"))
+
+
+def set_ssrf_trusted(hosts):
+    """设置 SSRF 信任主机白名单（内网/保留网段经用户显式信任后放行）。
+
+    支持：主机名精确匹配、IP 精确匹配、CIDR 网段（192.168.1.0/24）、
+    域后缀（example.com. 通配 *.example.com）。云元数据地址永远不可豁免。
+    """
+    global SSRF_TRUSTED
+    SSRF_TRUSTED = [str(h).strip().lower() for h in (hosts or []) if str(h).strip()]
+
+
+def _trusted_host(host, trusted):
+    """信任白名单匹配：主机名/IP 精确、CIDR 网段、域后缀。"""
+    try:
+        import ipaddress
+
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    for item in trusted or []:
+        if not item:
+            continue
+        if item == host:
+            return True
+        if ip is not None and "/" in item:
+            try:
+                if ip in ipaddress.ip_network(item, strict=False):
+                    return True
+            except ValueError:
+                pass
+        elif item.startswith("*.") and host.endswith(item[1:]):
+            return True
+    return False
+
+
+def _is_private_host(host, allow_loopback=True):
     """SSRF 防护：主机是否为回环/内网/链路本地地址（模型可控 URL 禁止访问）。
 
-    覆盖 127.0.0.0/8、10/8、172.16/12、192.168/16、169.254.169.254、
-    ::1、fe80::/10、fc00::/7 以及 localhost 等主机名。
+    安全分层（桌面单用户智能体：模型指令均来自用户）：
+    - 回环（localhost / 127.0.0.0/8 / ::1）：默认放行——本地开发服务器验证
+      （localhost:3000 等）是最高频正当场景；严格场景（如搜索结果过滤）传
+      allow_loopback=False。
+    - 内网 / 链路本地 / 保留网段：默认阻止，SSRF_TRUSTED 白名单可显式信任
+      （内网服务 / NAS 等）。
+    - 云元数据地址（169.254.169.254 等 169.254.0.0/16）：永远阻止，白名单
+      不可豁免（云环境 SSRF 的最终攻击面）。
 
     DNS 重绑定防护：域名先解析，只要任一解析结果落在内网即拦截——
     模型可控的域名指向 127.0.0.1 时（恶意/失陷 DNS）不再放行。解析失败
@@ -1663,22 +1831,26 @@ def _is_private_host(host):
     host = (host or "").strip().lower()
     if not host:
         return True
+    if _trusted_host(host, SSRF_TRUSTED):
+        return False
     if host in ("localhost", "ipv6-localhost"):
-        return True
+        return not allow_loopback
     # 形如 127.0.0.1 的纯数字点分式
     if host.replace(".", "").isdigit():
         parts = host.split(".")
         if len(parts) == 4:
             try:
                 a, b = int(parts[0]), int(parts[1])
-                if a == 127 or a == 10:
+                if a == 127:
+                    return not allow_loopback
+                if a == 10:
                     return True
                 if a == 172 and 16 <= b <= 31:
                     return True
                 if a == 192 and b == 168:
                     return True
                 if a == 169 and b == 254:
-                    return True
+                    return True  # 云元数据 / 链路本地：永远阻止
                 if a == 0:
                     return True
             except (ValueError, IndexError):
@@ -1687,7 +1859,14 @@ def _is_private_host(host):
         import ipaddress
 
         ip = ipaddress.ip_address(host)
-        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+        if ip.is_loopback:
+            return not allow_loopback
+        # 链路本地（含 169.254.169.254 云元数据）与保留地址永远阻止
+        if ip.is_link_local or ip.is_reserved:
+            return True
+        if ip.is_private:
+            return True
+        return False
     except ValueError:
         pass
     # 非 IP 主机名：解析 DNS，任一解析结果落内网即拦截（防 DNS 重绑定）
@@ -1706,23 +1885,34 @@ def _is_private_host(host):
                 continue
             seen.add(ip)
             addr = ipaddress.ip_address(ip)
-            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            if addr.is_loopback:
+                return not allow_loopback
+            if addr.is_link_local or addr.is_reserved or addr.is_private:
                 return True
         except ValueError:
             continue
     return False
 
 
-def _safe_url(url):
+def _safe_url(url, allow_loopback=True):
     """URL 安全校验：仅 http/https + 非内网/回环主机。非法返回原因字符串。"""
     if not url or not str(url).startswith(("http://", "https://")):
         return "URL 必须以 http:// 或 https:// 开头"
     host = _url_host(url)
     if not host:
         return f"URL 主机名解析失败：{url[:80]}"
-    if _is_private_host(host):
+    if _is_private_host(host, allow_loopback=allow_loopback):
         return f"已阻止访问内网/回环地址（SSRF 防护）：{url[:80]}"
     return ""
+
+
+def _run_fetch_blocked(args):
+    """工具分发：fetch_blocked（按需能力，模块缺失时明确提示）。"""
+    if _fetch_blocked_impl is None:
+        return "错误: fetch_blocked 能力未安装（需要将 fetch_blocked.py 放入程序目录并启用后可用）"
+    url = (args or {}).get("url", "")
+    proxy = (args or {}).get("proxy") or ""
+    return _fetch_blocked_impl(url, proxy)
 
 
 def fetch_url(url):
@@ -2154,30 +2344,6 @@ def image_process(path, output, ops=""):
         return f"错误：图像处理失败: {e}"
 
 
-_OCR_IMAGE_PS = r"""
-$ErrorActionPreference='Stop'
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
-function Await($WinRtTask, $ResultType) {
-    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-    $netTask = $asTask.Invoke($null, @($WinRtTask))
-    $netTask.Wait(-1) | Out-Null
-    $netTask.Result
-}
-[Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime] | Out-Null
-[Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
-$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('@PATH@')) ([Windows.Storage.StorageFile])
-$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
-$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-if (-not $engine) { '当前系统语言不支持 OCR' } else {
-    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    $result.Text
-}
-""".lstrip()
-
-
 def ocr_image(path):
     """从图片文件提取文字（Windows OCR，需系统语言包支持）。"""
     if not path or not str(path).strip():
@@ -2194,7 +2360,7 @@ def ocr_image(path):
         fd, ps_path = tempfile.mkstemp(suffix=".ps1")
         os.close(fd)
         try:
-            script = _OCR_IMAGE_PS.replace("@PATH@", "'" + str(p).replace("'", "''") + "'")
+            script = OCR_IMAGE_PS.replace("@PATH@", "'" + str(p).replace("'", "''") + "'")
             with open(ps_path, "w", encoding="utf-8-sig") as f:
                 f.write(script)
             proc = subprocess.run(
@@ -3144,8 +3310,9 @@ def search_web(query):
             last_err = e
             continue
         # 结果链接安全过滤：搜索引擎返回的链接理论上可信，但恶意站点/广告可
-        # 注入 javascript:/file: 等——只保留 http(s) 公网链接
-        safe = [r for r in results if not _safe_url(r["url"])]
+        # 注入 javascript:/file: 等——只保留 http(s) 公网链接（回环不放行：
+        # 搜索结果来自外部，是 SSRF 注入源，恶意站点可注入 localhost 链接）
+        safe = [r for r in results if not _safe_url(r["url"], allow_loopback=False)]
         if safe:
             lines = [f"搜索结果（{len(safe)} 条）:"]
             for i, r in enumerate(safe, 1):
@@ -3239,7 +3406,9 @@ def edit_file(path, old="", new="", regex=None):
         if len(str(regex)) > EDIT_FILE_REGEX_MAX:
             return f"错误：正则过长（>{EDIT_FILE_REGEX_MAX} 字符）"
         try:
-            new_content, n = re.subn(regex, new or "", content)
+            # lambda 返回 new 原样：re.sub 的字符串替换会把 new 中的 \1 / \g<1> /
+            # \\ 解释为分组引用与转义，模型生成的替换文本含反斜杠时会被静默改写
+            new_content, n = re.subn(regex, lambda m: new or "", content)
         except re.error as e:
             return f"错误：正则无效: {e}"
     else:
@@ -4141,12 +4310,14 @@ KNOWLEDGE_INDEX_FILE = None  # DATA_DIR/knowledge_index.json
 WORKFLOWS_FILE = None        # DATA_DIR/workflows.json
 CHECKPOINT_FILE = None       # DATA_DIR/task_checkpoint.json
 STATS_FILE = None            # DATA_DIR/stats.json
+PATTERNS_FILE = None         # DATA_DIR/patterns.json（成功模式配方，run_workflow 的 recipe 步骤用）
 IMAGE_GEN_BASE = None        # 图片生成端点（默认 = base_url）
 IMAGE_GEN_KEY = None         # 图片生成 API Key（默认 = api_key）
 IMAGE_GEN_MODEL = "gpt-image-1"
 RSS_SOURCES_FILE = None      # DATA_DIR/rss_sources.json（RSS 订阅列表）
 KV_CACHE_DIR = None          # DATA_DIR/kv_cache（diskcache 存储目录）
 WEBDAV_CONFIG_FILE = None    # DATA_DIR/webdav_config.json（WebDAV 连接）
+PLUGIN_PATHS = None          # 插件体系路径（plugins_dir/user_tools/prompts/workflows，main 注入）
 
 SCHEDULES_LOCK = threading.Lock()  # 与 main 的定时任务面板共享（防并发覆盖）
 _SEND_CALLBACK = None              # run_workflow：向主线程投递要发送的消息
@@ -4164,37 +4335,7 @@ def set_busy_provider(cb):
 
 
 # ---------- 任务调度工具（复用 main 的 cron 引擎与 schedules.json） ----------
-# cron 5 字段的值域（分/时/日/月/周），weekday 1=周一…7=周日
-_CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (1, 7))
-
-
-def _cron_field_valid(field, pos):
-    """cron 单字段语法 + 值域校验（数字、*、,、-、/）。"""
-    field = str(field or "").strip()
-    lo, hi = _CRON_RANGES[pos]
-    if not field or field in ("*", "?"):
-        return True
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            return False
-        if "/" in part:
-            base, _, step = part.partition("/")
-            if not step.isdigit() or not (1 <= int(step) <= hi):
-                return False
-            if base not in ("*", "?", "") and not (
-                base.isdigit() and lo <= int(base) <= hi
-            ):
-                return False
-        elif "-" in part:
-            l, _, r = part.partition("-")
-            if not (l.isdigit() and r.isdigit()):
-                return False
-            if not (lo <= int(l) <= hi and lo <= int(r) <= hi and int(l) <= int(r)):
-                return False
-        elif not part.isdigit() or not (lo <= int(part) <= hi):
-            return False
-    return True
+# cron 字段校验/匹配由 shared.py 统一提供（CRON_RANGES / cron_field_ok）
 
 
 def _load_schedules_plain():
@@ -4224,11 +4365,14 @@ def _save_schedules_plain(schedules):
         return False
 
 
-def schedule_task(expr_type="cron", expr="", content="", action="message", name="", enabled=True):
+def schedule_task(expr_type="cron", expr="", content="", action="message", name="", enabled=True, off_peak=False):
     """创建定时任务（与手动「定时任务」面板同文件同引擎，AI 可主动安排）。
 
     expr_type: cron（5 字段：分 时 日 月 周）/ time（HH:MM 每日一次）/ every（每 N 分钟）
     action: message（到点自动发送指令执行任务）/ notify（状态栏提醒）/ backup（项目备份）
+            / workflow（到点自动运行 workflows.json 中的流程，content 为流程名）
+    off_peak: 高峰错峰——触发时刻处于高峰时段（9-12 / 14-18）时自动顺延到
+            最近空闲时段开始执行（官方峰谷定价：空闲价格仅为高峰一半）
     """
     expr = str(expr or "").strip()
     if not expr:
@@ -4255,16 +4399,20 @@ def schedule_task(expr_type="cron", expr="", content="", action="message", name=
         fields = expr.split()
         if len(fields) != 5:
             return "错误：cron 需 5 个字段：分 时 日 月 周（如 30 9 * * 1）"
-        if not all(_cron_field_valid(f, i) for i, f in enumerate(fields)):
+        if not all(cron_field_ok(f, i) for i, f in enumerate(fields)):
             return (
                 "错误：cron 字段非法（值域：分 0-59，时 0-23，日 1-31，月 1-12，周 1-7；"
                 "仅支持数字、*、,、-、/）"
             )
         s["cron"] = expr
-    if str(action or "") not in ("message", "notify", "backup"):
-        return "错误：action 仅支持 message / notify / backup"
+    if str(action or "") not in ("message", "notify", "backup", "workflow"):
+        return "错误：action 仅支持 message / notify / backup / workflow"
     if str(action) in ("message", "notify") and not str(content or "").strip():
         return "错误：message / notify 动作需要 content 内容"
+    if str(action) == "workflow" and not str(content or "").strip():
+        return "错误：workflow 动作需要流程名称（workflows.json 中的流程名）"
+    if off_peak:
+        s["off_peak"] = True
     if str(name or "").strip():
         s["name"] = str(name).strip()[:40]
     if str(content or "").strip():
@@ -4285,7 +4433,7 @@ def list_schedules():
         schedules = _load_schedules_plain()
     if not schedules:
         return "当前没有定时任务"
-    act_map = {"message": "发指令", "notify": "提醒", "backup": "备份"}
+    act_map = {"message": "发指令", "notify": "提醒", "backup": "备份", "workflow": "流程"}
     lines = [f"共 {len(schedules)} 个定时任务："]
     for i, s in enumerate(schedules, 1):
         act = act_map.get(str(s.get("action") or "message"), str(s.get("action")))
@@ -5206,8 +5354,12 @@ def read_email(limit=10, since_days=3):
 
 
 # ---------- 任务检查点（断点续跑） ----------
-def task_checkpoint_save(name="", status="进行中", pending=None, notes=""):
-    """保存任务进度检查点（崩溃/重启后可从此继续）。"""
+def task_checkpoint_save(name="", status="进行中", pending=None, notes="", auto=False):
+    """保存任务进度检查点（崩溃/重启后可从此继续）。
+
+    auto=True：鲸语工具链执行中的自动断点（main 每步工具后写入），
+    任务正常完成时由 task_checkpoint_clear 自动清除；手动断点不受影响。
+    """
     if not str(name or "").strip() and not str(notes or "").strip():
         return "错误：name 或 notes 必填"
     data = {
@@ -5217,6 +5369,8 @@ def task_checkpoint_save(name="", status="进行中", pending=None, notes=""):
         "notes": str(notes or "")[:2000],
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if auto:
+        data["auto"] = True
     if not CHECKPOINT_FILE:
         return "错误：检查点模块未初始化"
     try:
@@ -5228,6 +5382,21 @@ def task_checkpoint_save(name="", status="进行中", pending=None, notes=""):
         return f"已保存任务检查点：{data['name']}（{data['status']}）"
     except Exception as e:
         return f"错误：保存检查点失败: {e}"
+
+
+def task_checkpoint_clear():
+    """清除自动检查点（任务正常完成时调用）；手动断点保留。"""
+    if not CHECKPOINT_FILE or not os.path.exists(CHECKPOINT_FILE):
+        return "当前没有检查点"
+    try:
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("auto"):
+            os.remove(CHECKPOINT_FILE)
+            return "已清除自动断点"
+        return "当前检查点为手动保存，未清除"
+    except Exception:
+        return "错误：清除检查点失败"
 
 
 def task_checkpoint_load():
@@ -5243,6 +5412,8 @@ def task_checkpoint_load():
             f"任务：{data.get('name', '')}（状态：{data.get('status', '')}）",
             f"保存时间：{data.get('saved_at', '')}",
         ]
+        if data.get("auto"):
+            lines.append("（自动断点：由鲸语在任务执行中自动保存）")
         if data.get("pending"):
             lines.append("待办步骤：\n" + "\n".join(f"- {p}" for p in data["pending"]))
         if data.get("notes"):
@@ -5258,8 +5429,46 @@ _WORKFLOW_RUNNING = False  # 流程防重：同一时刻只允许一个流程运
 _WORKFLOW_LOCK = threading.Lock()  # 检查-置位原子化：并行工具调用下防双流程同时启动
 
 
+def _recipe_chain(name):
+    """按配方名读取成功模式工具链（patterns.json 的 name 字段）。"""
+    if not PATTERNS_FILE or not os.path.exists(PATTERNS_FILE):
+        return []
+    try:
+        with open(PATTERNS_FILE, "r", encoding="utf-8") as f:
+            pats = json.load(f)
+        for p in pats if isinstance(pats, list) else []:
+            if isinstance(p, dict) and str(p.get("name") or "") == str(name or "").strip():
+                return [str(c) for c in (p.get("chain") or []) if str(c).strip()]
+    except Exception:
+        logging.exception("读取配方失败")
+    return []
+
+
+def _workflow_step_text(st, name=""):
+    """把单个流程步骤解析为待发送指令。
+
+    dict 步骤支持：
+    - text：指令原文（必填或与 recipe 二选一）
+    - recipe：配方名（patterns.json）——发送时注入已验证的工具链，text 作为任务目标
+    """
+    if isinstance(st, dict):
+        text = str(st.get("text") or "").strip()
+        recipe = str(st.get("recipe") or "").strip()
+        if recipe:
+            chain = _recipe_chain(recipe)
+            if chain:
+                prefix = "请按以下已验证成功的工具链顺序执行任务：\n" + " → ".join(chain)
+                return f"{prefix}\n\n任务目标：{text}" if text else prefix
+            return f"[配方「{recipe}」不存在或为空，请直接完成以下任务]\n{text}" if text else ""
+        return text
+    return str(st or "").strip()
+
+
 def run_workflow(name):
-    """运行已保存的流程模板：按顺序逐条发送指令，上一步完成后自动执行下一步。"""
+    """运行已保存的流程模板：按顺序逐条发送指令，上一步完成后自动执行下一步。
+
+    步骤支持 {"text": "任务目标", "recipe": "配方名"}：自动注入配方工具链。
+    """
     global _WORKFLOW_RUNNING
     if not WORKFLOWS_FILE:
         return "错误：流程模块未初始化"
@@ -5279,7 +5488,7 @@ def run_workflow(name):
             return f"错误：流程「{name}」没有步骤"
         texts = []
         for st in step_list:
-            t = str(st.get("text") or "").strip() if isinstance(st, dict) else str(st or "").strip()
+            t = _workflow_step_text(st, name)
             if t:
                 texts.append(t)
         if not texts:
@@ -6079,7 +6288,7 @@ def rss_fetch(action="list", url="", limit=10, since_hours=24):
         published = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
         if published:
             try:
-                pub = _dt.fromtimestamp(calendar.timegm(published), _dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+                pub = _dt.utcfromtimestamp(calendar.timegm(published)).strftime("%Y-%m-%d %H:%M")
             except Exception:
                 pub = ""
         summary = re.sub(r"<[^>]+>", " ", str(getattr(e, "summary", "") or getattr(e, "description", "")))
@@ -6553,11 +6762,12 @@ def webdav(action="list", remote_path="/", local_path=""):
 # ============================================================================
 # 公众号自动写作（wechat_writer 独立包，薄封装）
 # ============================================================================
-def run_wechat_writer(dry_run=False, topic=""):
+def run_wechat_writer(dry_run=False, topic="", use_blocked=False):
     """运行公众号自动写作工具：采集→选题→写作→质检→存草稿箱（只产草稿）。
 
     耗时可能 1-3 分钟（多次 LLM 调用）；返回结构化摘要文本。
     草稿统一写到工作区 drafts/（与 publish_draft 同目录，用户可从产物面板直达）。
+    use_blocked=True 时被墙信源（linux.do/hostloc 等）自动经代理通道采集。
     """
     try:
         from wechat_writer import run_once
@@ -6574,6 +6784,7 @@ def run_wechat_writer(dry_run=False, topic=""):
             topic_override=str(topic or ""),
             drafts_dir=drafts_dir,
             archive_dir=archive_dir,
+            use_blocked=bool(use_blocked),
         )
     except Exception as e:
         return f"错误：公众号写作工具运行失败: {e}"
@@ -6593,8 +6804,180 @@ def run_wechat_writer(dry_run=False, topic=""):
         lines.append(f"HTML：{paths['html_path']}")
     if paths.get("archive_path"):
         lines.append(f"存档：{paths['archive_path']}")
-    lines.append("草稿已存入草稿箱，请在公众号后台审阅后手动发布（工具不自动发布）。")
+    if dry_run:
+        lines.append("（dry-run 预览：未写入草稿箱，正式运行后草稿存草稿箱，请在公众号后台审阅后手动发布）")
+    else:
+        lines.append("草稿已存入草稿箱，请在公众号后台审阅后手动发布（工具不自动发布）。")
     return "\n".join(lines)
+
+
+# ============================================================================
+# 每日简报（主动助手：采集当日资讯 → LLM 提炼 → 落盘工作区 briefs/）
+# ============================================================================
+def daily_brief(topic="", max_items=8):
+    """生成每日简报：采集当日 AI/科技资讯（复用 WeChat Writer 采集引擎）
+    → LLM 提炼要点与点评 → 保存到工作区 briefs/brief_YYYYMMDD.md。
+
+    topic：可选主题关键词（仅保留标题/摘要命中的素材）。
+    返回简报正文 + 落盘路径。
+    """
+    try:
+        from wechat_writer import config as _ww_config
+        from wechat_writer import sources as _ww_sources
+    except ImportError:
+        return "错误：wechat_writer 模块不可用（请确认项目目录完整）"
+    try:
+        cfg = _ww_config.load_config()
+        items = _ww_sources.collect_all(cfg)
+    except Exception as e:
+        return f"错误：资讯采集失败: {e}"
+    kw = str(topic or "").strip()
+    if kw:
+        items = [it for it in items if kw in (f"{it.title} {it.summary}")]
+    if not items:
+        return "今日暂无资讯素材（RSS 与搜索均无结果），可稍后再试"
+    try:
+        limit = max(3, min(15, int(max_items or 8)))
+    except (TypeError, ValueError):
+        limit = 8
+    items = items[:limit]
+    client = _CLIENT_HOLDER.get("client")
+    if client is None:
+        return "错误：没有可用客户端（请先完成一次对话建立连接）"
+    material = "\n\n".join(
+        f"{i + 1}. {it.title}（{it.source}）\n   {it.url}\n   {it.summary[:200]}"
+        for i, it in enumerate(items)
+    )
+    prompt = (
+        "你是每日资讯主编。基于以下今日采集的资讯，生成一份精炼简报：\n"
+        "1. 简报标题：一句话概括今日主题（## 开头）\n"
+        "2. 3-6 条要点，每条用 - 前缀：主题 + 一句话点评\n"
+        "3. 结尾「今日趋势」：2-3 句话总结值得关注的动向\n"
+        "只输出简报正文（Markdown），不要任何说明文字。\n\n"
+        f"素材（{len(items)} 条）：\n{material}"
+    )
+    try:
+        resp = client.client.chat.completions.create(
+            model=client.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            stream=False,
+            timeout=120.0,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        brief = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"错误：简报生成失败: {e}"
+    if not brief:
+        return "简报生成失败：模型返回空内容，请重试"
+    out = ""
+    if permissions.WORKSPACE_DIR:
+        d = os.path.join(permissions.WORKSPACE_DIR, "briefs")
+        ok, reason = permissions.check_filesystem(d, write=True)
+        if not ok:
+            out = f"\n（简报落盘被权限拒绝：{reason}）"
+        else:
+            try:
+                os.makedirs(d, exist_ok=True)
+                path = os.path.join(d, f"brief_{datetime.now():%Y%m%d}.md")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"# 每日简报 {datetime.now():%Y-%m-%d}\n\n{brief}\n")
+                out = f"\n已保存：{path}"
+            except Exception as e:
+                out = f"\n（简报落盘失败：{e}）"
+    return f"📰 今日简报（{len(items)} 条素材）：\n\n{brief}{out}"
+
+
+# ============================================================================
+# 插件工坊：AI 生成并安装 .wtplugin 插件（零代码能力扩展）
+# ============================================================================
+def _to_tool_schema(t):
+    """把简化工具描述转成 user_tools.json 完整 schema（兼容已完整 schema 的输入）。"""
+    if isinstance(t, dict) and t.get("function"):
+        return t
+    if not isinstance(t, dict):
+        return None
+    name = str(t.get("name") or "").strip()
+    endpoint = str(t.get("endpoint") or "").strip()
+    if not (name and endpoint):
+        return None
+    params = [p.strip() for p in str(t.get("params") or "").split(",") if p.strip()]
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": str(t.get("description") or "")[:200],
+            "parameters": {
+                "type": "object",
+                "properties": {p: {"type": "string", "description": p} for p in params},
+                "required": params,
+            },
+            "endpoint": endpoint,
+            "method": str(t.get("method") or "POST").upper(),
+        },
+    }
+
+
+def create_plugin(name, description="", tools=None, skills=None, workflows=None,
+                  scenario=None, requires=None):
+    """AI 生成并安装插件：根据需求组合工具/技能/流程/场景，生成后立即生效。
+
+    内部走审批闸门（ACTION_TOOLS 注册）；安装后可在「工具 → 插件管理」停用/卸载。
+    """
+    name = str(name or "").strip()
+    if not name:
+        return "错误：name 必填（插件名称）"
+    contents = {}
+    if tools:
+        converted = [_to_tool_schema(t) for t in tools] if isinstance(tools, list) else [_to_tool_schema(tools)]
+        converted = [t for t in converted if t]
+        if converted:
+            contents["tools"] = converted
+    if skills:
+        contents["skills"] = skills if isinstance(skills, list) else [skills]
+    if workflows:
+        contents["workflows"] = workflows
+    if scenario:
+        contents["scenario"] = scenario
+    if not contents:
+        return "错误：插件需要至少一项能力（tools / skills / workflows / scenario）"
+    plugin = {
+        "format": plugins_mod.PLUGIN_FORMAT,
+        "version": 1,
+        "meta": {
+            "name": name[:40],
+            "description": str(description or "")[:200],
+            "author": "鲸语 AI",
+            "version": "1.0.0",
+        },
+        "requires": [str(r).strip() for r in (requires or []) if str(r).strip()],
+        "contents": contents,
+    }
+    ok, err = plugins_mod.validate_plugin(plugin)
+    if not ok:
+        return f"错误：插件校验失败：{err}"
+    if not PLUGIN_PATHS:
+        return "错误：插件模块未初始化"
+    res = plugins_mod.apply_plugin(plugin, PLUGIN_PATHS)
+    if not res.get("ok"):
+        return f"错误：插件安装失败：{res.get('error')}"
+    added = res.get("added") or {}
+    parts = []
+    if added.get("tools"):
+        parts.append(f"工具 {'、'.join(added['tools'])}")
+    if added.get("skills"):
+        parts.append(f"技能 {'、'.join(added['skills'])}")
+    if added.get("workflows"):
+        parts.append(f"流程 {'、'.join(added['workflows'])}")
+    if scenario:
+        parts.append("场景配置（可在插件管理中应用）")
+    miss = plugins_mod.missing_requires(plugin)
+    note = f"\n⚠ 缺失依赖：{'、'.join(miss)}（pip install …，可在「依赖状态」查看）" if miss else ""
+    return (
+        f"✅ 插件「{name}」已生成并安装：{'；'.join(parts) or '空'}。\n"
+        f"安装目录：{res.get('path')}{note}\n"
+        "可在「工具 → 插件管理」查看、停用或卸载；插件可导出 .wtplugin 分享给他人。"
+    )
 
 
 TOOL_CALL_MAP = {
@@ -6608,6 +6991,7 @@ TOOL_CALL_MAP = {
     "run_python": run_python,
     "read_file": read_file,
     "fetch_url": fetch_url,
+    "fetch_blocked": _run_fetch_blocked,
     "search_web": search_web,
     "database_query": database_query,
     "tts_save": tts_save,
@@ -6678,6 +7062,8 @@ TOOL_CALL_MAP = {
     "media_ffmpeg": media_ffmpeg,
     "webdav": webdav,
     "run_wechat_writer": run_wechat_writer,
+    "daily_brief": daily_brief,
+    "create_plugin": create_plugin,
 }
 
 MAX_TOOL_ROUNDS = 10
@@ -6715,6 +7101,74 @@ def check_balance(api_key, base_url=DEFAULT_BASE_URL, timeout=10.0):
     )
     response.raise_for_status()
     return response.json()
+
+
+def _prune_reasoning_for_send(messages):
+    """发送时剥离「无工具调用轮次」的思考内容（官方多轮拼接规则）。
+
+    官方规则：两个 user 消息之间，若模型未进行工具调用，中间 assistant 的
+    reasoning_content 在后续轮次传入 API 会被忽略——不传即可省下这部分
+    输入 token（思考内容可占数千 token，是纯浪费）。
+    带 tool_calls 的轮次必须完整回传 reasoning_content（缺失会 400），
+    因此只剥离「无 tool_calls 的 assistant 消息」。
+    仅对浅拷贝生效，不影响调用方内存中的会话历史（UI/存档仍需 reasoning）。
+    """
+    cleaned = []
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and not m.get("tool_calls")
+            and m.get("reasoning_content")
+        ):
+            m = dict(m)
+            m.pop("reasoning_content", None)
+        cleaned.append(m)
+    return cleaned
+
+
+def _strictify_schema(schema):
+    """把 JSON Schema 转换为 strict 模式（Beta）要求：
+    - object 的全部属性补入 required
+    - object 必须 additionalProperties=false
+    - 递归处理嵌套 object / items / anyOf
+    strict 模式下模型输出 Function 调用时严格遵循 schema，减少参数格式错误。
+    """
+    if not isinstance(schema, dict):
+        return schema
+    st = dict(schema)
+    if st.get("type") == "object":
+        props = st.get("properties")
+        if isinstance(props, dict):
+            st["required"] = list(props.keys())
+            st["properties"] = {k: _strictify_schema(v) for k, v in props.items()}
+        st["additionalProperties"] = False
+    items = st.get("items")
+    if isinstance(items, dict):
+        st["items"] = _strictify_schema(items)
+    anyof = st.get("anyOf")
+    if isinstance(anyof, list):
+        st["anyOf"] = [_strictify_schema(a) for a in anyof]
+    return st
+
+
+def _strictify_tools(tools):
+    """把所有 function 工具转换为 strict 模式（官方要求：全部 function 均需 strict=true）。"""
+    out = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            out.append(t)
+            continue
+        t = dict(t)
+        fn = t.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            fn["strict"] = True
+            if isinstance(fn.get("parameters"), dict):
+                fn["parameters"] = _strictify_schema(fn["parameters"])
+            t["function"] = fn
+        out.append(t)
+    return out
 
 
 class DeepSeekClient:
@@ -6796,6 +7250,9 @@ class DeepSeekClient:
         pure_chat=False,
         on_ask=None,
         on_request_permission=None,
+        on_truncated=None,
+        trailing_text=None,
+        strict_tools=False,
     ):
         cfg = SCENARIOS.get(scenario, SCENARIOS["通用"])
         thinking_key = thinking if thinking in THINKING_MODES else "high"
@@ -6804,12 +7261,18 @@ class DeepSeekClient:
         work = messages
         json_hint = None
         memory_msg = None
+        # 缓存友好消息布局（官方硬盘缓存按「前缀完整匹配」命中）：
+        # - 恒定的 json_hint 保持在最前（前缀稳定 → 可命中）
+        # - 系统提示词 messages[0] 紧随其后（稳定前缀主体）
+        # - 可能变化的记忆注入追加在末尾（system 消息位置任意），
+        #   记忆刷新只破坏尾部单元，稳定前缀继续命中
         if json_output:
             json_hint = {"role": "system", "content": JSON_HINT_MESSAGE}
             work = [json_hint] + messages
         if memory_text:
             memory_msg = {"role": "system", "content": memory_text}
-            work = [memory_msg] + work
+            work = work + [memory_msg]
+        trailing = str(trailing_text or "")
 
         extra_body = {
             "thinking": {"type": "enabled" if thinking_key != "none" else "disabled"}
@@ -6836,12 +7299,21 @@ class DeepSeekClient:
             effort = EFFORT_BY_THINKING.get(thinking_key)
             if thinking_key == "auto":
                 effort = _auto_effort(work)
-            if effort is None:
-                effort = cfg["reasoning_effort"]
-            kwargs["reasoning_effort"] = effort
+            if effort == "none":
+                # auto 判定为简单任务：关闭思考（reasoning_effort 不支持 none，
+                # 此前直接传 "none" 会被 API 拒绝或静默忽略）
+                kwargs["temperature"] = cfg["temperature"] if temperature is None else temperature
+                kwargs["top_p"] = cfg["top_p"] if top_p is None else top_p
+            else:
+                if effort is None:
+                    effort = cfg["reasoning_effort"]
+                kwargs["reasoning_effort"] = effort
         if seed is not None:
             kwargs["seed"] = seed
         all_tools = TOOLS + (custom_tools or [])
+        # 兜底：array 参数缺 items 会导致 API 400（missing field 'items'），
+        # 内置/自定义/插件工具一律补齐，防御用户自定义 schema 遗漏
+        _patch_array_items(all_tools)
         if pure_chat:
             # 纯对话模式：完全不传 tools schema（避免工具提示词污染对话能力）
             pass
@@ -6854,7 +7326,7 @@ class DeepSeekClient:
                     or t["function"]["name"] in SELF_EVOLUTION_TOOLS
                 ]
             if tools:
-                kwargs["tools"] = tools
+                kwargs["tools"] = _strictify_tools(tools) if strict_tools else tools
         elif any(t["function"]["name"] in SELF_EVOLUTION_TOOLS for t in all_tools):
             # 工具总开关关闭时，自我进化工具仍可用（自我审查是安全只读+分支提案）
             kwargs["tools"] = [
@@ -6863,6 +7335,7 @@ class DeepSeekClient:
 
         empty_retries = 0
         plan_rejections = 0
+        json_retried = False  # JSON 输出自校验重试只允许一次
         rounds = max_tool_rounds if max_tool_rounds and max_tool_rounds > 0 else MAX_TOOL_ROUNDS
         last_tool_key = None
         same_repeats = 0
@@ -6870,15 +7343,32 @@ class DeepSeekClient:
             for _ in range(rounds):
                 if stop_event and stop_event.is_set():
                     return False
+                # 发送前构造请求消息：剥离无工具轮次的思考内容（省输入 token），
+                # 动态上下文（trailing_text）追加到最近一条 user 消息尾部。
+                # 仅作用于浅拷贝：不修改 work / 调用方内存历史（UI 与存档保留 reasoning）
+                req_msgs = _prune_reasoning_for_send(work)
+                if trailing:
+                    req_msgs = list(req_msgs)
+                    for i in range(len(req_msgs) - 1, -1, -1):
+                        if req_msgs[i].get("role") == "user":
+                            last = dict(req_msgs[i])
+                            last["content"] = str(last.get("content") or "") + "\n\n" + trailing
+                            req_msgs[i] = last
+                            break
+                    else:
+                        req_msgs.append({"role": "user", "content": trailing})
+                kw = dict(kwargs) if req_msgs is not work else kwargs
+                if req_msgs is not work:
+                    kw["messages"] = req_msgs
                 # 流中途断线（APIConnectionError）会抛在 _create_with_retry 之外：
                 # 仅在「尚无任何增量送达 UI」时整体重试，避免已显示内容重复
-                reasoning, content, tool_calls = "", "", {}
+                reasoning, content, tool_calls, finish_reason = "", "", {}, None
                 stream_usage = None
                 try:
                     for stream_attempt in range(2):
-                        response = self._create_with_retry(kwargs, attempts=2, stop_event=stop_event)
+                        response = self._create_with_retry(kw, attempts=2, stop_event=stop_event)
                         try:
-                            reasoning, content, tool_calls, stream_usage = self._consume_stream(
+                            reasoning, content, tool_calls, finish_reason, stream_usage = self._consume_stream(
                                 response, on_reasoning, on_content, stop_event
                             )
                             break
@@ -6888,6 +7378,13 @@ class DeepSeekClient:
                             logger.warning("流式连接中途断开（尚未收到内容），重试: %s", e)
                 except _StopRequested:
                     return False  # 停止请求：干净返回，不把半截内容当异常抛给 UI
+                except (APIConnectionError, APITimeoutError) as e:
+                    # 流中途断线且已有部分增量送达 UI：不再重试（避免已显示内容重复），
+                    # 明确告知本轮未正常完成（finish_reason=aborted 语义）
+                    logger.warning("流式连接中途断开，本轮生成未完成: %s", e)
+                    if on_truncated:
+                        on_truncated("网络中断：本轮回复不完整")
+                    return False
                 if stream_usage is not None:
                     if on_usage:
                         on_usage(self._usage_dict(stream_usage))
@@ -6902,6 +7399,8 @@ class DeepSeekClient:
                         logger.warning("收到空响应（无内容/思考/工具调用），自动重试第 %s 次", empty_retries)
                         continue
                     logger.warning("空响应重试已达上限，按失败返回（不写入空历史）")
+                    if on_truncated:
+                        on_truncated("模型连续返回空响应，本轮生成失败")
                     return False
 
                 if continue_prefix and work and work[-1].get("role") == "assistant":
@@ -6942,6 +7441,33 @@ class DeepSeekClient:
                     work.append(assistant_msg)
 
                 if not tool_calls:
+                    # finish_reason=length：输出达 max_tokens 上限被截断，
+                    # 任务/回复未完成——此前静默返回 True 导致 UI 误报「任务完成」
+                    if finish_reason == "length" and on_truncated:
+                        on_truncated("输出已达上限（max_tokens）被截断，回复不完整")
+                    if json_output and content.strip():
+                        # JSON 输出自校验：解析失败自动修正重试一次
+                        # （官方说明 JSON 输出有概率返回非法内容，这是应用层可救回的部分）
+                        try:
+                            json.loads(content)
+                        except (TypeError, ValueError):
+                            if not json_retried:
+                                json_retried = True
+                                if on_truncated:
+                                    on_truncated("JSON 输出解析失败，正在自动修正重试")
+                                if work and work[-1].get("role") == "assistant":
+                                    work.pop()  # 移除刚追加的半截 assistant 消息
+                                work.append(
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "[系统] 你上次输出的内容无法解析为合法 JSON。"
+                                            "请重新输出：仅返回一个合法的 JSON 对象，"
+                                            "不要输出任何其他文字。"
+                                        ),
+                                    }
+                                )
+                                continue
                     return True
 
                 # 停止/中断防护：用户已停止或 tool_calls 不完整（缺 id/name，流被中断）
@@ -6950,6 +7476,8 @@ class DeepSeekClient:
                     not (tc.get("id") and tc.get("name")) for tc in tool_calls
                 ):
                     work[-1].pop("tool_calls", None)
+                    if on_truncated and not (stop_event and stop_event.is_set()):
+                        on_truncated("工具调用流被截断，本轮工具未执行")
                     return False
 
                 if on_plan is not None:
@@ -7178,6 +7706,11 @@ class DeepSeekClient:
                     work.append(
                         {"role": "tool", "tool_call_id": tc["id"], "content": text}
                     )
+            # for 循环自然结束 = 工具轮数耗尽（任务可能未完成）：告知 UI
+            if on_truncated:
+                on_truncated(
+                    f"工具调用轮数已达上限（{rounds} 轮），若任务未完成请追加指令继续"
+                )
             return True
         finally:
             if json_hint is not None or memory_msg is not None:
@@ -7224,6 +7757,7 @@ class DeepSeekClient:
         reasoning = ""
         content = ""
         tool_calls = {}
+        finish_reason = None
         usage = None
         try:
             for chunk in response:
@@ -7237,6 +7771,12 @@ class DeepSeekClient:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
+                try:
+                    fr = chunk.choices[0].finish_reason
+                    if fr:
+                        finish_reason = fr
+                except Exception:
+                    pass
                 reasoning_part = getattr(delta, "reasoning_content", None)
                 if reasoning_part:
                     reasoning += reasoning_part
@@ -7263,7 +7803,7 @@ class DeepSeekClient:
                     response.close()
             except Exception:
                 pass
-        return reasoning, content, list(tool_calls.values()), usage
+        return reasoning, content, list(tool_calls.values()), finish_reason, usage
 
     @staticmethod
     def _usage_dict(usage):

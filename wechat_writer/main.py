@@ -64,6 +64,7 @@ def run_once(dry_run=False, topic_override="", config_path=None, use_blocked=Fal
         # 2 选题（含历史去重）
         hist_topics = hist_mod.topics(HISTORY_PATH)
         hist_titles = hist_mod.titles(HISTORY_PATH)
+        user_picked = bool(topic_override)  # 用户显式指定主题：质检跳过查重（用户决策优先）
         if topic_override:
             topic = topic_mod.Topic(str(topic_override).strip(), "（用户指定主题）")
         else:
@@ -75,13 +76,13 @@ def run_once(dry_run=False, topic_override="", config_path=None, use_blocked=Fal
         logger.info("初稿完成：%s（%d 字）", article.title, q_mod._count_chars(article.content))
 
         # 4 质检 + 重试
-        report = q_mod.check(article, cfg, hist_topics, hist_titles)
+        report = q_mod.check(article, cfg, hist_topics, hist_titles, skip_dedup=user_picked)
         for _ in range(cfg["quality"].get("max_retry", 1)):
             if report.passed:
                 break
             logger.warning("质检未过：%s；重写修正", report.reasons)
             article = w_mod.rewrite_fix(article, report.reasons, cfg["style"])
-            report = q_mod.check(article, cfg, hist_topics, hist_titles)
+            report = q_mod.check(article, cfg, hist_topics, hist_titles, skip_dedup=user_picked)
         if not report.passed:
             return {"ok": False, "topic": topic.name, "title": article.title,
                     "chars": report.chars,

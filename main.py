@@ -6,14 +6,22 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
 import bisect
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import tkinter.font as tkfont
+
+from shared import (
+    cron_field_ok,
+    cron_match,
+    PATH_RE,
+    OCR_IMAGE_PS,
+)
 
 from deepseek_client import (
     DeepSeekClient,
@@ -34,6 +42,7 @@ import prompts
 import exporters
 import permissions
 import crypto
+import plugins as plugins_mod
 from splash import SplashScreen
 from taskpanel import TaskPanel
 from processpanel import ProcessPanel
@@ -44,6 +53,14 @@ try:
     DND_AVAILABLE = True
 except ImportError:
     DND_AVAILABLE = False
+
+try:
+    import pystray
+    from PIL import Image as _TrayImage
+
+    TRAY_AVAILABLE = True
+except Exception:
+    TRAY_AVAILABLE = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -65,9 +82,12 @@ WORKSPACE_DIR = os.path.join(DATA_DIR, "workspace")
 DRAFT_PATH = os.path.join(DATA_DIR, "draft.json")
 MEMORY_PATH = os.path.join(DATA_DIR, "memory.json")
 SCHEDULES_PATH = os.path.join(DATA_DIR, "schedules.json")
-FEEDBACK_PATH = os.path.join(DATA_DIR, "feedback.json")
 PATTERNS_PATH = os.path.join(DATA_DIR, "patterns.json")
+USER_ROLES_PATH = os.path.join(DATA_DIR, "user_roles.json")  # 用户自定义角色（可增删改分类）
 SESSIONS_DIR = os.path.join(HISTORY_DIR, "sessions")
+FAILURES_PATH = os.path.join(DATA_DIR, "failures.json")  # 失败模式库（工具失败→AI 规避参考）
+PLUGINS_DIR = os.path.join(DATA_DIR, "plugins")  # 插件体系（.wtplugin 安装目录）
+SAMPLE_PLUGINS_DIR = os.path.join(BASE_DIR, "sample_plugins")  # 内置示例插件（插件画廊）
 
 EVOLUTIONS_DIR = os.path.join(BASE_DIR, "evolutions")
 
@@ -169,10 +189,17 @@ _dc.KNOWLEDGE_INDEX_FILE = os.path.join(DATA_DIR, "knowledge_index.json")
 _dc.WORKFLOWS_FILE = os.path.join(DATA_DIR, "workflows.json")
 _dc.CHECKPOINT_FILE = os.path.join(DATA_DIR, "task_checkpoint.json")
 _dc.STATS_FILE = STATS_PATH
+_dc.PATTERNS_FILE = PATTERNS_PATH
 # 文档 / RSS / KV / WebDAV 数据文件
 _dc.RSS_SOURCES_FILE = os.path.join(DATA_DIR, "rss_sources.json")
 _dc.KV_CACHE_DIR = os.path.join(DATA_DIR, "kv_cache")
 _dc.WEBDAV_CONFIG_FILE = os.path.join(DATA_DIR, "webdav_config.json")
+_dc.PLUGIN_PATHS = {
+    "plugins_dir": PLUGINS_DIR,
+    "user_tools": USER_TOOLS_PATH,
+    "prompts": PROMPTS_PATH,
+    "workflows": os.path.join(DATA_DIR, "workflows.json"),
+}
 
 
 def load_profiles(path=PROFILES_PATH):
@@ -347,6 +374,11 @@ BUILTIN_TOOL_NAMES = [
     "task_checkpoint_load",
     "run_workflow",
     "usage_report",
+    "daily_brief",
+    "create_plugin",
+    # 公众号写作能力（安全：只产草稿不发布，发布权在用户；permissions 白名单已含 publish_draft）
+    "run_wechat_writer",
+    "publish_draft",
 ]
 
 DEFAULT_CONFIG = {
@@ -386,7 +418,7 @@ DEFAULT_CONFIG = {
     "fold_early_threshold": 0,
     "current_profile": "",
     "notify_on_done": False,
-    "scenario_pack": "",
+    "ssrf_trusted": [],
     "project_context": False,
     "full_auto": False,
     "active_dir": "",
@@ -400,62 +432,35 @@ DEFAULT_CONFIG = {
     "image_base_url": "",     # 图片生成端点（默认 = base_url）
     "image_model": "gpt-image-1",
     "window_geometry": "",    # 窗口大小位置记忆（如 1280x820+100+50）
+    "minimize_to_tray": False,  # 关闭时最小化到系统托盘（需 pystray）
+    "autostart": False,       # 开机自启（注册表 Run 键）
+    "strict_tools": False,    # strict 工具模式（Beta）：模型严格遵循工具 JSON Schema
+    "update_url": "",         # 更新检查源（latest.json，如 https://example.com/latest.json）
 }
 
-VERSION = "1.11.0"
-
-SCENARIO_PACKS = {
-    "办公": {
-        "desc": "周报 / 文档 / 整理 / 翻译",
-        "thinking": "high",
-        "system_prompt": (
-            "你是专业的办公助理。输出简洁专业，使用中文。\n"
-            "处理文档类任务时优先使用 create_doc / write_file 保存到工作区，"
-            "需要资料时用 search_local / fetch_url，写作草稿用 publish_draft。"
-        ),
-        "tools": [
-            "get_date", "get_weather", "run_python", "read_file", "fetch_url",
-            "write_file", "edit_file", "list_dir", "search_local", "create_doc", "publish_draft",
-        ],
-        "perms": {"allow_write": True, "allow_run_command": False, "approval_mode": "auto"},
-    },
-    "开发": {
-        "desc": "写代码 / 建工程 / 跑测试",
-        "thinking": "max",
-        "system_prompt": (
-            "你是资深软件工程师。输出高质量代码并尽量实际运行验证。\n"
-            "创建项目用 write_code_project，运行与测试用 run_command（python/pip/pytest/git），"
-            "服务器用 start_process 启动并实时验证，修复用 edit_file，改前先读文件。"
-            "完成任务前务必自检：产物齐全、进程存活、测试通过。使用中文说明。"
-        ),
-        "tools": [
-            "get_date", "get_weather", "run_python", "read_file", "fetch_url",
-            "write_file", "edit_file", "list_dir", "run_command", "search_local",
-            "create_doc", "write_code_project", "start_process", "stop_process",
-            "list_processes", "environment_info", "verify_files",
-        ],
-        "perms": {"allow_write": True, "allow_run_command": True, "approval_mode": "confirm"},
-    },
-    "创作": {
-        "desc": "写作 / 文案 / 翻译 / 润色",
-        "thinking": "high",
-        "system_prompt": (
-            "你是资深创作顾问，擅长写作、文案、翻译与润色。使用中文，输出有文采且实用。\n"
-            "成稿用 create_doc 保存到工作区，草稿用 publish_draft。"
-        ),
-        "tools": [
-            "get_date", "get_weather", "run_python", "read_file", "fetch_url",
-            "write_file", "edit_file", "list_dir", "search_local", "create_doc", "publish_draft",
-        ],
-        "perms": {"allow_write": True, "allow_run_command": False, "approval_mode": "auto"},
-    },
-}
+VERSION = "2.12.10"
 
 ROLES = {
     "通用助手": {
         "prompt": DEFAULT_SYSTEM_PROMPT,
         "thinking": "high",
         "desc": "默认全能助手，任务拆解/工具调用/长上下文管理",
+    },
+    "智能体": {
+        "prompt": (
+            "你是一位面向开发与创作任务的自主智能体。工作协议：\n"
+            "1) 目标先行：先理解任务目标与可验收的结果，主动澄清缺失的关键信息；\n"
+            "2) 规划执行：拆解步骤，为每一步挑选合适的工具（读/写/运行/检索/抓取），"
+            "按依赖顺序执行，能自动完成的不再询问；\n"
+            "3) 产物落地：代码与文档写入文件系统（write_file / write_code_project / create_doc），"
+            "服务与命令通过 run_command / start_process 运行；\n"
+            "4) 验证闭环：每次产出后主动验证——运行测试、抓取页面、检查文件，失败即定位修正；\n"
+            "5) 结果汇报：以结构化方式汇报完成项、验证证据（文件位置/测试输出/截图）、"
+            "遗留风险与下一步建议。\n"
+            "请使用中文，把「完成并交付可验证的产物」作为最高准则。"
+        ),
+        "thinking": "max",
+        "desc": "自主任务执行：规划-执行-验证闭环，交付可验证产物",
     },
     "翻译官": {
         "prompt": (
@@ -586,9 +591,7 @@ TASK_TEMPLATES = {
     ),
 }
 
-# 更新源：GitHub Releases（返回 {"tag_name": "v1.11.0", "html_url": ...}）。
-# 也兼容自定义 JSON 格式 {"version": "...", "url": "..."}（见 check_for_update）。
-UPDATE_URL = "https://api.github.com/repos/pythonshiyi/DeepSeek_Assistant/releases/latest"
+UPDATE_URL = ""  # 部署时填入发布信息 JSON 地址，如 "https://example.com/latest.json"
 CLEAN_EXIT_FLAG = os.path.join(DATA_DIR, ".clean_exit")
 
 MAX_CONTEXT_TOKENS = 1_000_000
@@ -635,15 +638,33 @@ PAGED_RENDER_SIZE = 250        # 每帧渲染的 block 数
 PAGED_RENDER_MS = 25           # 帧间隔（事件循环得以处理输入/拖动/切换）
 MAX_SEARCH_MATCHES = 2000
 CODE_FENCE_RE = re.compile(r"^```\w*\s*$", re.MULTILINE)
-PATH_RE = re.compile(
-    r"[A-Za-z]:[\\/][^\s'\"()<>|,;（）【】《》，。、；：？！]+"
-)
 
 RECENT_PATH = os.path.join(DATA_DIR, "recent_outputs.json")
 
 FONT_FAMILY = "Microsoft YaHei UI"
 MONO_FAMILY = "Consolas"
 PLACEHOLDER_TEXT = "输入问题，Enter 发送，Shift+Enter 换行"
+
+# 可选依赖清单（依赖状态对话框）：(导入名, 显示名, 影响功能, 安装命令)
+OPTIONAL_DEPS = [
+    ("PIL", "Pillow", "图片处理/应用内图片预览/OCR/图表/图标", "pip install pillow"),
+    ("pystray", "pystray", "系统托盘常驻", "pip install pystray"),
+    ("playwright", "playwright", "浏览器操作/网页截图", "pip install playwright && playwright install chromium"),
+    ("faster_whisper", "faster-whisper", "语音转文字", "pip install faster-whisper"),
+    ("fitz", "PyMuPDF", "PDF 提取", "pip install PyMuPDF"),
+    ("reportlab", "reportlab", "PDF 生成", "pip install reportlab"),
+    ("docx", "python-docx", "Word 读写", "pip install python-docx"),
+    ("pptx", "python-pptx", "PPT 读取", "pip install python-pptx"),
+    ("feedparser", "feedparser", "RSS 聚合/每日简报/公众号写作", "pip install feedparser"),
+    ("qrcode", "qrcode", "二维码生成", "pip install qrcode"),
+    ("pyzbar", "pyzbar", "二维码识别", "pip install pyzbar（另需系统 zbar）"),
+    ("diskcache", "diskcache", "KV 存储", "pip install diskcache"),
+    ("imageio_ffmpeg", "imageio-ffmpeg", "音视频处理（内置 ffmpeg）", "pip install imageio-ffmpeg"),
+    ("markdown", "markdown", "公众号写作 HTML 输出", "pip install markdown"),
+    ("win32com", "pywin32", "语音朗读/语音合成", "pip install pywin32"),
+    ("tkinterdnd2", "tkinterdnd2", "文件拖拽到输入框", "pip install tkinterdnd2"),
+    ("tiktoken", "tiktoken", "精确 token 估算（缺省回退字符估算）", "pip install tiktoken"),
+]
 
 
 class CappedList(list):
@@ -673,98 +694,6 @@ def _index_num(idx):
         return (int(ln), int(ch or "0"))
     except ValueError:
         return (10**9, 0)
-
-
-def _cron_field_match(field, value):
-    """匹配 cron 单字段（* / 逗号 / 连字符 / 步进）。"""
-    field = str(field).strip()
-    if field in ("*", "?"):
-        return True
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "/" in part:
-            base, _, step = part.partition("/")
-            try:
-                step = int(step)
-            except ValueError:
-                continue
-            start = 0 if base in ("*", "?") else _cron_int(base)
-            if start is None:
-                continue
-            if value >= start and (value - start) % step == 0:
-                return True
-        elif "-" in part:
-            lo, _, hi = part.partition("-")
-            lo_v, hi_v = _cron_int(lo), _cron_int(hi)
-            if lo_v is not None and hi_v is not None and lo_v <= value <= hi_v:
-                return True
-        else:
-            v = _cron_int(part)
-            if v is not None and v == value:
-                return True
-    return False
-
-
-def _cron_int(s):
-    try:
-        return int(s)
-    except (TypeError, ValueError):
-        return None
-
-
-_CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (1, 7))
-
-
-def _cron_field_ok(field, pos=0):
-    """cron 字段语法校验：仅允许数字、*、,、-、/，且值域合法（添加定时任务时防止非法表达式）。"""
-    field = str(field or "").strip()
-    if not field:
-        return False
-    if field in ("*", "?"):
-        return True
-    lo, hi = _CRON_RANGES[pos]
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            return False
-        if "/" in part:
-            base, _, step = part.partition("/")
-            if _cron_int(step) is None or not (1 <= _cron_int(step) <= hi):
-                return False
-            if base not in ("*", "?", "") and not (
-                _cron_int(base) is not None and lo <= _cron_int(base) <= hi
-            ):
-                return False
-        elif "-" in part:
-            l, _, r = part.partition("-")
-            lv, rv = _cron_int(l), _cron_int(r)
-            if lv is None or rv is None or not (lo <= lv <= hi and lo <= rv <= hi and lv <= rv):
-                return False
-        else:
-            v = _cron_int(part)
-            if v is None or not (lo <= v <= hi):
-                return False
-    return True
-
-
-def _cron_match(expr, now):
-    """匹配 5 字段 cron 表达式（分 时 日 月 周，周 1=周一…7=周日）。"""
-    try:
-        fields = str(expr).strip().split()
-        if len(fields) != 5:
-            return False
-        minute, hour, day, month, weekday = fields
-        return (
-            _cron_field_match(minute, now.minute)
-            and _cron_field_match(hour, now.hour)
-            and _cron_field_match(day, now.day)
-            and _cron_field_match(month, now.month)
-            and _cron_field_match(weekday, now.isoweekday())
-        )
-    except Exception:
-        return False
 
 
 def _stream_defer_needed(buf):
@@ -1001,7 +930,7 @@ def normalize_config(cfg):
         cfg["max_tokens"] = int(cfg.get("max_tokens", 16384))
     except (TypeError, ValueError):
         cfg["max_tokens"] = 16384
-    cfg["max_tokens"] = max(1024, min(65536, cfg["max_tokens"]))
+    cfg["max_tokens"] = max(1024, min(393216, cfg["max_tokens"]))  # V4 正式版最大输出 384K
 
     seed = str(cfg.get("seed", "")).strip()
     if seed:
@@ -1124,6 +1053,10 @@ def normalize_config(cfg):
     cfg["image_api_key"] = str(cfg.get("image_api_key", "") or "").strip()
     cfg["image_base_url"] = str(cfg.get("image_base_url", "") or "").strip()
     cfg["image_model"] = str(cfg.get("image_model", "gpt-image-1")).strip() or "gpt-image-1"
+    cfg["minimize_to_tray"] = _as_bool(cfg.get("minimize_to_tray", False))
+    cfg["autostart"] = _as_bool(cfg.get("autostart", False))
+    cfg["strict_tools"] = _as_bool(cfg.get("strict_tools", False))
+    cfg["update_url"] = str(cfg.get("update_url", "") or "").strip()
     return cfg
 
 
@@ -1322,8 +1255,13 @@ class AssistantApp:
         self._ensure_current()["blocks"] = value
 
     def __init__(self, root):
+        _t_init = time.perf_counter()
         self.root = root
         self.cfg = load_config()
+        # SSRF 信任主机白名单（回环默认放行；内网经白名单显式信任后放行）
+        _dc.set_ssrf_trusted(self.cfg.get("ssrf_trusted") or [])
+        self._apply_screen_font_default()
+        _t_cfg = time.perf_counter()
         self._sessions = []
         self._current = None
         self.client = None
@@ -1335,6 +1273,7 @@ class AssistantApp:
         self._pending_tool_durations = []
         self._agent_tool_count = 0
         self._last_stream_activity = 0.0
+        self._auto_ckpt_tools = []  # 本轮工具链（自动断点用，worker 线程追加）
         self._ui_queue = queue.Queue()
         self._poller_id = None
         self._pending_send = None
@@ -1354,7 +1293,6 @@ class AssistantApp:
         self._send_when_ready = None  # 分帧渲染期间挂起的待发消息
         self._search_when_ready = False  # 分帧渲染期间挂起的搜索
         self._pending_appends = []  # 分帧渲染期间挂起的文本追加
-        self._speech_busy = False  # 语音输入防重入
         self._speak_thread = None  # 朗读线程引用（防叠加）
         self._session_name_cache = {}  # id(session) -> 基础显示名（重命名时失效）
         self._list_last_names = None  # 会话列表上次渲染的显示名（无变化跳过重建）
@@ -1390,6 +1328,7 @@ class AssistantApp:
         self._snapshot_writing = False  # 快照后台写盘进行中标志（防并发写互相覆盖）
         self._pending_stats = {}
         self._last_stats_flush = 0.0
+        self._round_aborted = False  # 本轮生成被截断/中断（max_tokens 达上限 / 流断线 / 异常）
         self._monthly_cost_cache = 0.0
         self._monthly_cost_time = None
         self._peak_notified = ""
@@ -1413,6 +1352,7 @@ class AssistantApp:
         if self.cfg.get("privacy_mode"):
             logging.disable(logging.INFO)
         self.build_ui()
+        _t_ui = time.perf_counter()
         self.setup_widgets_from_config()
         self.new_conversation(export_old=False)
         # 快照 JSON 解析 + 重建延后 100ms：先让窗口显示一帧，启动不再整段阻塞
@@ -1420,12 +1360,23 @@ class AssistantApp:
         self._restore_draft()
         self._poller_id = self.after(FLUSH_INTERVAL_MS, self._poll_ui)
         # 注：崩溃检测不再弹窗提示（体验决策）——快照恢复始终静默进行
-        if self.cfg.get("check_update") and UPDATE_URL:
+        if self.cfg.get("check_update") and (
+            self.cfg.get("update_url") or UPDATE_URL
+        ):
             self.after(3000, lambda: self.check_for_update(manual=False))
         if not self.cfg.get("welcomed"):
             self.after(500, self._show_welcome)
         self.after(400, self._apply_dark_titlebar)
         self.after(5000, self._maybe_remind_evolution)
+        self._quit_from_tray = False  # 托盘「退出」触发的关闭不走最小化拦截
+        self._tray_icon = None
+        self._tray_thread = None
+        self.after(1500, self._start_tray)
+        # 启动性能观测：各阶段耗时写入日志（后续版本据此优化热点）
+        logging.info(
+            "启动耗时 %.2fs（配置 %.2fs · UI 构建 %.2fs）",
+            time.perf_counter() - _t_init, _t_cfg - _t_init, _t_ui - _t_cfg,
+        )
 
     def build_ui(self):
         t = self._theme()
@@ -1448,7 +1399,10 @@ class AssistantApp:
         if not getattr(self, "_window_geo_restored", False):
             try:
                 sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-                w, h = LAYOUT["window_w"], LAYOUT["window_h"]
+                # 大屏自适应默认几何：屏幕的 72% 宽 × 80% 高（上限 1680x1050，
+                # 下限布局最小尺寸）——大屏 PC 不再局促
+                w = max(LAYOUT["window_min_w"], min(1680, int(sw * 0.72)))
+                h = max(LAYOUT["window_min_h"], min(1050, int(sh * 0.80)))
                 self.root.geometry(
                     f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 10)}"
                 )
@@ -1490,8 +1444,8 @@ class AssistantApp:
         self.root.bind("<Control-W>", lambda e: (self.close_tab(), "break"))
         self.root.bind("<F1>", lambda e: (self.show_help(), "break"))
         self.root.bind("<F5>", lambda e: (self.regenerate(), "break"))
-        # 菜单 Alt 快捷键导航（Alt+F/E/V/T/S/H 打开对应菜单，正式桌面应用惯例）
-        self._alt_menu_bindings = {"f": 0, "e": 1, "v": 2, "t": 3, "s": 4, "h": 5}
+        # 菜单 Alt 快捷键导航（Alt+F/E/V/T/A/S/H 打开对应菜单，正式桌面应用惯例）
+        self._alt_menu_bindings = {"f": 0, "e": 1, "v": 2, "t": 3, "a": 4, "s": 5, "h": 6}
         for _k, _idx in self._alt_menu_bindings.items():
             self.root.bind(
                 f"<Alt-{_k}>",
@@ -1503,6 +1457,11 @@ class AssistantApp:
             )
         self.root.bind("<Control-k>", lambda e: (self.show_command_palette(), "break"))
         self.root.bind("<Control-K>", lambda e: (self.show_command_palette(), "break"))
+        self.root.bind("<F11>", lambda e: (self.toggle_fullscreen(), "break"))
+        self.root.bind("<Control-Shift-t>", lambda e: (self.show_tool_hub(), "break"))
+        self.root.bind("<Control-Shift-T>", lambda e: (self.show_tool_hub(), "break"))
+        self.root.bind("<Control-Shift-p>", lambda e: (self.show_plugin_hub(), "break"))
+        self.root.bind("<Control-Shift-P>", lambda e: (self.show_plugin_hub(), "break"))
         self.root.bind("<Configure>", self._on_root_configure)
         self.root.bind("<Map>", lambda e: self._apply_dark_titlebar())
         self.root.bind("<FocusIn>", lambda e: self._apply_dark_titlebar())
@@ -1522,6 +1481,7 @@ class AssistantApp:
             font=(FONT_FAMILY, 9),
         )
         self._menus = []
+        self._menu_by_title = {}  # 顶级菜单标题 → Menu（测试/主题刷新定位用）
         self._menu_buttons = []
         bar = tk.Frame(self.root, bg=t["panel"])
         bar.pack(side="top", fill="x")
@@ -1531,6 +1491,7 @@ class AssistantApp:
         def add_menu(title, setup):
             menu = tk.Menu(self.root, **menu_opts)
             self._menus.append(menu)
+            self._menu_by_title[title] = menu  # 顶级菜单标题映射（含级联子菜单时 _menus 不同步）
             setup(menu)
             btn = tk.Button(
                 bar,
@@ -1567,86 +1528,109 @@ class AssistantApp:
 
         def _edit_menu(em):
             em.add_command(label="编辑重发", command=self.edit_last_message)
-            em.add_command(label="重新生成", command=self.regenerate)
+            em.add_command(label="重新生成", accelerator="F5", command=self.regenerate)
             em.add_command(label="生成变体", command=self.regenerate_variant)
             em.add_command(label="浏览变体…", command=self.show_variants)
             em.add_command(label="继续生成（Beta 续写）", command=self.continue_generation)
             em.add_separator()
             em.add_command(label="粘贴剪贴板并提问 (Ctrl+Shift+Q)", command=self._paste_clipboard_ask)
-            em.add_separator()
             em.add_command(label="复制回复", command=self.copy_last_reply)
             em.add_command(label="复制代码", command=self.copy_last_code)
             em.add_command(label="复制全部对话", command=self._copy_all)
             em.add_separator()
             em.add_command(label="查找对话内容", accelerator="Ctrl+F", command=self.toggle_search)
             em.add_command(label="全局搜索全部会话", accelerator="Ctrl+Shift+F", command=self.open_global_search)
+            em.add_command(label="🗺 会话轨迹", command=self.show_session_timeline)
+            em.add_separator()
             em.add_command(label="查看收藏", command=self.show_stars)
             em.add_command(label="长期记忆…", command=self.manage_memory)
-            em.add_command(label="反馈记录…", command=self.show_feedback)
             em.add_command(label="复制分享文本", command=self.copy_share_text)
-            em.add_separator()
-            em.add_command(label="朗读最后回复", command=self.speak_last_reply)
+            em.add_command(label="🔊 朗读最后回复", command=self.speak_last_reply)
 
         def _tools_menu(tm):
-            # ── 账户与用量 ──
-            tm.add_command(label="查余额", command=self.check_balance)
-            tm.add_command(label="用量统计", command=self.show_stats)
-            tm.add_command(label="预算设置", command=self.edit_budget)
-            tm.add_command(label="上下文详情", command=self.show_context_details)
-            tm.add_command(label="模型对比", command=self.compare_models)
+            # 中心入口（最高频导航按钮，置顶直连）
+            tm.add_command(label="🛠 工具中心", accelerator="Ctrl+Shift+T", command=self.show_tool_hub)
+            tm.add_command(label="🧩 插件中心", accelerator="Ctrl+Shift+P", command=self.show_plugin_hub)
             tm.add_separator()
+
+            # ── 账户与用量 ──
+            account = tk.Menu(tm, **menu_opts)
+            self._menus.append(account)
+            account.add_command(label="💰 查余额", command=self.check_balance)
+            account.add_command(label="📊 用量统计", command=self.show_stats)
+            account.add_command(label="🎯 预算设置", command=self.edit_budget)
+            account.add_command(label="📐 上下文详情", command=self.show_context_details)
+            account.add_command(label="⚖ 模型对比", command=self.compare_models)
+            tm.add_cascade(label="账户与用量", menu=account)
+
             # ── 任务与模板 ──
-            task_menu = tk.Menu(tm, **menu_opts)
+            tasks = tk.Menu(tm, **menu_opts)
+            self._menus.append(tasks)
+            task_menu = tk.Menu(tasks, **menu_opts)
             self._menus.append(task_menu)
             for tname in TASK_TEMPLATES:
                 task_menu.add_command(
                     label=tname, command=lambda n=tname: self.run_task_template(n)
                 )
-            tm.add_cascade(label="Agent 任务模板", menu=task_menu)
-            sample_menu = tk.Menu(tm, **menu_opts)
-            self._menus.append(sample_menu)
-            for tname in PLAYGROUND_TASKS:
-                sample_menu.add_command(
-                    label=tname, command=lambda n=tname: self._run_playground(n)
-                )
-            tm.add_cascade(label="示例任务（一键体验）", menu=sample_menu)
-            tm.add_command(label="批量任务…", command=self.show_batch_task)
-            tm.add_command(label="📄 生成会话纪要", command=self.generate_session_summary)
-            tm.add_command(label="🗺 会话结构导航", command=self.show_session_timeline)
-            tm.add_command(label="🗣 朗读最后回复", command=self.speak_last_reply)
-            tm.add_separator()
-            # ── 能力管理 ──
-            tm.add_command(label="工具设置", command=self.edit_tools)
-            tm.add_command(label="权限设置", command=self.edit_permissions)
-            tm.add_command(label="自定义工具（Agent SDK）", command=self.manage_user_tools)
-            tm.add_command(label="Profile 管理（多账号）", command=self.manage_profiles)
-            tm.add_command(label="提示词库管理", command=self.manage_prompts)
-            tm.add_command(label="🎭 角色库", command=self.show_roles)
-            tm.add_command(label="🧪 配方管理（成功模式）", command=self.show_recipes)
-            tm.add_command(label="FIM 代码补全…", command=self.show_fim_dialog)
-            tm.add_separator()
-            # ── 数据与文件 ──
-            tm.add_command(label="工作目录…", command=self.choose_working_dir)
-            tm.add_command(label="工作区文件树…", command=self.show_workspace_tree)
-            tm.add_command(label="最近产物…", command=self.show_recent_outputs)
-            tm.add_command(label="进程终端…", command=self.show_process_terminal)
-            tm.add_command(label="定时任务…", command=self.manage_schedules)
-            tm.add_command(label="📋 流程管理…", command=self.manage_workflows)
-            tm.add_command(label="📚 知识库管理…", command=self.manage_knowledge)
-            tm.add_command(label="📍 任务检查点…", command=self.show_checkpoint)
-            tm.add_command(label="项目任务记录…", command=self.show_tasklog)
-            tm.add_separator()
+            tasks.add_cascade(label="Agent 任务模板", menu=task_menu)
+            tasks.add_command(label="批量任务…", command=self.show_batch_task)
+            tasks.add_command(label="📰 生成每日简报", command=lambda: self.send(
+                text="请生成今日简报：采集当日 AI/科技资讯，提炼要点与点评，并保存到工作区。"
+            ))
+            tasks.add_command(label="📄 生成会话纪要", command=self.generate_session_summary)
+            tasks.add_command(label="🗺 会话轨迹", command=self.show_session_timeline)
+            tm.add_cascade(label="任务与模板", menu=tasks)
+
+            # ── 文件与产物 ──
+            files = tk.Menu(tm, **menu_opts)
+            self._menus.append(files)
+            files.add_command(label="📁 工作目录…", command=self.choose_working_dir)
+            files.add_command(label="🌳 工作区文件树…", command=self.show_workspace_tree)
+            files.add_command(label="📦 最近产物…", command=self.show_recent_outputs)
+            files.add_command(label="🖥 进程终端…", command=self.show_process_terminal)
+            tm.add_cascade(label="文件与产物", menu=files)
+
+            # ── 能力扩展 ──
+            caps = tk.Menu(tm, **menu_opts)
+            self._menus.append(caps)
+            caps.add_command(label="🔧 自定义工具（Agent SDK）", command=self.manage_user_tools)
+            caps.add_command(label="👤 Profile 管理（多账号）", command=self.manage_profiles)
+            caps.add_command(label="📝 提示词库管理", command=self.manage_prompts)
+            caps.add_command(label="✂ FIM 代码补全…", command=self.show_fim_dialog)
+            caps.add_command(label="🔌 依赖状态…", command=self.show_dependencies)
+            tm.add_cascade(label="能力扩展", menu=caps)
+
             # ── 自我进化 ──
-            tm.add_command(label="🧬 自我进化（代码提案）…", command=self.show_evolutions)
-            tm.add_command(label="🧬 自我审查（生成报告）…", command=self.show_evolution_audit)
-            tm.add_command(label="🧬 功能建议（升级方向）…", command=self.show_feature_suggestions)
-            tm.add_command(label="🧬 打开审查报告目录", command=self.open_review_reports)
-            tm.add_separator()
+            evo = tk.Menu(tm, **menu_opts)
+            self._menus.append(evo)
+            evo.add_command(label="🧬 自我进化（代码提案）…", command=self.show_evolutions)
+            evo.add_command(label="🧬 自我审查（生成报告）…", command=self.show_evolution_audit)
+            evo.add_command(label="🧬 功能建议（升级方向）…", command=self.show_feature_suggestions)
+            evo.add_command(label="🧬 打开审查报告目录", command=self.open_review_reports)
+            tm.add_cascade(label="🧬 自我进化", menu=evo)
+
             # ── 系统 ──
-            tm.add_command(label="推送与数据库配置…", command=self.show_external_config)
-            tm.add_command(label="从剪贴板图片提取文字 (OCR)…", command=self._ocr_clipboard)
-            tm.add_command(label="数据清理…", command=self.show_cleanup)
-            tm.add_command(label="⌨ 命令面板", accelerator="Ctrl+K", command=self.show_command_palette)
+            sysm = tk.Menu(tm, **menu_opts)
+            self._menus.append(sysm)
+            sysm.add_command(label="🔧 失败模式库…", command=self.show_failures)
+            sysm.add_command(label="🔗 推送与数据库配置…", command=self.show_external_config)
+            sysm.add_command(label="🖼 从剪贴板图片提取文字 (OCR)…", command=self._ocr_clipboard)
+            sysm.add_command(label="🧹 数据清理…", command=self.show_cleanup)
+            sysm.add_command(label="⌨ 命令面板", accelerator="Ctrl+K", command=self.show_command_palette)
+            tm.add_cascade(label="系统", menu=sysm)
+
+        def _automation_menu(am):
+            # 自动化：定时触发与流程编排（独立顶级菜单，精确分类）
+            am.add_command(label="⏰ 定时任务…", command=self.manage_schedules)
+            am.add_command(label="🔁 流程管理…", command=self.manage_workflows)
+            am.add_separator()
+            am.add_command(label="📚 知识库管理…", command=self.manage_knowledge)
+            am.add_command(label="📍 任务检查点…", command=self.show_checkpoint)
+            am.add_command(label="📋 项目任务记录…", command=self.show_tasklog)
+            am.add_separator()
+            am.add_command(label="📰 生成每日简报", command=lambda: self.send(
+                text="请生成今日简报：采集当日 AI/科技资讯，提炼要点与点评，并保存到工作区。"
+            ))
 
         def _view_menu(vm):
             vm.add_command(label="切换主题", command=self.toggle_theme)
@@ -1656,6 +1640,8 @@ class AssistantApp:
             vm.add_separator()
             vm.add_command(label="设置面板（右侧）", command=self.toggle_side_panel)
             vm.add_command(label="会话列表（左侧）", command=self.toggle_sidebar)
+            vm.add_command(label="⛶ 全屏模式", accelerator="F11", command=self.toggle_fullscreen)
+            vm.add_separator()
             self.suggest_var2 = tk.BooleanVar(value=bool(self.cfg.get("suggestions_enabled", True)))
             vm.add_checkbutton(
                 label="主动建议（对话结束后提示）",
@@ -1667,9 +1653,18 @@ class AssistantApp:
             )
 
         def _settings_menu(sm):
-            sm.add_command(label="系统提示词", command=self.edit_system_prompt)
+            # ── AI 行为 ──
+            sm.add_command(label="🎭 角色与提示词…", command=self.show_roles)
             sm.add_separator()
-            # 三项功能此前只有 config.json 入口（README 声称"可开关/可配置"但 UI 无处可开）
+            self.strict_tools_var = tk.BooleanVar(
+                value=bool(self.cfg.get("strict_tools", False))
+            )
+            sm.add_checkbutton(
+                label="strict 工具模式（Beta，开启时自动启用 Beta API）", variable=self.strict_tools_var,
+                command=lambda: self._on_strict_tools_toggle(),
+            )
+            sm.add_separator()
+            # ── 应用行为 ──
             self.notify_done_var = tk.BooleanVar(value=bool(self.cfg.get("notify_on_done", False)))
             sm.add_checkbutton(
                 label="完成通知（任务栏闪烁 + 提示音 + 桌面通知）",
@@ -1693,6 +1688,18 @@ class AssistantApp:
                 label="隐私模式（不保存快照/统计/日志）", variable=self.privacy_var,
                 command=self._on_privacy_toggle,
             )
+            self.autostart_var = tk.BooleanVar(value=self._autostart_enabled())
+            sm.add_checkbutton(
+                label="开机自启（后台启动，常驻托盘）", variable=self.autostart_var,
+                command=lambda: self._on_autostart_toggle(),
+            )
+            self.minimize_tray_var = tk.BooleanVar(
+                value=bool(self.cfg.get("minimize_to_tray", False))
+            )
+            sm.add_checkbutton(
+                label="关闭时最小化到托盘", variable=self.minimize_tray_var,
+                command=lambda: self._on_minimize_tray_toggle(),
+            )
             sm.add_separator()
             sm.add_command(label="保存配置", command=self.save_widgets_to_config)
 
@@ -1705,6 +1712,7 @@ class AssistantApp:
         add_menu("编辑(E)", lambda em: _edit_menu(em))
         add_menu("视图(V)", lambda vm: _view_menu(vm))
         add_menu("工具(T)", lambda tm: _tools_menu(tm))
+        add_menu("自动化(A)", lambda am: _automation_menu(am))
         add_menu("设置(S)", lambda sm: _settings_menu(sm))
         add_menu("帮助(H)", lambda hm: _help_menu(hm))
 
@@ -1813,6 +1821,69 @@ class AssistantApp:
         except Exception:
             pass
 
+    def _on_minimize_tray_toggle(self):
+        """关闭时最小化到托盘开关：托盘不可用（未装 pystray）时提示并回滚勾选。
+
+        托盘尚未启动（延迟 1.5s 启动）时先补启动再判断可用性。
+        """
+        want = bool(self.minimize_tray_var.get())
+        if want and not TRAY_AVAILABLE:
+            self.minimize_tray_var.set(False)
+            messagebox.showwarning(
+                "托盘不可用",
+                "未安装 pystray，无法使用系统托盘。\n\n请运行：pip install pystray",
+            )
+            return
+        if want and not getattr(self, "_tray_icon", None):
+            self._start_tray()  # 用户此刻就需要：立即补启动（不等待 1.5s 延迟）
+        if want and not self._tray_alive():
+            self.minimize_tray_var.set(False)
+            messagebox.showwarning(
+                "托盘启动失败",
+                "系统托盘启动失败（不影响主程序使用）。\n"
+                "关闭窗口将按正常方式退出，不会最小化到托盘。",
+            )
+            return
+        self.cfg["minimize_to_tray"] = want
+        save_config(self.cfg)
+        self._flash_status("已开启：关闭窗口最小化到托盘" if want else "已关闭：关闭窗口将直接退出")
+
+    def _on_strict_tools_toggle(self):
+        """strict 工具模式开关：需 Beta 端点（strict 模式官方要求 base_url 为 /beta）。
+
+        开启时自动打开 Beta API 并保存；关闭时仅保存开关。
+        """
+        want = bool(self.strict_tools_var.get())
+        if want:
+            if not self.cfg.get("beta_api"):
+                if not messagebox.askyesno(
+                    "strict 工具模式",
+                    "strict 模式需要 Beta 端点（https://api.deepseek.com/beta）。\n"
+                    "将自动开启「Beta API」开关。继续？",
+                ):
+                    self.strict_tools_var.set(False)
+                    return
+                self.cfg["beta_api"] = True
+                self.beta_var.set(True)
+            self._flash_status("strict 工具模式已开启：模型将严格遵循工具参数格式（Beta）")
+        else:
+            self._flash_status("strict 工具模式已关闭")
+        self.cfg["strict_tools"] = want
+        save_config(self.cfg)
+
+    def _on_autostart_toggle(self):
+        """开机自启开关：注册表写入失败时提示并回滚勾选。"""
+        want = bool(self.autostart_var.get())
+        if want and not self._set_autostart(True):
+            self.autostart_var.set(False)
+            messagebox.showwarning("开机自启失败", "注册表写入失败，无法开启开机自启。")
+            return
+        if not want:
+            self._set_autostart(False)
+        self.cfg["autostart"] = want
+        save_config(self.cfg)
+        self._flash_status("已开启开机自启" if want else "已关闭开机自启")
+
     def _on_privacy_toggle(self):
         self.cfg["privacy_mode"] = bool(self.privacy_var.get())
         permissions.set_audit_enabled(not self.cfg["privacy_mode"])
@@ -1840,7 +1911,7 @@ class AssistantApp:
         dialog.grab_set()
         for line in (
             "· 流式输出思考过程与回答，支持 1M 长上下文与缓存优化",
-            "· 90+ Agent 工具：文档/代码/浏览器/数据/媒体/公众号写作",
+            "· 100+ Agent 工具：文档/代码/浏览器/数据/媒体/公众号写作",
             "· 产物面板：生成的文件一键打开，无需翻找目录",
             "· 多会话、上下文自动压缩、用量统计与预算控制",
             "· 提示词库、消息收藏、分支对话、深色主题",
@@ -1879,10 +1950,13 @@ class AssistantApp:
         )
 
     def check_for_update(self, manual=True):
-        url = UPDATE_URL
+        url = str(self.cfg.get("update_url") or "").strip() or UPDATE_URL
         if not url:
             if manual:
-                messagebox.showinfo("检查更新", f"未配置更新源（UPDATE_URL），当前版本 {VERSION}")
+                messagebox.showinfo(
+                    "检查更新",
+                    f"未配置更新源（config.json 的 update_url，或 main.py 的 UPDATE_URL），当前版本 {VERSION}",
+                )
             return
         if manual:
             self._flash_status("正在检查更新…")
@@ -1892,15 +1966,9 @@ class AssistantApp:
                 resp = _dc._http_client().get(url, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
-                # GitHub Releases: tag_name（"v1.11.0"）；自定义源: version
-                latest = str(
-                    data.get("version") or data.get("tag_name") or ""
-                ).strip().lstrip("v")
+                latest = str(data.get("version", "")).strip()
                 if latest:
-                    self._ui_queue.put((
-                        "update",
-                        (latest, str(data.get("url") or data.get("html_url") or "")),
-                    ))
+                    self._ui_queue.put(("update", (latest, str(data.get("url", "") or ""))))
             except Exception as e:
                 logging.warning("检查更新失败: %s", e)
                 if manual:
@@ -1981,7 +2049,7 @@ class AssistantApp:
                   font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(0, 14))
         for line in (
             "· 流式思考与回答、1M 长上下文、缓存命中优化",
-            "· 90+ Agent 工具：文档/代码/浏览器/数据/媒体/云盘/公众号写作",
+            "· 100+ Agent 工具：文档/代码/浏览器/数据/媒体/云盘/公众号写作",
             "· 产物面板与产物条：生成的文件一键直达",
             "· 会话快照、用量统计、预算控制、隐私模式",
             "· 自我进化：AI 可感知自身代码并提出改进提案",
@@ -2387,19 +2455,15 @@ class AssistantApp:
             )
             self.model_combo.pack(fill="x")
             self.model_combo.bind("<<ComboboxSelected>>", lambda e: self._update_context_bar())
-            row2 = tk.Frame(g, bg=t["panel"])
-            row2.pack(fill="x", pady=(6, 0))
-            self._restyle.append((row2, "panel"))
+            self._lbl(g, "场景 = 模型采样参数（温度 / 思考强度）", role="label_sec",
+                      bg="panel", font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(6, 0))
             self.scenario_combo = ttk.Combobox(
                 g, width=8, values=list(SCENARIOS.keys()), state="readonly"
             )
             self.scenario_combo.pack(fill="x", pady=(6, 0))
             self.scenario_combo.bind("<<ComboboxSelected>>", self.on_scenario_change)
-            self.pack_combo = ttk.Combobox(
-                g, width=14, values=[""] + list(SCENARIO_PACKS), state="readonly"
-            )
-            self.pack_combo.pack(fill="x", pady=(6, 0))
-            self.pack_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_scenario_pack(self.pack_combo.get()))
+            self._lbl(g, "任务能力由「自主模式」表达：完全智能 = 全部工具 / 纯对话 = 无工具",
+                      role="label_sec", bg="panel", font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(6, 0))
             self.thinking_combo = ttk.Combobox(
                 g, width=14, values=list(THINKING_MODES.values()), state="readonly"
             )
@@ -2409,7 +2473,7 @@ class AssistantApp:
             row3.pack(fill="x", pady=(6, 0))
             self._restyle.append((row3, "panel"))
             self._lbl(row3, "输出上限", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left")
-            self.max_tokens_spin = ttk.Spinbox(row3, from_=1024, to=65536, increment=1024, width=9)
+            self.max_tokens_spin = ttk.Spinbox(row3, from_=1024, to=393216, increment=4096, width=10)
             self.max_tokens_spin.pack(side="left", padx=(6, 10))
             self._lbl(row3, "seed", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left")
             self.seed_var = tk.StringVar()
@@ -2453,6 +2517,16 @@ class AssistantApp:
             self.beta_check.pack(in_=self.adv_frame, anchor="w", pady=(2, 0))
 
         group("模型与参数", model_group)
+
+        def role_row(g):
+            self._lbl(g, "人格 = 系统提示词（说什么）", role="label_sec", bg="panel",
+                      font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(0, 2))
+            self._role_lbl = self._lbl(g, "", role="label_sec", bg="panel",
+                                       font=(FONT_FAMILY, 9))
+            self._role_lbl.pack(anchor="w", pady=(2, 0))
+            self._mk_button(g, "🎭 角色与提示词…", self.show_roles, fsz=9).pack(anchor="w", pady=(4, 0))
+
+        group("AI 人格", role_row)
 
         def tools_group(g):
             self.tools_var = tk.BooleanVar(value=True)
@@ -2810,23 +2884,94 @@ class AssistantApp:
     _DIALOG_H_SNAP = (LAYOUT["dialog_h_s"], LAYOUT["dialog_h_m"], LAYOUT["dialog_h_l"],
                       LAYOUT["dialog_h_editor"], LAYOUT["dialog_h_editor_l"])
 
+    def _screen_scale(self):
+        """应用级自适应系数：以主窗口宽度为参照（应用内一切窗口与主窗口成比例）。
+
+        主窗口 1000 宽 ≈ 1.0；1474（1152p 默认）≈ 1.47；1680 → 1.68；封顶 1.9。
+        对话框档位/预览窗随主窗口呼吸，大屏与窄屏统一比例。
+        """
+        try:
+            rw = max(1, self.root.winfo_width())
+            return min(1.9, max(1.0, rw / 1000.0))
+        except Exception:
+            return 1.0
+
+    def _apply_screen_font_default(self):
+        """大屏默认字号提升：仅当用户未自定义字号（=默认 10）时按屏幕高度调整。"""
+        try:
+            if int(self.cfg.get("font_size", 10) or 10) != 10:
+                return
+            sh = self.root.winfo_screenheight()
+            if sh >= 1300:
+                self.cfg["font_size"] = 13
+            elif sh >= 1080:
+                self.cfg["font_size"] = 11
+        except Exception:
+            pass
+
+    def toggle_fullscreen(self):
+        """F11 无边框全屏切换（浏览器式）：全屏 = 上下左右无边框铺满屏幕。"""
+        self._fullscreen = not getattr(self, "_fullscreen", False)
+        try:
+            if self._fullscreen:
+                self._fs_prev_geo = self.root.geometry()
+                self.root.attributes("-fullscreen", True)
+                self._flash_status("已进入全屏（F11 退出）", 2500)
+            else:
+                self.root.attributes("-fullscreen", False)
+                prev = getattr(self, "_fs_prev_geo", None)
+                if prev:
+                    try:
+                        self.root.geometry(prev)
+                    except Exception:
+                        pass
+        except tk.TclError:
+            pass
+
+    def _center_geometry(self, w, h):
+        """居中几何字符串：相对主窗口中心（视觉重心略高），屏幕内校验。
+
+        浏览器式交互原则：任何窗口/对话框打开即居中，不落在随机位置。
+        """
+        try:
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            rw = max(1, self.root.winfo_width())
+            rh = max(1, self.root.winfo_height())
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            x = rx + (rw - w) // 2
+            y = ry + (rh - h) // 3
+            x = max(0, min(x, max(0, sw - w - 8)))
+            y = max(0, min(y, max(0, sh - h - 8)))
+            return f"{w}x{h}+{x}+{y}"
+        except Exception:
+            return f"{w}x{h}"
+
     def _dialog_shell(self, title, width, height, subtitle="", minsize=None):
         """统一对话框骨架：标题头（◉ 标题 + 说明）→ 分隔线 → 内容区 → 底部操作栏。
 
         返回 (dialog, body, footer)。所有对话框统一使用，保证一致的设计语言。
         尺寸自动吸附到定版档位（窄 420 / 中 520 / 宽 640；高 300/420/460/540/620）——
         消除历史散落的自定义尺寸，未来新增对话框自动对齐。
+        档位按屏幕自适应系数放大（_screen_scale：1080p≈1.2、2K+≈1.6）。
         同一对话框在会话内记住上次位置（屏幕内校验）。
         """
+        scale = self._screen_scale()
+        w_snaps = tuple(int(s * scale) for s in (LAYOUT["dialog_s"], LAYOUT["dialog_m"], LAYOUT["dialog_l"]))
+        h_snaps = tuple(
+            int(s * scale) for s in (
+                LAYOUT["dialog_h_s"], LAYOUT["dialog_h_m"], LAYOUT["dialog_h_l"],
+                LAYOUT["dialog_h_editor"], LAYOUT["dialog_h_editor_l"],
+            )
+        )
         try:
-            width = min(self._DIALOG_W_SNAP, key=lambda d: abs(d - int(width)))
-            height = min(self._DIALOG_H_SNAP, key=lambda d: abs(d - int(height)))
+            width = min(w_snaps, key=lambda d: abs(d - int(width)))
+            height = min(h_snaps, key=lambda d: abs(d - int(height)))
         except (TypeError, ValueError):
-            width, height = LAYOUT["dialog_m"], LAYOUT["dialog_h_m"]
+            width, height = w_snaps[1], h_snaps[1]
         t = self._theme()
         dialog = tk.Toplevel(self.root, bg=t["panel"])
         dialog.title(title)
-        dialog.geometry(f"{width}x{height}")
+        dialog.geometry(self._center_geometry(width, height))  # 打开即居中（浏览器式）
         if minsize:
             dialog.minsize(*minsize)
         dialog.transient(self.root)
@@ -3247,8 +3392,6 @@ class AssistantApp:
         self.btn_prompts.pack(side="left", padx=(10, 0))
         self.btn_dir = self._mk_button(foot, "📁 目录", self.choose_working_dir, fsz=9)
         self.btn_dir.pack(side="left", padx=(6, 0))
-        self.btn_speech = self._mk_button(foot, "🎤 语音", self._start_speech, fsz=9)
-        self.btn_speech.pack(side="left", padx=(6, 0))
         self.btn_stop = self._mk_button(foot, "■ 停止", self.stop_generate, kind="danger", fsz=10)
         self.btn_stop.configure(state="disabled")
         self.btn_stop.pack(side="right")
@@ -3848,6 +3991,15 @@ class AssistantApp:
         text.tag_configure("error", foreground=t["error"], lmargin1=12, lmargin2=12)
         text.tag_configure("fold_hidden", elide=True)
         text.tag_configure(
+            "continue_hint",
+            foreground=t["accent"],
+            font=(FONT_FAMILY, sizes["small"], "bold"),
+            lmargin1=8,
+            lmargin2=8,
+            spacing1=8,
+            spacing3=8,
+        )
+        text.tag_configure(
             "fold_hint",
             foreground=t["accent"],
             font=(FONT_FAMILY, sizes["small"], "bold"),
@@ -4003,6 +4155,9 @@ class AssistantApp:
         text.tag_bind("fold_hint", "<Button-1>", self._on_fold_early_click)
         text.tag_bind("fold_hint", "<Enter>", lambda e: text.configure(cursor="hand2"))
         text.tag_bind("fold_hint", "<Leave>", lambda e: text.configure(cursor=""))
+        text.tag_bind("continue_hint", "<Button-1>", self._on_continue_click)
+        text.tag_bind("continue_hint", "<Enter>", lambda e: text.configure(cursor="hand2"))
+        text.tag_bind("continue_hint", "<Leave>", lambda e: text.configure(cursor=""))
         self._fold_ranges[text] = []
         self._fold_nums[text] = []
         session = {
@@ -4455,11 +4610,8 @@ class AssistantApp:
             self._restore_input_height()
         except Exception:
             pass
-        try:
-            self.pack_combo.set(str(self.cfg.get("scenario_pack") or ""))
-        except Exception:
-            pass
         self.on_scenario_change()
+        self._update_role_label()
 
     def save_widgets_to_config(self):
         new = {}
@@ -4518,7 +4670,7 @@ class AssistantApp:
 
     def _on_thinking_changed(self, _event=None):
         label = self.thinking_combo.get()
-        if label not in ("最大思考 (max)", "极限思考 (xhigh)"):
+        if label != "最大思考 (max)":
             return
         try:
             if self._ctx_counts is not None:
@@ -4529,7 +4681,7 @@ class AssistantApp:
             pct = used / MAX_CONTEXT_TOKENS
             if pct > 0.6:
                 self._flash_status(
-                    f"上下文已占 {pct:.0%}，思考强度 max/xhigh 建议保留输出余量"
+                    f"上下文已占 {pct:.0%}，思考强度 max 建议保留输出余量"
                     "（V4 最大输出 384K）",
                     5000,
                 )
@@ -4574,12 +4726,20 @@ class AssistantApp:
         return "其他"
 
     def edit_tools(self):
-        t = self._theme()
+        """工具设置（工具中心面板版）。"""
         dialog, body, footer = self._dialog_shell(
             "工具设置", 460, 620,
             subtitle="选择 AI 可自动调用的工具（未选中的不会出现在请求中）",
             minsize=(380, 420),
         )
+        save = self._edit_tools_panel(body)
+        self._footer_hint(footer, f"共 {len(TOOLS) + len(load_user_tools())} 个工具 · 滚轮或拖动右侧滚动条")
+        self._footer_btn(footer, "取消", dialog.destroy)
+        self._footer_btn(footer, "保存", lambda: (save(), dialog.destroy()), primary=True)
+
+    def _edit_tools_panel(self, body):
+        """工具设置面板（嵌入工具中心）：返回保存回调。"""
+        t = self._theme()
         master = tk.BooleanVar(value=self.tools_var.get())
         vars = {}
         enabled = set(self.cfg.get("enabled_tools", []))
@@ -4593,6 +4753,12 @@ class AssistantApp:
         head = tk.Frame(body, bg=t["panel"])
         head.pack(fill="x", pady=(0, 6))
         self._restyle.append((head, "panel"))
+        if self.cfg.get("full_auto"):
+            self._lbl(body, "🤖 完全智能模式生效中：全部工具自动可用，以下勾选仅作为切回标准模式后的默认集。",
+                      role="label_accent", bg="panel", font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", pady=(0, 4))
+        elif self.cfg.get("pure_chat"):
+            self._lbl(body, "💬 纯对话模式生效中：不调用任何工具，以下勾选仅作为切回标准模式后的默认集。",
+                      role="label_sec", bg="panel", font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Checkbutton(
             head, text="启用工具（Agent 自动调用）", variable=master,
             command=lambda: [v.set(master.get()) for v in vars.values()],
@@ -4664,11 +4830,9 @@ class AssistantApp:
             chosen = [n for n, v in vars.items() if v.get()] if master.get() else []
             self.cfg["enabled_tools"] = chosen
             save_config(self.cfg)
-            dialog.destroy()
+            self._flash_status("工具配置已保存")
 
-        self._footer_hint(footer, f"共 {len(all_tools)} 个工具 · 滚轮或拖动右侧滚动条")
-        self._footer_btn(footer, "取消", dialog.destroy)
-        self._footer_btn(footer, "保存", save, primary=True)
+        return save
 
     def manage_user_tools(self):
         t = self._theme()
@@ -5327,6 +5491,7 @@ class AssistantApp:
             ("权限配置", PERMISSIONS_PATH, "file"),
             ("定时任务", SCHEDULES_PATH, "file"),
             ("长期记忆", MEMORY_PATH, "file"),
+            ("失败模式库", FAILURES_PATH, "file"),
         ]
         dialog = tk.Toplevel(self.root, bg=t["panel"])
         dialog.title("数据清理")
@@ -5526,14 +5691,14 @@ class AssistantApp:
         try:
             if last is None:
                 self._flash_status(
-                    "🧬 鲸语支持自我进化：工具 → 自我进化 可立即发起自我审查", 10000
+                    "🧬 鲸语支持自我进化：工具 → 🧬 自我进化 可立即发起自我审查", 10000
                 )
                 return
             age_days = (time.time() - last) / 86400
             if age_days >= days:
                 self._flash_status(
                     f"🧬 距上次自我进化已 {int(age_days)} 天，"
-                    "可发起一次自我审查（工具 → 自我进化）",
+                    "可发起一次自我审查（工具 → 🧬 自我进化）",
                     10000,
                 )
         except Exception:
@@ -5915,6 +6080,10 @@ class AssistantApp:
         if mode == "full_auto":
             self.cfg["full_auto"] = True
             self.cfg["pure_chat"] = False
+            self._flash_status(
+                "🤖 完全智能已开启——全部工具自动可用，为开发/创作而生"
+                "（建议应用「智能体」人格：角色与提示词 → 智能体）"
+            )
         elif mode == "pure_chat":
             self.cfg["full_auto"] = False
             self.cfg["pure_chat"] = True
@@ -5940,6 +6109,14 @@ class AssistantApp:
                 self.mode_var.set("pure_chat")
             else:
                 self.mode_var.set("standard")
+        except Exception:
+            pass
+
+    def _switch_mode_quick(self, mode):
+        """快捷切换自主模式（建议条采纳入口），复用确认与保存逻辑。"""
+        try:
+            self.mode_var.set(mode)
+            self._on_mode_change()
         except Exception:
             pass
 
@@ -6087,6 +6264,68 @@ class AssistantApp:
     def _save_patterns(pats):
         return AssistantApp._atomic_json_write(PATTERNS_PATH, pats)
 
+    # ===== 失败模式库：工具失败自动积累，注入上下文供 AI 规避已知坑 =====
+    FAILURES_MAX = 50
+
+    @staticmethod
+    def _load_failures():
+        try:
+            if os.path.exists(FAILURES_PATH):
+                with open(FAILURES_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            logging.exception("读取失败模式失败")
+        return []
+
+    @staticmethod
+    def _save_failures(items):
+        return AssistantApp._atomic_json_write(FAILURES_PATH, items, indent=1)
+
+    @staticmethod
+    def _append_failures(new_items):
+        """追加失败记录：同 (工具, 错误摘要前 50 字符) 去重并更新时间戳，上限 50 条。
+
+        纯静态方法（不依赖实例）：_finish 统计循环结束后在主线程调用。
+        """
+        if not new_items:
+            return
+        try:
+            items = AssistantApp._load_failures()
+            for it in new_items:
+                key = (str(it.get("tool") or ""), str(it.get("error") or "")[:50])
+                replaced = False
+                for old in items:
+                    if (str(old.get("tool") or ""), str(old.get("error") or "")[:50]) == key:
+                        old["ts"] = it["ts"]
+                        replaced = True
+                        break
+                if not replaced:
+                    items.append(it)
+            if len(items) > AssistantApp.FAILURES_MAX:
+                del items[: len(items) - AssistantApp.FAILURES_MAX]
+            AssistantApp._save_failures(items)
+        except Exception:
+            logging.exception("记录失败模式失败")
+
+    @staticmethod
+    def _failure_patterns_text():
+        """已知失败模式注入（最近 3 条，固定格式缓存友好）。"""
+        try:
+            items = AssistantApp._load_failures()
+            if not items:
+                return ""
+            lines = ["[已知失败模式] 以下工具调用曾失败（遇到同类情况请规避或改用其他方式）："]
+            for it in items[-3:]:
+                tool = str(it.get("tool") or "?")
+                err = str(it.get("error") or "")[:100]
+                if err:
+                    lines.append(f"- {tool}：{err}")
+            return "\n".join(lines) if len(lines) > 1 else ""
+        except Exception:
+            return ""
+
     def _record_success_pattern(self):
         """任务全部成功时记录工具链模式（上限 10 条）。"""
         try:
@@ -6210,8 +6449,9 @@ class AssistantApp:
             if not last:
                 return
             suggestions = []
-            if "```" in last and self.cfg.get("scenario_pack") != "开发":
-                suggestions.append(("💡 检测到代码输出，建议启用「开发」场景包", self.apply_scenario_pack, "开发"))
+            if "```" in last and self.mode_var.get() != "full_auto":
+                suggestions.append(("💡 检测到代码输出，建议切换「完全智能」模式（自动调用全部工具）",
+                                    self._switch_mode_quick, "full_auto"))
             if any(w in last for w in ("翻译", "润色", "改写", "周报")):
                 suggestions.append(("💡 翻译/润色/周报可用「⚡ 指令」模板一键套用", self._show_prompt_menu, None))
             if PATH_RE.search(last):
@@ -6428,6 +6668,16 @@ class AssistantApp:
             except Exception:
                 pass
             return "\n\n".join(parts) if parts else ""
+        return self._memory_prompt_stable()
+
+    def _memory_prompt_stable(self):
+        """稳定注入（作为 system 消息，配合缓存友好布局保持前缀稳定）：
+        长期记忆 + 工作目录 + 行为指令。
+
+        变化频繁的注入（项目上下文/检查点/成功模式/任务记录/失败模式/相关文件）
+        走 _memory_prompt_dynamic 追加到本轮 user 消息尾部——记忆刷新
+        不会破坏稳定前缀，最大化官方硬盘缓存命中（前缀完整匹配才命中）。
+        """
         parts = []
         try:
             data = self._load_memory()
@@ -6444,11 +6694,34 @@ class AssistantApp:
                     )
         except Exception:
             pass
+        parts.append(self._working_dir_prompt())
+        parts.append(TASK_QUALITY_GUIDE)
+        return "\n\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _plugin_skills_hint():
+        """已安装插件技能清单（注入 AI：让 AI 知晓用户可用的技能模板，并在相关任务中建议或直接完成）。"""
+        try:
+            items = prompts.load_prompts(PROMPTS_PATH)
+            plugin_skills = [p for p in items if str(p.get("_source") or "").startswith("plugin:")]
+            if not plugin_skills:
+                return ""
+            names = "、".join(str(p["name"]) for p in plugin_skills[:8])
+            return (
+                f"[已安装插件技能] 用户装有技能模板：{names}（输入框「⚡ 指令」可一键插入）。"
+                "相关任务请直接完成，或建议用户使用对应模板。"
+            )
+        except Exception:
+            return ""
+
+    def _memory_prompt_dynamic(self):
+        """动态注入（追加到本轮 user 消息尾部，不破坏稳定前缀缓存）：
+        项目上下文 / 任务检查点 / 成功模式 / 任务记录 / 失败模式 / 相关文件。
+        """
+        parts = []
         proj = self._project_context_text()
         if proj:
             parts.append(proj)
-        parts.append(self._working_dir_prompt())
-        parts.append(TASK_QUALITY_GUIDE)
         cp = self._checkpoint_prompt_text()
         if cp:
             parts.append(cp)
@@ -6458,6 +6731,12 @@ class AssistantApp:
         tl = self._tasklog_prompt()
         if tl:
             parts.append(tl)
+        fp = self._failure_patterns_text()
+        if fp:
+            parts.append(fp)
+        ps = self._plugin_skills_hint()
+        if ps:
+            parts.append(ps)
         inject = self._current_inject_text
         if inject:
             parts.append(inject)
@@ -6481,29 +6760,111 @@ class AssistantApp:
     def _save_memory(data):
         return AssistantApp._atomic_json_write(MEMORY_PATH, data, indent=2)
 
+    @staticmethod
+    def _defer_until(now):
+        """高峰错峰顺延目标时刻：最近空闲时段开始（12:00 / 18:00；已过则次日 0:00）。
+
+        仅在高峰时段调用：9-12 高峰 → 12:00；14-18 高峰 → 18:00；
+        若对应空闲开始时刻已过（极端情况）→ 次日 0:00。
+        """
+        h = now.hour
+        defer_h = 12 if h < 14 else 18
+        ts = now.replace(hour=defer_h, minute=0, second=0, microsecond=0).timestamp()
+        if ts <= now.timestamp():
+            ts = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        return ts
+
+    @staticmethod
+    def _budget_thinking(budget, cost, thinking):
+        """预算感知思考降档：接近月度预算 80% 时，auto/max 档自动降为 high。
+
+        返回 (effective_thinking, near_budget)。用户显式选择的 low/medium/high
+        档位不干预（尊重手动选择）；仅对智能路由与最高档做降级。
+        """
+        if budget > 0 and cost >= budget * 0.8:
+            if thinking in ("auto", "max"):
+                return "high", True
+            return thinking, True
+        return thinking, False
+
+    def _budget_thinking_hint(self, near_budget):
+        """预算降档提示（worker 线程经 UI 队列投递）。"""
+        if near_budget:
+            self._ui_queue.put(
+                ("info", "💡 已接近月度预算，本轮思考档位自动降为 high（auto/max → high），节省费用。")
+            )
+
     def _scheduler_loop(self):
         """定时任务线程：每 30 秒检查一次，支持三种调度模式。
 
         - time "HH:MM"：每日固定时刻执行一次（旧格式兼容）
         - cron "分 时 日 月 周"：标准 5 字段 cron 表达式（支持 * / 逗号 / 连字符 / 步进）
         - every N：每 N 分钟周期执行
-        动作：message（发送指令）/ backup（项目备份）/ notify（状态栏+webhook 推送）。
+        动作：message（发送指令）/ backup（项目备份）/ notify（状态栏+webhook 推送）
+              / workflow（运行流程）。
+        off_peak：触发时刻处于高峰时段（9-12 / 14-18）时顺延到最近空闲时段
+        （官方峰谷定价：空闲价格仅为高峰一半）。
         所有文件读写经 _schedules_lock 串行化，避免与主线程编辑对话框并发覆盖。
         """
+        catchup_done = False
         while True:
             try:
                 now = datetime.now()
                 changed = False
                 with self._schedules_lock:
                     schedules = self._load_schedules()
+                    if not catchup_done:
+                        # 启动补跑：程序未运行时错过的任务补执行一次。
+                        # - time 型：今天时刻已过且未标记 → 补跑（只补最近一次，不积压）
+                        # - cron 型：找到今天已过去且匹配的最近一个触发分钟 → 补跑一次
+                        # - every 型：周期检查在启动后 30s 内自然触发，无需补跑
+                        catchup_done = True
+                        for s in schedules:
+                            if not s.get("enabled"):
+                                continue
+                            action = str(s.get("action") or "message")
+                            today = now.strftime("%Y-%m-%d")
+                            if s.get("cron"):
+                                last_match = None
+                                for hh in range(now.hour + 1):
+                                    for mm in range(60):
+                                        if hh == now.hour and mm > now.minute:
+                                            break
+                                        cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                                        if cron_match(str(s["cron"]), cand):
+                                            last_match = cand
+                                if last_match is not None:
+                                    stamp = last_match.strftime("%Y-%m-%d %H:%M")
+                                    if s.get("last") != stamp and stamp[:10] == today:
+                                        s["last"] = stamp
+                                        changed = True
+                                        self._dispatch_schedule(s, action)
+                            elif not s.get("every"):
+                                key = now.strftime("%H:%M")
+                                t = str(s.get("time", ""))
+                                if t and t < key and s.get("last") != today:
+                                    s["last"] = today
+                                    changed = True
+                                    self._dispatch_schedule(s, action)
+                    now_ts = now.timestamp()
                     for s in schedules:
                         if not s.get("enabled"):
                             continue
                         action = str(s.get("action") or "message")
+                        # 高峰错峰顺延到期 → 立即触发一次（time/cron 语义：当天一次）
+                        defer = float(s.get("defer_until") or 0)
+                        if defer and now_ts >= defer:
+                            s.pop("defer_until", None)
+                            s["last"] = now.strftime("%Y-%m-%d %H:%M")
+                            if s.get("every"):
+                                s["last_run"] = now_ts
+                            changed = True
+                            self._dispatch_schedule(s, action)
+                            continue
                         fired = False
                         if s.get("cron"):
                             stamp = now.strftime("%Y-%m-%d %H:%M")
-                            if _cron_match(str(s["cron"]), now) and s.get("last") != stamp:
+                            if cron_match(str(s["cron"]), now) and s.get("last") != stamp:
                                 s["last"] = stamp
                                 fired = True
                         elif s.get("every"):
@@ -6523,6 +6884,13 @@ class AssistantApp:
                                 s["last"] = today
                                 fired = True
                         if fired:
+                            if s.get("off_peak") and is_peak_hour(now):
+                                # 错峰任务在高峰命中：顺延到最近空闲时段（不标记已执行）
+                                if not s.get("defer_until"):
+                                    s["defer_until"] = self._defer_until(now)
+                                    changed = True
+                                continue
+                            s.pop("defer_until", None)
                             changed = True
                             self._dispatch_schedule(s, action)
                     if changed:
@@ -6530,6 +6898,119 @@ class AssistantApp:
             except Exception:
                 logging.exception("定时任务检查异常")
             time.sleep(30)
+
+    # ===== 系统托盘 + 开机自启 =====
+    def _start_tray(self):
+        """启动系统托盘图标（pystray 可选依赖，失败静默降级）。
+
+        托盘菜单回调运行在 pystray 的线程中，禁止直接碰 Tk——
+        全部经 _ui_queue 投递到主线程处理。
+        """
+        if not TRAY_AVAILABLE or getattr(self, "_tray_icon", None) is not None:
+            return
+        try:
+            img = None
+            try:
+                img = _TrayImage.open(os.path.join(BASE_DIR, "app.ico"))
+            except Exception:
+                img = _TrayImage.new("RGBA", (64, 64), (52, 120, 246, 255))
+            menu = pystray.Menu(
+                pystray.MenuItem("🪟 显示主窗口", lambda: self._tray_cmd("show")),
+                pystray.MenuItem("🙈 隐藏窗口", lambda: self._tray_cmd("hide")),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出鲸语", lambda: self._tray_cmd("quit")),
+            )
+            icon = pystray.Icon("WhaleTalk", img, "鲸语 WhaleTalk", menu)
+            self._tray_icon = icon
+            self._tray_thread = threading.Thread(target=icon.run, daemon=True)
+            self._tray_thread.start()
+            logging.info("系统托盘已启动（pystray）")
+            self.after(600, lambda: self._flash_status("🪟 已驻留系统托盘（右键托盘图标：显示/隐藏/退出）", 4000))
+        except Exception:
+            logging.warning("系统托盘启动失败（不影响使用）", exc_info=True)
+            self._tray_icon = None
+            self._tray_thread = None
+
+    def _tray_alive(self):
+        """托盘是否可用：图标存在且运行线程存活（线程崩溃后不再拦截关闭，防窗口锁死）。"""
+        if getattr(self, "_tray_icon", None) is None:
+            return False
+        th = getattr(self, "_tray_thread", None)
+        if th is not None:
+            return th.is_alive()
+        return False
+
+    def _tray_cmd(self, cmd):
+        """托盘菜单动作（pystray 线程）→ 主线程队列。"""
+        try:
+            self._ui_queue.put(("tray", cmd))
+        except Exception:
+            pass
+
+    def _stop_tray(self):
+        icon = getattr(self, "_tray_icon", None)
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+            self._tray_thread = None
+
+    @staticmethod
+    def _autostart_command():
+        """开机自启命令：打包 exe 用 exe 本体；源码运行用 pythonw + main.py。"""
+        if getattr(sys, "frozen", False):
+            return f'"{sys.executable}"'
+        pyw = os.path.join(BASE_DIR, ".venv", "Scripts", "pythonw.exe")
+        if not os.path.exists(pyw):
+            alt = os.path.join(os.path.dirname(sys.executable) or ".", "pythonw.exe")
+            pyw = alt if os.path.exists(alt) else "pythonw.exe"
+        return f'"{pyw}" "{os.path.join(BASE_DIR, "main.py")}"'
+
+    @staticmethod
+    def _autostart_enabled():
+        """读取 HKCU Run 键，判断是否已注册开机自启。"""
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"
+            ) as k:
+                val, _ = winreg.QueryValueEx(k, "WhaleTalk")
+            return bool(val)
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _set_autostart(enabled):
+        """注册/取消开机自启（HKCU Run 键）。返回是否成功。"""
+        try:
+            import winreg
+
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_SET_VALUE,
+            )
+            try:
+                if enabled:
+                    winreg.SetValueEx(
+                        key, "WhaleTalk", 0, winreg.REG_SZ, AssistantApp._autostart_command()
+                    )
+                else:
+                    try:
+                        winreg.DeleteValue(key, "WhaleTalk")
+                    except FileNotFoundError:
+                        pass
+            finally:
+                winreg.CloseKey(key)
+            return True
+        except Exception:
+            logging.exception("设置开机自启失败")
+            return False
 
     def _start_inbound_server(self):
         """Webhook 接收端：本地监听 HTTP POST（token 鉴权），外部可远程下达任务。
@@ -6627,6 +7108,13 @@ class AssistantApp:
             elif action == "notify":
                 if text:
                     self._ui_queue.put(("schedule_notify", text))
+            elif action == "workflow":
+                # 到点自动运行流程（run_workflow 内部异步执行，不阻塞 scheduler 线程）
+                if text:
+                    try:
+                        _dc.run_workflow(text)
+                    except Exception:
+                        logging.exception("定时流程执行失败")
             else:
                 if text:
                     self._ui_queue.put(("timer_task", text))
@@ -6738,7 +7226,7 @@ class AssistantApp:
         self._restyle.append((body, "panel"))
         self._lbl(
             body, "三种调度：每日 HH:MM 一次 / cron 表达式（分 时 日 月 周）/ 每 N 分钟；"
-            "动作：发送指令 / 项目备份 / 状态提醒",
+            "动作：发送指令 / 运行流程 / 项目备份 / 状态提醒；「错峰」= 高峰时段自动顺延到空闲时段执行（省一半费用）",
             role="label_sec", bg="panel", font=(FONT_FAMILY, 9), wraplength=560, justify="left",
         ).pack(anchor="w", pady=(0, 6))
         listbox = tk.Listbox(
@@ -6751,9 +7239,10 @@ class AssistantApp:
 
         def sched_label(s):
             tag = "✓" if s.get("enabled") else "✗"
-            act = {"message": "发指令", "backup": "备份", "notify": "提醒"}.get(
+            act = {"message": "发指令", "backup": "备份", "notify": "提醒", "workflow": "流程"}.get(
                 str(s.get("action") or "message"), "发指令"
             )
+            peak = " 🌙错峰" if s.get("off_peak") else ""
             if s.get("cron"):
                 when = f"cron:{s['cron']}"
             elif s.get("every"):
@@ -6762,7 +7251,7 @@ class AssistantApp:
                 when = s.get("time", "")
             name = str(s.get("name") or "").strip()
             shown = f"{name}：{s.get('text', '')}" if name else str(s.get("text", ""))
-            return f"{tag} [{act}] {when}  {shown}"
+            return f"{tag} [{act}{peak}] {when}  {shown}"
 
         def refresh():
             listbox.delete(0, "end")
@@ -6782,13 +7271,15 @@ class AssistantApp:
         ttk.Entry(row, textvariable=value_var, width=12).pack(side="left", padx=(4, 0))
         action_var = tk.StringVar(value="message")
         ttk.Combobox(
-            row, textvariable=action_var, values=["message", "backup", "notify"],
+            row, textvariable=action_var, values=["message", "workflow", "backup", "notify"],
             state="readonly", width=7,
         ).pack(side="left", padx=(6, 0))
         text_var = tk.StringVar()
         ttk.Entry(row, textvariable=text_var).pack(side="left", fill="x", expand=True, padx=(6, 0))
         en_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="启用", variable=en_var).pack(side="left", padx=(6, 0))
+        off_peak_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="错峰", variable=off_peak_var).pack(side="left", padx=(2, 0))
 
         def add_schedule():
             mode = mode_var.get()
@@ -6797,12 +7288,14 @@ class AssistantApp:
             if not val:
                 return
             s = {"enabled": bool(en_var.get()), "action": action_var.get(), "last": "", "last_run": 0}
+            if off_peak_var.get():
+                s["off_peak"] = True
             if mode == "cron":
                 fields = val.split()
                 if len(fields) != 5:
                     messagebox.showinfo("提示", "cron 表达式需为 5 个字段：分 时 日 月 周（如 30 9 * * 1）")
                     return
-                if not all(_cron_field_ok(f, i) for i, f in enumerate(fields)):
+                if not all(cron_field_ok(f, i) for i, f in enumerate(fields)):
                     messagebox.showinfo(
                         "提示",
                         "cron 字段非法（值域：分 0-59，时 0-23，日 1-31，月 1-12，周 1-7；仅支持数字、*、,、-、/）",
@@ -6823,7 +7316,22 @@ class AssistantApp:
                     messagebox.showinfo("提示", "时刻格式应为 HH:MM。")
                     return
                 s["time"] = val
-            if s.get("action") != "backup" and not txt:
+            if s.get("action") == "workflow":
+                # 流程动作：内容为流程名（校验存在性，提示可用的流程）
+                flows = {}
+                try:
+                    if os.path.exists(_dc.WORKFLOWS_FILE):
+                        with open(_dc.WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                            flows = json.load(f)
+                except Exception:
+                    flows = {}
+                if txt not in flows:
+                    messagebox.showinfo(
+                        "提示",
+                        f"流程「{txt}」不存在。可用流程：{list(flows) or '（无，请先在 自动化 → 流程管理 创建）'}",
+                    )
+                    return
+            elif s.get("action") != "backup" and not txt:
                 messagebox.showinfo("提示", "发送指令/提醒需要填写内容。")
                 return
             if txt:
@@ -7106,11 +7614,30 @@ class AssistantApp:
             name_var.set("")
             steps_text.delete("1.0", "end")
 
+        def run_flow():
+            sel = listbox.curselection()
+            if not sel or sel[0] >= len(list(wf)):
+                return
+            name = list(wf)[sel[0]]
+            steps = wf[name].get("steps") or []
+            if not messagebox.askyesno(
+                "运行流程",
+                f"确认立即运行流程「{name}」？（{len(steps)} 步，将按顺序自动执行）",
+            ):
+                return
+            dialog.destroy()
+            self._flash_status(f"🚀 正在运行流程「{name}」…")
+            try:
+                _dc.run_workflow(name)
+            except Exception as e:
+                self._flash_status(f"流程启动失败：{e}")
+
         listbox.bind("<<ListboxSelect>>", lambda e: show_item())
         bar = tk.Frame(body, bg=t["panel"])
         bar.pack(fill="x", pady=(10, 0))
         self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "删除流程", delete_flow, fsz=9).pack(side="left")
+        self._mk_button(bar, "运行选中", run_flow, fsz=9).pack(side="left")
+        self._mk_button(bar, "删除流程", delete_flow, fsz=9).pack(side="left", padx=(6, 0))
         self._mk_button(bar, "保存流程", save_flow, kind="primary", fsz=9).pack(side="right")
 
         self._footer_hint(footer, "保存后 AI 可用 run_workflow 一键执行；也可配合 schedule_task 定时触发")
@@ -7265,70 +7792,6 @@ class AssistantApp:
         except tk.TclError:
             pass
 
-    def _start_speech(self):
-        """语音输入：System.Speech 一次听写（后台线程，结果经队列回主线程）。"""
-        if self.busy:
-            return
-        if self._speech_busy:  # 防重入：连点不叠加多个识别进程
-            return
-        self._speech_busy = True
-        self._flash_status("🎤 正在聆听…（说完停顿即可）")
-        ps = (
-            "Add-Type -AssemblyName System.Speech\n"
-            "$rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine\n"
-            "$rec.SetInputToDefaultAudioDevice()\n"
-            "$r = $rec.Recognize()\n"
-            "if ($r) { $r.Text } else { '' }"
-        )
-
-        def worker():
-            text = ""
-            try:
-                proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps],
-                    capture_output=True, text=True, timeout=45,
-                    encoding="utf-8", errors="replace",
-                )
-                text = (proc.stdout or "").strip()
-            except Exception:
-                logging.exception("语音识别失败")
-                text = ""
-            self._ui_queue.put(("speech", text))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _insert_speech(self, text):
-        if text:
-            self._clear_placeholder()
-            self.input_text.insert("insert", text + " ")
-            self.input_text.focus_set()
-            self._flash_status("语音已识别，可编辑后发送")
-        else:
-            self._flash_status("未识别到语音（请检查麦克风与系统语音识别设置）")
-
-    _OCR_PS = r"""
-$ErrorActionPreference='Stop'
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
-function Await($WinRtTask, $ResultType) {
-    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-    $netTask = $asTask.Invoke($null, @($WinRtTask))
-    $netTask.Wait(-1) | Out-Null
-    $netTask.Result
-}
-[Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime] | Out-Null
-[Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
-$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
-$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
-$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-if (-not $engine) { '当前系统语言不支持 OCR' } else {
-    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    $result.Text
-}
-""".lstrip()
-
     def _ocr_clipboard(self):
         """从剪贴板图片提取文字（Windows.Media.Ocr，后台线程）。"""
         self._flash_status("正在识别剪贴板图片文字…")
@@ -7350,8 +7813,8 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                         img_path = os.path.join(DATA_DIR, "_ocr_tmp.png")
                         img.save(img_path)
                         ps_path = os.path.join(DATA_DIR, "_ocr.ps1")
-                        script = self._OCR_PS.replace(
-                            "$path", "'" + img_path.replace("'", "''") + "'"
+                        script = OCR_IMAGE_PS.replace(
+                            "@PATH@", "'" + img_path.replace("'", "''") + "'"
                         )
                         with open(ps_path, "w", encoding="utf-8-sig") as f:
                             f.write(script)
@@ -7371,41 +7834,19 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                             os.remove(p)
                         except Exception:
                             pass
-            self._ui_queue.put(("speech", text))
+            self._ui_queue.put(("ocr", text))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def apply_scenario_pack(self, name):
-        """一键应用场景包：权限 + 工具 + 提示词 + 思考档位一次性配好。"""
-        if not name:
-            self.cfg["scenario_pack"] = ""
-            save_config(self.cfg)
-            self._flash_status("已恢复手动配置模式")
-            return
-        pack = SCENARIO_PACKS.get(name)
-        if not pack:
-            return
-        self.cfg["scenario_pack"] = name
-        self.cfg["thinking"] = pack["thinking"]
-        self.cfg["system_prompt"] = pack["system_prompt"]
-        self.cfg["active_dir"] = WORKSPACE_DIR
-        valid = set(self._valid_tool_names())
-        self.cfg["enabled_tools"] = [t for t in pack["tools"] if t in valid]
-        d = permissions.get_data()
-        d["filesystem"]["allow_write"] = bool(pack["perms"]["allow_write"])
-        d["shell"]["allow_run_command"] = bool(pack["perms"]["allow_run_command"])
-        d["approval_mode"] = str(pack["perms"]["approval_mode"])
-        permissions.set_data(d)
-        permissions.save()
-        save_config(self.cfg)
-        try:
-            self.thinking_combo.set(THINKING_MODES[pack["thinking"]])
-            self.pack_combo.set(name)
-        except Exception:
-            pass
-        if self.messages:
-            self.messages[0]["content"] = self.cfg["system_prompt"]
-        self._flash_status(f"已应用「{name}」场景包（权限/工具/提示词已就绪）")
+    def _ocr_result(self, text):
+        """OCR 识别结果：插入输入框（替代原走语音队列的历史 bug 路径）。"""
+        if text:
+            self._clear_placeholder()
+            self.input_text.insert("insert", str(text).strip() + " ")
+            self.input_text.focus_set()
+            self._flash_status("OCR 识别完成，可编辑后发送")
+        else:
+            self._flash_status("OCR 未能识别出文字")
 
     def _valid_tool_names(self):
         try:
@@ -7423,51 +7864,856 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             messagebox.showwarning("未配置 API Key", "请先填写 DeepSeek API Key 再体验。")
             return
         if messagebox.askyesno("试玩任务", f"将执行「{name}」。\n需要对应权限（写文件等）已开启，"
-                               "可在工具 → 权限设置查看。\n开始？"):
+                               "可在 🛠 工具中心 → 权限 查看。\n开始？"):
             self.send(text=prompt)
 
-    def _feedback(self, msg_idx, rating):
-        """消息 👍/👎 反馈记录（用于积累使用偏好）。"""
-        if not (1 <= msg_idx < len(self.messages)):
-            return
-        try:
-            data = self._load_feedback()
-            content = (self.messages[msg_idx].get("content") or "")[:200]
-            data["records"].append(
-                {
-                    "role": self.messages[msg_idx].get("role"),
-                    "snippet": content,
-                    "rating": rating,
-                    "ts": datetime.now().isoformat(timespec="seconds"),
-                }
-            )
-            if len(data["records"]) > 500:
-                del data["records"][: len(data["records"]) - 500]
-            self._atomic_json_write(FEEDBACK_PATH, data)
-        except Exception:
-            logging.exception("保存反馈失败")
-        self._flash_status("已记录 👍 反馈" if rating == "up" else "已记录 👎 反馈")
+    def _mode_tools_for_request(self, cfg):
+        """自主模式 = 任务能力：按当前模式解析本次请求的工具集（不污染配置）。
+
+        完全智能 → 全部工具（为开发/创作而生）；纯对话 → 无工具；标准 → 按工具中心配置。
+        返回 (enabled_tools, tools_enabled)。
+        """
+        if cfg.get("full_auto"):
+            names = [t["function"]["name"] for t in TOOLS] + [
+                t["function"]["name"] for t in load_user_tools(USER_TOOLS_PATH)
+            ]
+            return names, True
+        if cfg.get("pure_chat"):
+            return [], False
+        return list(cfg.get("enabled_tools") or []), bool(cfg.get("tools_enabled", True))
 
     @staticmethod
-    def _load_feedback():
-        try:
-            if os.path.exists(FEEDBACK_PATH):
-                with open(FEEDBACK_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and isinstance(data.get("records"), list):
-                    return data
-        except Exception:
-            logging.exception("读取反馈失败")
-        return {"records": []}
+    def _dependency_status():
+        """可选依赖检测：返回 [(显示名, 已装, 影响功能, 安装命令)]（打包 exe 排查利器）。"""
+        import importlib.util
 
-    def show_feedback(self):
+        rows = []
+        for mod, name, use, hint in OPTIONAL_DEPS:
+            try:
+                ok = importlib.util.find_spec(mod) is not None
+            except (ImportError, ValueError):
+                ok = False
+            rows.append((name, ok, use, hint))
+        return rows
+
+    def _refresh_user_tools_cache(self):
+        """自定义工具缓存失效（插件安装/卸载/停用后调用，mtime 兜底外的主动清除）。"""
+        try:
+            _USER_TOOLS_CACHE.clear()
+        except Exception:
+            pass
+
+    def _plugin_paths(self):
+        """插件应用/卸载所需的数据文件路径（供 plugins 模块使用）。"""
+        return {
+            "plugins_dir": PLUGINS_DIR,
+            "user_tools": USER_TOOLS_PATH,
+            "prompts": PROMPTS_PATH,
+            "workflows": _dc.WORKFLOWS_FILE,
+        }
+
+    def _plugin_summary(self, plugin):
+        """插件能力摘要（用于列表/导入预览）。"""
+        c = plugin.get("contents") or {}
+        parts = []
+        if c.get("tools"):
+            parts.append(f"{len(c['tools'])} 个工具")
+        if c.get("skills"):
+            parts.append(f"{len(c['skills'])} 个技能")
+        wf = c.get("workflows")
+        if wf:
+            parts.append(f"{len(wf)} 个流程")
+        if c.get("scenario"):
+            parts.append("1 个场景配置")
+        return " · ".join(parts) or "（空）"
+
+    @staticmethod
+    def _plugin_detail_text(plugin):
+        """插件详情全文（名称/作者/说明 + 能力明细 + 使用方式）。"""
+        meta = plugin.get("meta") or {}
+        c = plugin.get("contents") or {}
+        lines = [
+            f"🧩 {meta.get('icon', '🧩')} {meta.get('name', '')} v{meta.get('version', '?')}",
+            f"作者：{meta.get('author', '未知')} · 状态：{'已启用' if plugin.get('enabled', True) else '已停用'}",
+            "",
+        ]
+        if meta.get("description"):
+            lines.append(f"说明：{meta.get('description', '')}\n")
+        tools = c.get("tools") or []
+        skills = c.get("skills") or []
+        wf = c.get("workflows") or {}
+        sc = c.get("scenario")
+        for t in tools:
+            fn = t.get("function") or {}
+            lines.append(f"🔧 工具：{fn.get('name', '?')} — {str(fn.get('description', ''))[:60]}")
+        for s in skills:
+            lines.append(f"⚡ 技能：{s.get('name', '?')} — {str(s.get('text', ''))[:40]}")
+        for wname, wdef in wf.items():
+            steps = wdef.get("steps") if isinstance(wdef, dict) else []
+            lines.append(f"🔁 流程：{wname}（{len(steps)} 步）")
+        if sc:
+            lines.append(f"🎭 场景：{sc.get('name', '')}")
+        missing = plugins_mod.missing_requires(plugin)
+        if missing:
+            lines.append(f"\n⚠ 缺失依赖：{'、'.join(missing)}（pip install …）")
+        lines.append("\n使用方式：工具=AI 自动调用 · 技能=⚡指令 · 流程=AI/手动运行 · 场景=应用配置")
+        return "\n".join(lines)
+
+    def _show_plugin_guide(self, plugin):
+        """安装后引导：使用方式 + 快速试用（让用户 30 秒感知插件价值）。"""
+        meta = plugin.get("meta") or {}
+        c = plugin.get("contents") or {}
+        tools = c.get("tools") or []
+        skills = c.get("skills") or []
+        wf = c.get("workflows") or {}
+        sc = c.get("scenario")
+        dialog, body, footer = self._dialog_shell(
+            f"✅ 插件已安装：{meta.get('icon', '🧩')} {meta.get('name', '')}",
+            540, 300,
+            subtitle="使用方式与快速试用",
+        )
+        lines = []
+        if tools:
+            lines.append(f"🔧 {len(tools)} 个工具：AI 会按需自动调用（与内置工具一起参与任务）")
+        if skills:
+            lines.append(f"⚡ {len(skills)} 个技能：输入框「⚡ 指令」菜单选择，或点下方按钮直接试用")
+        if wf:
+            lines.append(f"🔁 {len(wf)} 个流程：AI 自动 / 定时任务 / 「流程管理」手动运行")
+        if sc:
+            lines.append("🎭 含场景配置：可一键应用思考档/提示词/推荐工具")
+        if not lines:
+            lines.append("（该插件不含可交互能力）")
+        for ln in lines:
+            self._lbl(body, ln, bg="panel", font=(FONT_FAMILY, 9), wraplength=480,
+                      justify="left").pack(anchor="w", pady=2)
+        self._lbl(body, "插件管理：🛠 工具菜单 → 🧩 插件中心 → 我的插件（停用/卸载/导出分享）",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(8, 0))
+        if skills:
+            s0 = skills[0]
+            self._footer_btn(footer, "关闭", dialog.destroy)
+            self._footer_btn(
+                footer, f"试用技能：{s0.get('name', '')}",
+                lambda s=s0: (self._insert_plugin_skill(s), dialog.destroy()),
+                primary=True,
+            )
+        elif wf:
+            w0 = next(iter(wf))
+            self._footer_btn(footer, "关闭", dialog.destroy)
+            self._footer_btn(
+                footer, f"运行流程：{w0}",
+                lambda n=w0: (dialog.destroy(), self._flash_status(f"🚀 正在运行流程「{n}」…"), _dc.run_workflow(n)),
+                primary=True,
+            )
+        elif sc:
+            self._footer_btn(footer, "关闭", dialog.destroy)
+            self._footer_btn(
+                footer, "应用场景配置",
+                lambda: (self._apply_plugin_scenario(sc), dialog.destroy()),
+                primary=True,
+            )
+        else:
+            self._footer_btn(footer, "关闭", dialog.destroy)
+
+    def _insert_plugin_skill(self, skill):
+        """把技能模板插入输入框（试用入口）。"""
+        self._clear_placeholder()
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", str(skill.get("text") or ""))
+        self.input_text.focus_set()
+        self._flash_status(f"已插入技能「{skill.get('name', '')}」，补充内容后按 Enter 发送")
+
+    def _install_plugin_file(self, path):
+        """共用安装流程：解析 → 重复检测（覆盖更新）→ 确认 → 安装 → 场景询问 → 引导。
+
+        返回 True/False（filedialog 与拖拽导入共用）。
+        """
+        plugin, err = plugins_mod.parse_plugin_file(path)
+        if err:
+            messagebox.showerror("插件无效", err)
+            return False
+        meta = plugin.get("meta") or {}
+        name = str(meta.get("name") or "")
+        installed = plugins_mod.list_plugins(PLUGINS_DIR)
+        exist = next((p for p in installed if (p.get("meta") or {}).get("name") == name), None)
+        if exist:
+            old_v = (exist.get("meta") or {}).get("version", "?")
+            new_v = meta.get("version", "?")
+            if not messagebox.askyesno(
+                "插件已安装",
+                f"已安装插件「{name}」v{old_v}。\n导入版本：v{new_v}\n\n覆盖更新？（旧条目将先移除再安装新版）",
+            ):
+                return False
+            plugins_mod.unapply_plugin(exist, self._plugin_paths())
+        missing = plugins_mod.missing_requires(plugin)
+        dep_note = ""
+        if missing:
+            dep_note = "\n\n⚠ 缺失依赖：" + "、".join(missing) + "（相关功能可能不可用，可在「依赖状态」查看安装命令）"
+        if not messagebox.askyesno(
+            "导入插件",
+            f"插件：{name} v{meta.get('version', '?')}（{meta.get('author', '未知')}）\n"
+            f"能力：{self._plugin_summary(plugin)}\n"
+            f"说明：{meta.get('description', '')}{dep_note}\n\n确认安装？",
+        ):
+            return False
+        res = plugins_mod.apply_plugin(plugin, self._plugin_paths())
+        if not res.get("ok"):
+            messagebox.showerror("安装失败", str(res.get("error") or "未知错误"))
+            return False
+        sc = (plugin.get("contents") or {}).get("scenario")
+        if isinstance(sc, dict) and sc.get("name"):
+            if messagebox.askyesno(
+                "应用场景",
+                f"插件包含场景配置「{sc.get('name')}」（推荐工具/思考档，可选建议人格）。\n立即应用任务能力？",
+            ):
+                self._apply_plugin_scenario(sc)
+        self._refresh_user_tools_cache()
+        self._flash_status(f"✅ 插件「{name}」已安装")
+        self._show_plugin_guide(plugin)
+        return True
+
+    def _on_plugin_drop(self, event):
+        """拖拽 .wtplugin 文件到插件管理对话框 → 直接走安装流程。"""
+        paths = re.findall(r"\{(.*?)\}", getattr(event, "data", "") or "")
+        if not paths:
+            paths = [p.strip() for p in str(getattr(event, "data", "") or "").split()]
+        for p in paths:
+            if str(p).lower().endswith(plugins_mod.PLUGIN_EXT) and os.path.isfile(p):
+                self._install_plugin_file(p)
+                return
+
+    def _hub_size(self, w_ratio=0.92, h_ratio=0.94):
+        """中心窗口几何：以应用窗口为参照（浏览器新标签页式）。
+
+        非全屏 = 主窗口的 92% 宽 × 94% 高（接近充满，元素全部可见）；
+        全屏（F11）= 屏幕的 85% × 85%（四周留边，视觉舒适）。
+        屏幕内校验兜底。
+        """
+        try:
+            full = False
+            try:
+                full = bool(self.root.attributes("-fullscreen"))
+            except Exception:
+                pass
+            if full:
+                sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+                w, h = int(sw * 0.85), int(sh * 0.85)
+            else:
+                rw = max(1, self.root.winfo_width())
+                rh = max(1, self.root.winfo_height())
+                w, h = int(rw * w_ratio), int(rh * h_ratio)
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            w = max(560, min(w, max(560, sw - 40)))
+            h = max(420, min(h, max(420, sh - 60)))
+            return f"{w}x{h}"
+        except Exception:
+            return "720x560"
+
+    def show_plugin_hub(self):
+        """插件中心：正式页面（我的插件 / 画廊 / 工坊 三页签）。"""
         t = self._theme()
-        data = self._load_feedback()
-        records = data["records"]
-        ups = sum(1 for r in records if r.get("rating") == "up")
-        downs = sum(1 for r in records if r.get("rating") == "down")
         dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title(f"反馈记录（👍 {ups} · 👎 {downs} · 共 {len(records)} 条）")
+        dialog.title("🧩 插件中心")
+        w, h = self._hub_size(0.90, 0.93).split("x")
+        dialog.geometry(self._center_geometry(int(w), int(h)))
+        dialog.minsize(560, 420)
+        dialog.transient(self.root)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        header = tk.Frame(dialog, bg=t["panel"])
+        header.pack(fill="x", padx=20, pady=(14, 6))
+        self._restyle.append((header, "panel"))
+        self._lbl(header, "🧩 插件中心", role="label_accent", bg="panel",
+                  font=(FONT_FAMILY, 14, "bold")).pack(side="left")
+        self._lbl(header, "零代码能力扩展 · 说需求 AI 造插件 · 插件 = 工具/技能/流程/场景的组合包",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left", padx=(14, 0))
+        nb = ttk.Notebook(dialog)
+        nb.pack(fill="both", expand=True, padx=14, pady=(4, 10))
+        self._hub_installed_tab(nb)
+        self._hub_gallery_tab(nb)
+        self._hub_workshop_tab(nb)
+        self._hub = dialog
+        return dialog
+
+    def _hub_installed_tab(self, nb):
+        """我的插件：列表 + 详情 + 操作（导入/导出/场景/启停/卸载/DND）。"""
+        t = self._theme()
+        body = tk.Frame(nb, bg=t["panel"])
+        nb.add(body, text="我的插件")
+        plugins = plugins_mod.list_plugins(PLUGINS_DIR)
+
+        left = tk.Frame(body, bg=t["panel"])
+        left.pack(side="left", fill="y", padx=(8, 8))
+        self._restyle.append((left, "panel"))
+        left_wrap = tk.Frame(left, bg=t["panel"])
+        left_wrap.pack(fill="both", expand=True)
+        self._restyle.append((left_wrap, "panel"))
+        listbox = tk.Listbox(
+            left_wrap, width=30, bg=t["input_bg"], fg=t["input_fg"],
+            selectbackground=t["selection"], selectforeground=t["accent_text"],
+            relief="flat", highlightthickness=1, highlightbackground=t["border"],
+            highlightcolor=t["accent"], exportselection=False,
+        )
+        lb_sb = tk.Scrollbar(left_wrap, orient="vertical", command=listbox.yview,
+                             relief="flat", bd=0)
+        listbox.configure(yscrollcommand=lb_sb.set)
+        lb_sb.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+        for p in plugins:
+            meta = p.get("meta") or {}
+            mark = "✅" if p.get("enabled", True) else "⏸"
+            listbox.insert("end", f"{mark} {meta.get('icon', '🧩')} {meta.get('name', '')}")
+
+        right = tk.Frame(body, bg=t["panel"])
+        right.pack(side="left", fill="both", expand=True, padx=(8, 8))
+        self._restyle.append((right, "panel"))
+        viewer = tk.Text(
+            right, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
+            relief="flat", highlightthickness=1, highlightbackground=t["border"],
+            highlightcolor=t["accent"], padx=12, pady=10,
+        )
+        view_sb = tk.Scrollbar(right, orient="vertical", command=viewer.yview,
+                               relief="flat", bd=0)
+        viewer.configure(yscrollcommand=view_sb.set)
+        view_sb.pack(side="right", fill="y")
+        viewer.pack(side="left", fill="both", expand=True)
+        if not plugins:
+            viewer.insert("1.0", "（暂无已安装插件）\n\n导入 .wtplugin 文件（或拖拽到本页），"
+                                 "也可从「画廊」一键安装，或让「工坊」的 AI 按需求生成。")
+
+        def show_item(idx):
+            viewer.configure(state="normal")
+            viewer.delete("1.0", "end")
+            viewer.insert("1.0", self._plugin_detail_text(plugins[idx]))
+            viewer.configure(state="disabled")
+
+        listbox.bind("<<ListboxSelect>>",
+                     lambda e: (show_item(listbox.curselection()[0])
+                                if listbox.curselection() else None))
+        if plugins:
+            listbox.selection_set(0)
+            show_item(0)
+
+        bar = tk.Frame(body, bg=t["panel"])
+        bar.pack(fill="x", side="bottom", padx=8, pady=(6, 8))
+        self._restyle.append((bar, "panel"))
+        self._mk_button(bar, "导入插件…", self._hub_import_plugin, fsz=9).pack(side="left")
+        self._mk_button(bar, "导出分享", self._hub_export_plugin, fsz=9).pack(side="left", padx=(6, 0))
+        self._mk_button(bar, "应用场景配置", self._hub_apply_scenario, fsz=9).pack(side="left", padx=(6, 0))
+        self._mk_button(bar, "停用/启用", self._hub_toggle_plugin, fsz=9).pack(side="left", padx=(6, 0))
+        self._mk_button(bar, "卸载", self._hub_uninstall_plugin, fsz=9).pack(side="left", padx=(6, 0))
+        self._lbl(bar, "拖拽 .wtplugin 到列表即可导入",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="right")
+        self._hub_installed_list = (listbox, viewer, plugins)
+        if DND_AVAILABLE:
+            try:
+                body.drop_target_register("DND_Files")
+                body.dnd_bind("<<Drop>>", self._hub_plugin_drop)
+            except Exception:
+                pass
+
+    def _hub_refresh_installed(self):
+        """我的插件页刷新（安装/卸载/启停后：销毁重建中心，状态即时更新）。"""
+        hub = getattr(self, "_hub", None)
+        if hub is None:
+            return
+        try:
+            hub.destroy()
+        except Exception:
+            pass
+        self._hub = None
+        self.show_plugin_hub()
+
+    def _hub_selected_plugin(self):
+        if not hasattr(self, "_hub_installed_list"):
+            return None
+        listbox, _v, plugins = self._hub_installed_list
+        try:
+            sel = listbox.curselection()
+        except tk.TclError:
+            return None
+        if not sel or sel[0] >= len(plugins):
+            return None
+        return plugins[sel[0]]
+
+    def _hub_import_plugin(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="导入插件",
+            filetypes=[("鲸语插件", f"*{plugins_mod.PLUGIN_EXT}"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        if self._install_plugin_file(path):
+            self._hub_refresh_installed()
+
+    def _hub_plugin_drop(self, event):
+        self._on_plugin_drop(event)
+        self._hub_refresh_installed()
+
+    def _hub_export_plugin(self):
+        p = self._hub_selected_plugin()
+        if not p:
+            messagebox.showinfo("提示", "请先在列表选择插件。")
+            return
+        meta = p.get("meta") or {}
+        out_path = filedialog.asksaveasfilename(
+            parent=self.root,
+            initialdir=os.path.expanduser("~"),
+            defaultextension=plugins_mod.PLUGIN_EXT,
+            filetypes=[("鲸语插件", f"*{plugins_mod.PLUGIN_EXT}")],
+            initialfile=f"{plugins_mod._slug(meta.get('name', 'plugin'))}{plugins_mod.PLUGIN_EXT}",
+        )
+        if not out_path:
+            return
+        try:
+            export = {k: p.get(k) for k in ("format", "version", "meta", "requires", "contents")}
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(export, f, ensure_ascii=False, indent=2)
+            self._flash_status(f"已导出插件：{out_path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _hub_apply_scenario(self):
+        p = self._hub_selected_plugin()
+        if not p:
+            messagebox.showinfo("提示", "请先在列表选择插件。")
+            return
+        sc = (p.get("contents") or {}).get("scenario")
+        if not isinstance(sc, dict) or not sc.get("name"):
+            messagebox.showinfo("提示", "该插件不包含场景配置。")
+            return
+        if messagebox.askyesno(
+            "应用场景",
+            f"应用插件场景「{sc.get('name')}」？（推荐工具 / 思考档；建议人格将单独确认，不静默覆盖）",
+        ):
+            self._apply_plugin_scenario(sc)
+            self._flash_status(f"🎭 已应用场景「{sc.get('name')}」（任务能力已配置）")
+
+    def _hub_toggle_plugin(self):
+        p = self._hub_selected_plugin()
+        if not p:
+            messagebox.showinfo("提示", "请先在列表选择插件。")
+            return
+        want = not p.get("enabled", True)
+        if want:
+            res = plugins_mod.apply_plugin(p, self._plugin_paths())
+            if not res.get("ok"):
+                messagebox.showerror("启用失败", str(res.get("error") or "未知错误"))
+                return
+        else:
+            res = plugins_mod.unapply_plugin(p, self._plugin_paths())
+            if not res.get("ok"):
+                messagebox.showerror("停用失败", str(res.get("error") or "未知错误"))
+                return
+            try:
+                with open(p["_file"], "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data["enabled"] = False
+                plugins_mod.save_plugin_file(data, PLUGINS_DIR)
+            except Exception:
+                pass
+        self._refresh_user_tools_cache()
+        self._hub_refresh_installed()
+
+    def _hub_uninstall_plugin(self):
+        p = self._hub_selected_plugin()
+        if not p:
+            messagebox.showinfo("提示", "请先在列表选择插件。")
+            return
+        name = (p.get("meta") or {}).get("name", "")
+        applied = p.get("applied") or {}
+        impact = []
+        if applied.get("tools"):
+            impact.append(f"{len(applied['tools'])} 个工具")
+        if applied.get("skills"):
+            impact.append(f"{len(applied['skills'])} 个技能")
+        if applied.get("workflows"):
+            impact.append(f"{len(applied['workflows'])} 个流程")
+        if not messagebox.askyesno(
+            "卸载插件",
+            f"确认卸载插件「{name}」？\n将移除：{'、'.join(impact) or '无条目'}。\n（不影响你手动添加的同名能力）",
+        ):
+            return
+        plugins_mod.unapply_plugin(p, self._plugin_paths())
+        try:
+            os.remove(p["_file"])
+        except OSError:
+            pass
+        self._refresh_user_tools_cache()
+        self._flash_status(f"已卸载插件「{name}」")
+        self._hub_refresh_installed()
+
+    def _hub_gallery_tab(self, nb):
+        """插件画廊：示例插件 + 详情 + 一键安装。"""
+        t = self._theme()
+        body = tk.Frame(nb, bg=t["panel"])
+        nb.add(body, text="画廊")
+        samples = []
+        if os.path.isdir(SAMPLE_PLUGINS_DIR):
+            for fn in sorted(os.listdir(SAMPLE_PLUGINS_DIR)):
+                if not fn.endswith(plugins_mod.PLUGIN_EXT):
+                    continue
+                p, err = plugins_mod.parse_plugin_file(os.path.join(SAMPLE_PLUGINS_DIR, fn))
+                if p is not None:
+                    samples.append(p)
+        installed_names = {p["meta"]["name"] for p in plugins_mod.list_plugins(PLUGINS_DIR)}
+
+        left = tk.Frame(body, bg=t["panel"])
+        left.pack(side="left", fill="y", padx=(8, 8))
+        self._restyle.append((left, "panel"))
+        left_wrap = tk.Frame(left, bg=t["panel"])
+        left_wrap.pack(fill="both", expand=True)
+        self._restyle.append((left_wrap, "panel"))
+        listbox = tk.Listbox(
+            left_wrap, width=30, bg=t["input_bg"], fg=t["input_fg"],
+            selectbackground=t["selection"], selectforeground=t["accent_text"],
+            relief="flat", highlightthickness=1, highlightbackground=t["border"],
+            highlightcolor=t["accent"], exportselection=False,
+        )
+        lb_sb = tk.Scrollbar(left_wrap, orient="vertical", command=listbox.yview,
+                             relief="flat", bd=0)
+        listbox.configure(yscrollcommand=lb_sb.set)
+        lb_sb.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+        for p in samples:
+            meta = p.get("meta") or {}
+            mark = "✅" if meta.get("name") in installed_names else "⬇"
+            listbox.insert("end", f"{mark} {meta.get('icon', '🧩')} {meta.get('name', '')}（{self._plugin_summary(p)}）")
+        if not samples:
+            listbox.insert("end", "（无内置示例插件）")
+
+        right = tk.Frame(body, bg=t["panel"])
+        right.pack(side="left", fill="both", expand=True, padx=(8, 8))
+        self._restyle.append((right, "panel"))
+        viewer = tk.Text(
+            right, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
+            relief="flat", highlightthickness=1, highlightbackground=t["border"],
+            highlightcolor=t["accent"], padx=12, pady=10,
+        )
+        view_sb = tk.Scrollbar(right, orient="vertical", command=viewer.yview,
+                               relief="flat", bd=0)
+        viewer.configure(yscrollcommand=view_sb.set)
+        view_sb.pack(side="right", fill="y")
+        viewer.pack(side="left", fill="both", expand=True)
+
+        def show_item(idx):
+            viewer.configure(state="normal")
+            viewer.delete("1.0", "end")
+            viewer.insert("1.0", self._plugin_detail_text(samples[idx]))
+            viewer.configure(state="disabled")
+
+        listbox.bind("<<ListboxSelect>>",
+                     lambda e: (show_item(listbox.curselection()[0])
+                                if listbox.curselection() else None))
+        if samples:
+            listbox.selection_set(0)
+            show_item(0)
+
+        def install_selected():
+            sel = listbox.curselection()
+            if not sel or sel[0] >= len(samples):
+                return
+            p = samples[sel[0]]
+            name = p["meta"]["name"]
+            if name in installed_names:
+                messagebox.showinfo("已安装", f"插件「{name}」已安装，可在「我的插件」中查看/停用/卸载。")
+                return
+            if not messagebox.askyesno("安装示例插件", f"确认安装「{name}」？\n{self._plugin_summary(p)}"):
+                return
+            res = plugins_mod.apply_plugin(p, self._plugin_paths())
+            if not res.get("ok"):
+                messagebox.showerror("安装失败", str(res.get("error") or "未知错误"))
+                return
+            self._refresh_user_tools_cache()
+            self._flash_status(f"✅ 示例插件「{name}」已安装")
+            self._hub_refresh_installed()
+            self._show_plugin_guide(p)
+
+        listbox.bind("<Double-1>", lambda e: install_selected())
+        bar = tk.Frame(body, bg=t["panel"])
+        bar.pack(fill="x", side="bottom", padx=8, pady=(6, 8))
+        self._restyle.append((bar, "panel"))
+        self._mk_button(bar, "安装选中", install_selected, kind="primary", fsz=9).pack(side="left")
+        self._lbl(bar, "示例插件：理解插件能力的最佳起点 · 双击安装",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="right")
+
+    def _hub_workshop_tab(self, nb):
+        """插件工坊：说需求，AI 造插件。"""
+        t = self._theme()
+        body = tk.Frame(nb, bg=t["panel"])
+        nb.add(body, text="工坊")
+        self._lbl(body, "描述你想要的能力，AI 将生成并安装插件（工具=AI 自动调用 · 技能=⚡指令 · 流程=AI/手动运行）：",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(8, 4))
+        for ex in (
+            "· 我想要一个小红书文案工具，根据主题生成爆款标题和正文",
+            "· 帮我创建一个『每日数据巡检』流程：读数据库 → 生成报表 → 推送通知",
+            "· 添加一个『会议纪要模板』技能，输入会议内容输出结构化纪要",
+        ):
+            self._lbl(body, ex, role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+                      wraplength=560, justify="left").pack(anchor="w", pady=1)
+        text = tk.Text(
+            body, height=5, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
+            insertbackground=t["input_fg"], relief="flat", highlightthickness=1,
+            highlightbackground=t["border"], highlightcolor=t["accent"],
+            font=(FONT_FAMILY, 10), padx=10, pady=8,
+        )
+        text.pack(fill="both", expand=True, pady=(8, 0))
+        text.focus_set()
+
+        def run():
+            need = text.get("1.0", "end").strip()
+            if not need:
+                messagebox.showinfo("提示", "请先描述你想要的能力。")
+                return
+            hub = getattr(self, "_hub", None)
+            if hub is not None:
+                try:
+                    hub.destroy()
+                except Exception:
+                    pass
+                self._hub = None
+            self.send(
+                text=(
+                    f"请使用 create_plugin 工具帮我生成并安装一个插件。\n"
+                    f"需求：{need}\n"
+                    "生成前先确认需求可实现（名称/包含哪些能力），生成后总结插件内容与使用方式。"
+                )
+            )
+
+        bar = tk.Frame(body, bg=t["panel"])
+        bar.pack(fill="x", side="bottom", pady=(8, 8))
+        self._restyle.append((bar, "panel"))
+        self._mk_button(bar, "生成插件", run, kind="primary", fsz=10).pack(side="right")
+
+    def show_tool_hub(self):
+        """工具中心：正式页面（概览 / 工具设置 / 权限 三页签）。"""
+        t = self._theme()
+        dialog = tk.Toplevel(self.root, bg=t["panel"])
+        dialog.title("🛠 工具中心")
+        w, h = self._hub_size(0.92, 0.94).split("x")
+        dialog.geometry(self._center_geometry(int(w), int(h)))
+        dialog.minsize(560, 420)
+        dialog.transient(self.root)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        header = tk.Frame(dialog, bg=t["panel"])
+        header.pack(fill="x", padx=20, pady=(14, 6))
+        self._restyle.append((header, "panel"))
+        self._lbl(header, "🛠 工具中心", role="label_accent", bg="panel",
+                  font=(FONT_FAMILY, 14, "bold")).pack(side="left")
+        self._lbl(header, "工具/权限/环境的统一管理 · 未选中的工具不会出现在请求中",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left", padx=(14, 0))
+        nb = ttk.Notebook(dialog)
+        nb.pack(fill="both", expand=True, padx=14, pady=(4, 4))
+        self._hub_saves = []
+        self._hub_tools_overview(nb)
+        self._hub_tools_settings(nb)
+        self._hub_tools_permissions(nb)
+        # 底部保存栏：工具设置与权限面板的保存回调在此统一触发（面板化后保存入口不丢失）
+        foot = tk.Frame(dialog, bg=t["panel"])
+        foot.pack(fill="x", padx=14, pady=(0, 10))
+        self._restyle.append((foot, "panel"))
+        self._lbl(foot, "修改工具/权限后点击保存生效", role="label_sec", bg="panel",
+                  font=(FONT_FAMILY, 9)).pack(side="left")
+        self._mk_button(foot, "💾 保存更改", lambda: self._hub_save_all(), kind="primary", fsz=10).pack(side="right")
+        self._mk_button(foot, "关闭", dialog.destroy, fsz=9).pack(side="right", padx=(0, 8))
+        self._hub = dialog
+        return dialog
+
+    def _hub_save_all(self):
+        """工具中心统一保存：触发工具设置与权限面板的保存回调。"""
+        saved = 0
+        for fn in getattr(self, "_hub_saves", []) or []:
+            try:
+                fn()
+                saved += 1
+            except Exception:
+                pass
+        self._hub_saves = []
+        self._flash_status(f"✅ 工具中心更改已保存（{saved} 个面板）")
+
+    def _hub_tools_overview(self, nb):
+        """工具中心-概览：环境/模型/用量/依赖摘要 + 高频快捷入口。"""
+        t = self._theme()
+        body = tk.Frame(nb, bg=t["panel"])
+        nb.add(body, text="概览")
+        # 快捷入口行
+        quick = tk.Frame(body, bg=t["panel"])
+        quick.pack(fill="x", padx=8, pady=(8, 4))
+        self._restyle.append((quick, "panel"))
+        self._lbl(quick, "快捷操作：", role="label_sec", bg="panel",
+                  font=(FONT_FAMILY, 9, "bold")).pack(side="left", padx=(0, 8))
+        for label, fn in (
+            ("💰 查余额", self.check_balance),
+            ("📊 用量统计", self.show_stats),
+            ("🎯 预算设置", self.edit_budget),
+            ("⚖ 模型对比", self.compare_models),
+            ("📐 上下文详情", self.show_context_details),
+        ):
+            self._mk_button(quick, label, fn, fsz=9).pack(side="left", padx=(0, 6))
+
+        nav = tk.Frame(body, bg=t["panel"])
+        nav.pack(fill="x", padx=8, pady=(2, 4))
+        self._restyle.append((nav, "panel"))
+        self._lbl(nav, "导航：", role="label_sec", bg="panel",
+                  font=(FONT_FAMILY, 9, "bold")).pack(side="left", padx=(0, 8))
+        for label, fn in (
+            ("⏰ 定时任务", self.manage_schedules),
+            ("🔁 流程管理", self.manage_workflows),
+            ("📚 知识库", self.manage_knowledge),
+            ("📍 检查点", self.show_checkpoint),
+            ("📋 任务记录", self.show_tasklog),
+            ("📦 最近产物", self.show_recent_outputs),
+            ("📁 工作目录", self.choose_working_dir),
+            ("🔧 失败模式", self.show_failures),
+            ("🧩 插件中心", self.show_plugin_hub),
+        ):
+            self._mk_button(nav, label, fn, fsz=9).pack(side="left", padx=(0, 6))
+
+        scroll_wrap = tk.Frame(body, bg=t["panel"])
+        scroll_wrap.pack(fill="both", expand=True, padx=8, pady=4)
+        self._restyle.append((scroll_wrap, "panel"))
+        canvas, inner = self._scroll_panel(scroll_wrap)
+
+        def card(title, lines, color=None):
+            self._lbl(inner, title, role="label_accent", bg="panel",
+                      font=(FONT_FAMILY, 10, "bold")).pack(anchor="w", pady=(8, 2))
+            for ln in lines:
+                self._lbl(inner, "· " + ln, bg="panel", font=(FONT_FAMILY, 9),
+                          fg=color if color else None, wraplength=600,
+                          justify="left").pack(anchor="w", padx=(12, 0), pady=1)
+
+        # 模型与环境
+        model = self.model_combo.get().strip() or "deepseek-v4-flash"
+        m_info = MODELS.get(model, {})
+        card("模型", [f"{model}（{m_info.get('version', '?')}） · 上下文 1M / 输出上限 384K"])
+        # 人格（当前生效角色）
+        role_name = self._current_role_name(self.cfg.get("system_prompt", ""))
+        card("人格", [f"🎭 当前角色：{role_name}（设置面板或「角色与提示词」切换）"])
+        # 用量（今日）
+        try:
+            data = stats.load_stats(STATS_PATH)
+            today = stats.day_total(data, date.today().isoformat())
+            today_cost = sum(
+                stats.estimate_cost(usage, mdl)
+                for mdl, usage in (data.get(date.today().isoformat()) or {}).items()
+            )
+            card("用量", [
+                f"今日：输入 {today['prompt']:,} / 输出 {today['completion']:,} token"
+                f"（缓存命中 {today['cache_hit']:,}）≈ ¥{stats.format_cost(today_cost)}",
+            ])
+        except Exception:
+            card("用量", ["（统计数据暂不可用）"])
+        # 依赖
+        deps = self._dependency_status()
+        n_ok = sum(1 for _, ok, _, _ in deps if ok)
+        missing = [name for name, ok, _u, _h in deps if not ok]
+        dep_line = f"可选能力 {n_ok}/{len(deps)} 已就绪"
+        if missing:
+            dep_line += f" · 缺失 {len(missing)} 项（{', '.join(missing[:5])}）"
+        card("依赖", [dep_line])
+        # 工作目录
+        card("工作目录", [self._get_active_dir()])
+        # 任务能力（自主模式语义：完全智能=全部工具 / 纯对话=无工具 / 标准=按工具设置）
+        if self.cfg.get("full_auto"):
+            cap_line = "🤖 完全智能：全部工具自动可用（为开发/创作而生，权限闸门跳过）"
+        elif self.cfg.get("pure_chat"):
+            cap_line = "💬 纯对话：不调用任何工具"
+        else:
+            cap_line = "标准：按下方「工具设置」勾选"
+        card("任务能力", [f"自主模式 → {cap_line}"])
+        # 安全
+        d = permissions.get_data()
+        mode = d.get("approval_mode", "auto")
+        auto = "🤖 完全智能（允许目录内全自动）" if permissions.is_full_auto() else f"审批模式：{mode}"
+        card("安全", [auto, f"写文件：{'开' if d['filesystem'].get('allow_write') else '关'} · "
+                           f"命令执行：{'开' if d['shell'].get('allow_run_command') else '关'}"])
+
+    def _hub_tools_settings(self, nb):
+        """工具中心-工具设置（可启停全部工具）。"""
+        t = self._theme()
+        body = tk.Frame(nb, bg=t["panel"])
+        nb.add(body, text="工具设置")
+        save = self._edit_tools_panel(body)
+        if save:
+            self._hub_saves.append(save)
+
+    def _hub_tools_permissions(self, nb):
+        """工具中心-权限（行动能力闸门）。"""
+        t = self._theme()
+        body = tk.Frame(nb, bg=t["panel"])
+        nb.add(body, text="权限")
+        save = self._edit_permissions_panel(body)
+        if save:
+            self._hub_saves.append(save)
+
+    def show_plugins(self):
+        """插件管理（已并入插件中心，兼容入口）。"""
+        self.show_plugin_hub()
+
+    def _apply_plugin_scenario(self, sc):
+        """应用插件场景配置：推荐工具 + 思考档（任务能力）；建议人格提示词单独询问。
+
+        与自主模式/人格分层一致：不静默覆盖当前人格。
+        """
+        name = str(sc.get("name") or "插件场景")
+        if sc.get("thinking") in THINKING_MODES:
+            self.cfg["thinking"] = sc["thinking"]
+        sp = str(sc.get("system_prompt") or "").strip()
+        if sp:
+            # 建议人格单独确认：避免插件静默覆盖用户人格
+            if messagebox.askyesno(
+                "应用建议人格",
+                f"插件「{name}」建议人格提示词：\n{sp[:120]}{'…' if len(sp) > 120 else ''}\n\n"
+                "是否一并应用？（将覆盖当前角色/系统提示词；选否则保持当前人格）",
+            ):
+                self.cfg["system_prompt"] = sp
+                if self.messages:
+                    self.messages[0]["content"] = sp
+                self._update_role_label()
+        tools = sc.get("enabled_tools")
+        if isinstance(tools, list):
+            valid = self._valid_tool_names()
+            self.cfg["enabled_tools"] = [t for t in tools if t in valid]
+        save_config(self.cfg)
+        self._flash_status(f"🎭 已应用插件场景「{name}」（任务能力已配置）")
+
+    def show_plugin_gallery(self):
+        """插件画廊（已并入插件中心，兼容入口）。"""
+        self.show_plugin_hub()
+
+    def show_plugin_workshop(self):
+        """插件工坊（已并入插件中心，兼容入口）。"""
+        self.show_plugin_hub()
+
+    def show_dependencies(self):
+        """依赖状态：可选能力清单与安装指引。"""
+        t = self._theme()
+        rows = self._dependency_status()
+        n_ok = sum(1 for _, ok, _, _ in rows if ok)
+        dialog, body, footer = self._dialog_shell(
+            "依赖状态", 580, 500,
+            subtitle=f"可选能力：{n_ok}/{len(rows)} 已安装（缺失项给出安装命令；所有缺失功能均自动降级提示）",
+        )
+        canvas, inner = self._scroll_panel(body)
+        for name, ok, use, hint in rows:
+            row = tk.Frame(inner, bg=t["panel"])
+            row.pack(fill="x", pady=2)
+            self._restyle.append((row, "panel"))
+            mark = "✅" if ok else "⚠ "
+            fg = t["success"] if ok else t["warning"]
+            self._lbl(row, f"{mark} {name}", bg="panel", font=(FONT_FAMILY, 9, "bold"),
+                      fg=fg, width=17, anchor="w").pack(side="left")
+            self._lbl(row, use, role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+                      anchor="w").pack(side="left", padx=(6, 0))
+            if not ok:
+                self._lbl(row, hint, role="label_sec", bg="panel", font=(MONO_FAMILY, 8),
+                          anchor="e").pack(side="right")
+        self._footer_btn(footer, "关闭", dialog.destroy)
+
+    def show_failures(self):
+        """失败模式库：查看 AI 工具曾失败的原因（供分析/规避）。"""
+        t = self._theme()
+        items = self._load_failures()
+        dialog = tk.Toplevel(self.root, bg=t["panel"])
+        dialog.title(f"失败模式库（{len(items)} 条 · 自动积累工具失败原因）")
         dialog.geometry("560x400")
         dialog.transient(self.root)
         text = tk.Text(
@@ -7476,22 +8722,24 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             highlightcolor=t["accent"], padx=12, pady=10,
         )
         text.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        for r in reversed(records[-200:]):
-            mark = "👍" if r.get("rating") == "up" else "👎"
+        for r in reversed(items[-200:]):
             text.insert(
                 "end",
-                f"{mark} [{r.get('ts', '')}] {r.get('role', '')}\n{r.get('snippet', '')}\n\n",
+                f"🔧 {r.get('tool', '?')} · [{r.get('ts', '')}]\n"
+                f"参数: {r.get('args', '')}\n错误: {r.get('error', '')}\n\n",
             )
+        if not items:
+            text.insert("1.0", "（暂无失败记录，AI 工具执行失败时自动积累）")
         text.configure(state="disabled")
         bar = tk.Frame(dialog, bg=t["panel"])
         bar.pack(fill="x", padx=12, pady=(8, 12))
         self._restyle.append((bar, "panel"))
 
         def clear():
-            if messagebox.askyesno("清空反馈", "确认清空全部反馈记录？"):
-                self._atomic_json_write(FEEDBACK_PATH, {"records": []})
+            if messagebox.askyesno("清空失败模式", "确认清空全部失败记录？"):
+                self._save_failures([])
                 dialog.destroy()
-                self.show_feedback()
+                self.show_failures()
 
         self._mk_button(bar, "清空", clear, fsz=9).pack(side="left")
         self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
@@ -7796,11 +9044,22 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         self._watch_dialog_timeout(dialog, ev, permissions.approval_timeout())
 
     def edit_permissions(self):
-        data = permissions.get_data()
+        """权限设置（工具中心面板版）。"""
         dialog, body, footer = self._dialog_shell(
             "权限设置", 540, 540,
             subtitle="⚠ 所有行动能力默认关闭；开启前请确认信任范围。",
         )
+        save = self._edit_permissions_panel(body)
+        self._footer_hint(footer, "配置文件：permissions.json")
+        self._footer_btn(footer, "关闭", dialog.destroy)
+        self._footer_btn(footer, "保存", lambda: (save(), dialog.destroy()), primary=True)
+
+    def _edit_permissions_panel(self, body):
+        """权限设置面板（嵌入工具中心）：返回保存回调。"""
+        data = permissions.get_data()
+        # 滚动容器：内容超出面板高度时可滚动，杜绝底部元素被截断
+        canvas, inner = self._scroll_panel(body)
+        body = inner
         self._lbl(
             body, "⚠ 所有行动能力默认关闭；开启前请确认信任范围。",
             role="label_error", bg="panel", font=(FONT_FAMILY, 9, "bold"),
@@ -7854,6 +9113,20 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             variable=plan_var,
         ).pack(anchor="w", pady=(10, 0))
 
+        # SSRF 信任白名单：回环默认放行（本地开发服务器验证），内网/保留网段
+        # 需在此显式信任后模型才能访问（云元数据 169.254.169.254 永远不可豁免）
+        self._lbl(
+            body, "SSRF 信任主机（内网访问需显式信任；回环 localhost 已默认放行）：",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", pady=(10, 2))
+        ssrf_var = tk.StringVar(value=", ".join(self.cfg.get("ssrf_trusted") or []))
+        ttk.Entry(body, textvariable=ssrf_var).pack(fill="x")
+        self._lbl(
+            body, "支持 IP / 主机名 / CIDR 网段（如 192.168.1.0/24）；可访问内网服务（NAS、公司系统等）。",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 8),
+            wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
         def save_perms():
             data["filesystem"]["allow_write"] = bool(write_var.get())
             data["filesystem"]["allowed_dirs"] = [
@@ -7868,11 +9141,13 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             permissions.set_data(data)
             if permissions.save():
                 self._flash_status("权限设置已保存")
-            dialog.destroy()
+            # SSRF 信任白名单保存（回环默认放行；内网需显式信任）
+            trusted = [h.strip() for h in ssrf_var.get().split(",") if h.strip()]
+            self.cfg["ssrf_trusted"] = trusted
+            _dc.set_ssrf_trusted(trusted)
+            save_config(self.cfg)
 
-        self._footer_hint(footer, "配置文件：permissions.json")
-        self._footer_btn(footer, "关闭", dialog.destroy)
-        self._footer_btn(footer, "保存", save_perms, primary=True)
+        return save_perms
 
     def show_fim_dialog(self):
         cfg = self.save_widgets_to_config()
@@ -8523,6 +9798,7 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         self.last_usage = None
         self._pending_send = None
         self._needs_compression = False
+        self._round_aborted = False
         self._resend_index = None
         self._stream_start = None
         self._stream_block_start = None
@@ -8648,7 +9924,8 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         ):
             self._peak_notified = date.today().isoformat()
             self._flash_status(
-                "⏰ 当前为 DeepSeek 高峰时段（9:00-12:00 / 14:00-18:00），价格按 2 倍计费",
+                "⏰ 当前为 DeepSeek 高峰时段（9:00-12:00 / 14:00-18:00），"
+                "按高峰价计费（空闲时段为高峰一半）",
                 6000,
             )
         self.input_text.delete("1.0", "end")
@@ -8684,6 +9961,21 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         self.stop_event = threading.Event()
         threading.Thread(target=self._worker, daemon=True).start()
 
+    def _resolve_thinking(self, cfg):
+        """生效思考档位：预算感知降档（auto/max → high，接近预算 80% 时）。"""
+        thinking = str(cfg.get("thinking") or "high")
+        budget = float(cfg.get("monthly_budget", 0) or 0)
+        if budget > 0:
+            try:
+                cost = self._monthly_cost()
+            except Exception:
+                cost = 0.0
+            eff, near = self._budget_thinking(budget, cost, thinking)
+            if eff != thinking:
+                self._budget_thinking_hint(near)
+            return eff
+        return thinking
+
     def _worker(self, continue_mode=False):
         try:
             client = self.ensure_client()
@@ -8716,7 +10008,9 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                 msgs = [dict(x) for x in msgs]
                 if msgs and msgs[0].get("role") == "system":
                     msgs[0]["content"] = DIALOG_SYSTEM_PROMPT
-            enabled_tools = list(cfg.get("enabled_tools") or [])
+            # 自主模式 = 任务能力（运行时语义，不污染 enabled_tools 配置）：
+            # 完全智能 = 全部工具（为开发/创作而生）；纯对话 = 无工具；标准 = 按工具中心配置
+            enabled_tools, tools_enabled = self._mode_tools_for_request(cfg)
             seed = None
             if self._variant_seed_override is not None:
                 seed = self._variant_seed_override
@@ -8728,10 +10022,10 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             ok_result = client.chat(
                 msgs,
                 scenario=cfg["scenario"],
-                thinking=cfg["thinking"],
+                thinking=self._resolve_thinking(cfg),
                 max_tokens=int(cfg["max_tokens"]) or 16384,
                 seed=seed,
-                tools_enabled=cfg["tools_enabled"],
+                tools_enabled=tools_enabled,
                 enabled_tools=enabled_tools,
                 custom_tools=load_user_tools(USER_TOOLS_PATH),
                 max_tool_rounds=int(cfg.get("max_tool_rounds", 10)),
@@ -8744,7 +10038,11 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                 on_approval=self._tool_approval,
                 on_plan=self._plan_gate,
                 memory_text=self._memory_prompt_text(),
+                trailing_text=(
+                    "" if pure else self._memory_prompt_dynamic()
+                ),
                 pure_chat=pure,
+                strict_tools=bool(cfg.get("strict_tools", False)),
                 stop_event=self.stop_event,
                 temperature=(
                     float(cfg.get("custom_temperature", 1.0))
@@ -8758,8 +10056,10 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                 continue_prefix=bool(continue_mode),
                 on_ask=self._ask_user_callback,
                 on_request_permission=self._request_whitelist_callback,
+                on_truncated=self._push_truncated,
             )
-            # chat() 返回 False 且非用户停止 = 空响应重试耗尽 / 计划连续被拒，给出可见反馈
+            # chat() 返回 False 且非用户停止 = 空响应重试耗尽 / 计划连续被拒 / 流中断截断，
+            # 给出可见反馈（on_truncated 已通知原因时不再重复）
             if ok_result is not None and not ok_result and not (
                 self.stop_event and self.stop_event.is_set()
             ):
@@ -8780,6 +10080,8 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             else:
                 logging.exception("请求失败")
                 self._ui_queue.put(("error", f"请求失败: {e}"))
+                # 异常中断：标记本轮未完成，_finish 的任务报告显示「任务中断」而非「任务完成」
+                self._ui_queue.put(("round_error", None))
         finally:
             self._ui_queue.put(("finish", None))
 
@@ -8829,6 +10131,37 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
 
     def _push_tool(self, name, args, result):
         self._ui_queue.put(("tool", (name, args, result)))
+        # 自动断点：工具链每完成一步即持久化检查点（worker 线程纯写盘），
+        # 停止/崩溃/重启后可从断点一键续跑（_finish 中断时插入续跑入口）
+        try:
+            self._auto_checkpoint(name)
+        except Exception:
+            pass
+
+    def _auto_checkpoint(self, tool_name=None):
+        """工具链执行中断点自动持久化（worker 线程调用；隐私模式跳过）。"""
+        if self.cfg.get("privacy_mode"):
+            return
+        tools = getattr(self, "_auto_ckpt_tools", None)
+        if tools is None:
+            return
+        if tool_name and (not tools or tools[-1] != tool_name):
+            tools.append(tool_name)
+        title = ""
+        for mm in reversed(self.messages):
+            if mm.get("role") == "user" and mm.get("content"):
+                title = " ".join(str(mm["content"]).split())[:40]
+                break
+        try:
+            _dc.task_checkpoint_save(
+                name=title or "未命名任务",
+                status="进行中",
+                pending=[f"已完成 {len(tools)} 个工具（最近：{'、'.join(tools[-5:])}）"],
+                notes=f"[自动断点] 工具链：{' → '.join(tools[-8:])}",
+                auto=True,
+            )
+        except Exception:
+            pass
 
     def _push_tool_duration(self, name, duration):
         self._ui_queue.put(("tool_dur", (name, duration)))
@@ -8838,6 +10171,14 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
 
     def _push_usage(self, usage):
         self._ui_queue.put(("usage", usage))
+
+    def _push_truncated(self, reason):
+        """生成截断/中断通知（worker 线程）：标记本轮未完成，_finish 展示明确提示。"""
+        try:
+            self._round_aborted = True
+            self._ui_queue.put(("truncated", str(reason)))
+        except Exception:
+            pass
 
     def _drain_ui_queue(self):
         try:
@@ -8894,10 +10235,32 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                     self._show_balance(payload)
                 elif kind == "info":
                     self._show_note(payload)
+                elif kind == "truncated":
+                    # 截断/中断原因（_push_truncated 已置 _round_aborted；此处补充可见提示）
+                    if payload:
+                        self._show_note(f"⚠ {payload}。本轮生成未正常完成，可重新发送或继续生成。")
+                elif kind == "round_error":
+                    self._round_aborted = True
                 elif kind == "balance_done":
                     self.btn_balance.configure(state="normal")
                 elif kind == "update":
                     self._handle_update_result(payload)
+                elif kind == "update_downloaded":
+                    ok, detail = payload
+                    if ok:
+                        if messagebox.askyesno(
+                            "下载完成",
+                            f"新版安装包已下载：\n{detail}\n\n"
+                            "关闭鲸语后运行该文件即可完成更新。\n打开所在文件夹？",
+                        ):
+                            try:
+                                os.startfile(os.path.dirname(detail))
+                            except Exception:
+                                pass
+                    else:
+                        messagebox.showerror(
+                            "下载失败", f"更新包下载失败：{detail}\n可前往官网手动下载。"
+                        )
                 elif kind == "search_all_done":
                     self._show_search_results(payload)
                 elif kind == "history_loaded":
@@ -8912,9 +10275,8 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                     self._show_approval_dialog(*payload)
                 elif kind == "plan_req":
                     self._show_plan_dialog(*payload)
-                elif kind == "speech":
-                    self._speech_busy = False
-                    self._insert_speech(payload)
+                elif kind == "ocr":
+                    self._ocr_result(payload)
                 elif kind == "timer_task":
                     self.send(text=payload, silent=True)
                 elif kind == "schedule_notify":
@@ -8930,6 +10292,19 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                     threading.Thread(target=_push, daemon=True).start()
                 elif kind == "proc_out":
                     self._proc_panel_append(*payload)
+                elif kind == "tray":
+                    try:
+                        if payload == "show":
+                            self.root.deiconify()
+                            self.root.lift()
+                            self.root.focus_force()
+                        elif payload == "hide":
+                            self.root.withdraw()
+                        elif payload == "quit":
+                            self._quit_from_tray = True
+                            self.on_close()
+                    except tk.TclError:
+                        pass
                 elif kind == "fim_done":
                     ok, res = payload
                     w = getattr(self, "_fim_widgets", None)
@@ -9253,7 +10628,27 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                     None if old <= last_removed else old - last_removed,
                 )
 
+    def _offer_continue_from_checkpoint(self):
+        """中断后存在自动断点：聊天区插入可点击「从断点继续」。"""
+        try:
+            if not _dc.CHECKPOINT_FILE or not os.path.exists(_dc.CHECKPOINT_FILE):
+                return
+            with open(_dc.CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                cp = json.load(f)
+            if not isinstance(cp, dict) or not cp.get("auto"):
+                return
+            name = str(cp.get("name") or "未命名任务")
+            note = f"▶ 已保存任务断点「{name}」，点击此处从断点继续（或发送『继续任务』）\n"
+            self._append(note, "continue_hint")
+            self.blocks.append(("note", note, "continue_hint"))
+        except Exception:
+            pass
+
     def _finish(self):
+        # 本轮是否被截断/中断（max_tokens 截断 / 流断线 / 工具轮数耗尽 / 异常）：
+        # 是则任务报告显示「任务中断」并提供继续路径，避免误报「任务完成」
+        aborted = bool(getattr(self, "_round_aborted", False))
+        self._round_aborted = False
         self._flush_pending(force=True)
         start = self._stream_start
         block_start = self._stream_block_start
@@ -9286,18 +10681,38 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             u = self.last_usage or {}
             ok_n = 0
             fail_n = 0
+            fail_items = []
             for b in self.blocks:
                 if b[0] == "tool":
                     res = str(b[1][2] or "")
                     if res.startswith(_dc.TOOL_RESULT_FAIL_PREFIXES):
                         fail_n += 1
+                        fail_items.append(
+                            {
+                                "tool": str(b[1][0]),
+                                "args": (
+                                    json.dumps(b[1][1], ensure_ascii=False)
+                                    if b[1][1] else ""
+                                )[:100],
+                                "error": (res.splitlines()[0] or res)[:200],
+                                "ts": datetime.now().isoformat(timespec="seconds"),
+                            }
+                        )
                     else:
                         ok_n += 1
             mark = "✅" if fail_n == 0 else "⚠"
-            report = (
-                f"[任务完成] {mark} 工具 {ok_n} 成功 / {fail_n} 失败 · 耗时 {dur:.1f}s"
-                f" · 输入 {u.get('prompt', 0):,} / 输出 {u.get('completion', 0):,} token\n"
-            )
+            if aborted:
+                report = (
+                    f"[任务中断] ⚠ 工具 {ok_n} 成功 / {fail_n} 失败 · 耗时 {dur:.1f}s"
+                    f" · 输入 {u.get('prompt', 0):,} / 输出 {u.get('completion', 0):,} token\n"
+                    "本轮回复未正常完成：请重新发送上一条消息让 AI 继续任务，"
+                    "或开启 Beta API 用「继续生成」从断点续写。\n"
+                )
+            else:
+                report = (
+                    f"[任务完成] {mark} 工具 {ok_n} 成功 / {fail_n} 失败 · 耗时 {dur:.1f}s"
+                    f" · 输入 {u.get('prompt', 0):,} / 输出 {u.get('completion', 0):,} token\n"
+                )
             self._append(report, "time")
             self.blocks.append(("note", report))
             # 产物自动核验：本轮 write/create 工具声明路径的实存性
@@ -9327,11 +10742,34 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                 pass
             if fail_n == 0 and ok_n >= 1:
                 self._record_success_pattern()
+            elif fail_n > 0 and not self.cfg.get("privacy_mode"):
+                # 失败模式积累：供后续任务注入「已知失败模式」帮助 AI 规避
+                self._append_failures(fail_items)
             if ok_n >= 1:
                 self._record_tasklog()
+            if aborted:
+                # 中断：自动断点已由 _auto_checkpoint 持久化，提供一键续跑入口
+                self._offer_continue_from_checkpoint()
+            elif not self.cfg.get("privacy_mode"):
+                # 正常完成：清除自动断点（手动断点保留），避免残留误导
+                try:
+                    _dc.task_checkpoint_clear()
+                except Exception:
+                    pass
+        elif aborted:
+            # 纯对话（无工具）但被截断/中断：明确提示而非静默「回复完成」
+            self._append(
+                "\n[回复中断] 本轮生成未正常完成（网络中断 / 输出截断 / 异常）。\n"
+                "可重新发送消息继续，或开启 Beta API 后用「继续生成」从断点续写。\n",
+                "time",
+            )
+            self.blocks.append(("note", "[回复中断] 本轮生成未正常完成。\n"))
         if self.task_panel is not None:
             try:
-                summary = f"✅ 任务完成 · {self._agent_tool_count} 个工具" if self._agent_tool_count else "✅ 回复完成"
+                if aborted:
+                    summary = f"⚠ 任务中断 · {self._agent_tool_count} 个工具（回复未完成）" if self._agent_tool_count else "⚠ 回复中断"
+                else:
+                    summary = f"✅ 任务完成 · {self._agent_tool_count} 个工具" if self._agent_tool_count else "✅ 回复完成"
                 self.task_panel.finish(summary=summary)
             except Exception:
                 pass
@@ -9346,15 +10784,18 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             # v2 联动：任务/回复完成同时发本地桌面 Toast（后台线程，不阻塞）
             if not self.cfg.get("privacy_mode"):
                 try:
-                    summary = "✅ 回复完成"
-                    if self._agent_tool_count > 0:
-                        ok_n = sum(
-                            1 for b in self.blocks
-                            if b[0] == "tool" and not str(b[1][2] or "").startswith(
-                                ("错误", "权限拒绝", "超时", "（用户停止")
+                    if aborted:
+                        summary = "⚠ 任务中断（回复未完成）" if self._agent_tool_count else "⚠ 回复中断"
+                    else:
+                        summary = "✅ 回复完成"
+                        if self._agent_tool_count > 0:
+                            ok_n = sum(
+                                1 for b in self.blocks
+                                if b[0] == "tool" and not str(b[1][2] or "").startswith(
+                                    ("错误", "权限拒绝", "超时", "（用户停止")
+                                )
                             )
-                        )
-                        summary = f"✅ 任务完成 · {ok_n} 个工具成功"
+                            summary = f"✅ 任务完成 · {ok_n} 个工具成功"
                     reply_hint = ""
                     for b in reversed(self.blocks):
                         if b[0] == "content" and str(b[1]).strip():
@@ -9616,6 +11057,21 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         self._render_all()
         self._flash_status("已展开早期消息")
 
+    def _on_continue_click(self, _event=None):
+        """中断后的「从断点继续」：以检查点上下文恢复执行。"""
+        if self.busy:
+            self._flash_status("请先停止当前生成")
+            return
+        self._clear_placeholder()
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert(
+            "1.0",
+            "请从断点继续执行未完成任务：先调用 task_checkpoint_load 恢复任务上下文，"
+            "然后继续完成剩余步骤，全部完成后用 task_checkpoint_save 标记完成。",
+        )
+        self.input_text.focus_set()
+        self.send()
+
     def _sync_thinking_fold(self, text):
         """全量重渲染完成后恢复进行中思考块的卡片游标。
 
@@ -9774,7 +11230,7 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         if parse(latest) > parse(VERSION):
             msg = f"发现新版本 {latest}（当前 {VERSION}）。"
             if url:
-                msg += "\n更新前将自动备份当前版本源码（backups/ 目录）。\n是否备份并前往下载？"
+                msg += "\n更新前将自动备份当前版本源码（backups/ 目录）。\n是否备份并继续？"
                 if messagebox.askyesno("发现新版本", msg):
                     # 备份（os.walk + zip 压缩 0.5-2s）放后台线程，避免主线程卡顿
                     def do_backup():
@@ -9789,11 +11245,46 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                             logging.exception("更新前备份失败")
 
                     threading.Thread(target=do_backup, daemon=True).start()
-                    webbrowser.open(url)
+                    if url.lower().endswith((".exe", ".zip", ".7z", ".msi")):
+                        # 直链安装包：应用内下载到下载目录（进度可见）
+                        self._download_update(latest, url)
+                    else:
+                        webbrowser.open(url)
             else:
                 messagebox.showinfo("发现新版本", msg + "\n请从官方渠道获取安装包。")
         else:
             self._show_note(f"[更新] 当前已是最新版本 {VERSION}。")
+
+    def _download_update(self, version, url):
+        """下载新版安装包到用户下载目录（后台线程，完成经队列提示）。"""
+        self._flash_status(f"正在下载 v{version} 安装包…")
+        try:
+            from urllib.parse import urlparse
+
+            fn = os.path.basename(urlparse(str(url)).path) or f"WhaleTalk_v{version}.exe"
+        except Exception:
+            fn = f"WhaleTalk_v{version}.exe"
+        target_dir = os.path.join(os.path.expanduser("~"), "Downloads", "WhaleTalk 更新")
+
+        def worker():
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                path = os.path.join(target_dir, fn)
+                with _dc._http_client().stream("GET", str(url), timeout=60) as resp:
+                    resp.raise_for_status()
+                    with open(path, "wb") as f:
+                        total = 0
+                        for chunk in resp.iter_bytes(64 * 1024):
+                            total += len(chunk)
+                            if total > 2 * 1024 * 1024 * 1024:
+                                raise RuntimeError("安装包超过 2GB，已放弃")
+                            f.write(chunk)
+                self._ui_queue.put(("update_downloaded", (True, path)))
+            except Exception as e:
+                logging.exception("更新包下载失败")
+                self._ui_queue.put(("update_downloaded", (False, str(e))))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _show_balance(self, data):
         """余额查询结果：品牌对话框展示（替代系统 messagebox）。"""
@@ -10135,7 +11626,10 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             return False
         summary_msg = {
             "role": "system",
-            "content": f"[历史对话摘要] 以下为较早轮次的压缩摘要：\n{summary}",
+            "content": (
+                f"[历史对话摘要] 以下为较早轮次的压缩摘要：\n{summary}\n"
+                "（摘要末尾的「关键事实」小节为可长期引用的要点，后续回答请参考）"
+            ),
         }
         with self._messages_lock:
             # 摘要调用期间消息不会变（busy 时 send 挂起），del/insert 仍持锁防主线程快照穿插
@@ -10170,7 +11664,9 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                             "role": "system",
                             "content": (
                                 "你是对话历史摘要器。请将以下对话历史压缩为不超过400字的中文摘要，"
-                                "保留关键事实、已做出的决定和未完成的任务，不要添加新信息。"
+                                "保留关键事实、已做出的决定和未完成的任务，不要添加新信息。\n"
+                                "摘要后另起一行输出「关键事实」小节：列出 2-6 条可长期引用的事实/"
+                                "决策/待办（每条 - 前缀），只保留与未来继续对话相关的要点。"
                             ),
                         },
                         {"role": "user", "content": history_text},
@@ -10373,9 +11869,10 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                 f"{privacy}{auto}{chat}📁 {wd_short} | {cur_str} | {total_str}{budget_str}{peak}"
             )
         )
-        # 右段：模型 / 场景 / 思考档位
+        # 右段：模型 / 角色 / 场景 / 思考档位（角色 = 当前生效人格，状态全程可见）
+        role_name = self._current_role_name(self.cfg.get("system_prompt", ""))
         self.status_right.configure(
-            text=f"模型 {self.model_combo.get()} · 场景 {self.scenario_combo.get()} · 思考 {self.thinking_combo.get()}"
+            text=f"模型 {self.model_combo.get()} · 🎭 {role_name} · 场景 {self.scenario_combo.get()} · 思考 {self.thinking_combo.get()}"
         )
         if fg is not None:
             self.status_label.configure(fg=fg)
@@ -11075,12 +12572,48 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         except tk.TclError:
             pass
 
+    @staticmethod
+    def _timeline_items(blocks):
+        """从渲染块构建会话轨迹条目：[(msg_idx 或 None, 显示文本, 可跳转)]。
+
+        混合时间线：用户消息 / 助手回复 / 思考过程 / 工具调用（含参数）/
+        系统事件（压缩、任务完成、中断等 note/error）。
+        """
+        items = []
+        for b in blocks:
+            kind = b[0]
+            if kind == "user":
+                items.append((None, "💬 用户 " + (" ".join(str(b[1]).split())[:40] or "（空）"), False))
+            elif kind == "content":
+                idx = b[2] if len(b) > 2 and isinstance(b[2], int) else None
+                items.append((idx, "🤖 助手 " + (" ".join(str(b[1]).split())[:40] or "（空）"), idx is not None))
+            elif kind == "thinking":
+                items.append((None, "🧠 思考 " + (" ".join(str(b[1]).split())[:30] or ""), False))
+            elif kind == "tool":
+                name, args, result = b[1][0], b[1][1], b[1][2]
+                args_s = ""
+                try:
+                    args_s = json.dumps(args, ensure_ascii=False)[:40] if args else ""
+                except (TypeError, ValueError):
+                    args_s = str(args)[:40]
+                res = " ".join(str(result or "").split())[:30]
+                mark = "✅" if not str(result or "").startswith(_dc.TOOL_RESULT_FAIL_PREFIXES) else "❌"
+                items.append((None, f"🔧 {mark} {name} {args_s} → {res}", False))
+            elif kind == "note":
+                text = str(b[1]).strip()
+                if text:
+                    items.append((None, "📌 " + text[:40], False))
+            elif kind == "error":
+                items.append((None, "⚠ " + str(b[1]).strip()[:40], False))
+        return items
+
     def show_session_timeline(self):
-        """会话结构导航：按时间顺序列出全部消息，双击/跳转定位到原文。"""
+        """会话轨迹：按时间顺序列出消息/思考/工具调用/系统事件的混合时间线，
+        双击/跳转定位到聊天区原文（Harness 式 Trajectory 的鲸语版）。"""
         t = self._theme()
         dialog, body, footer = self._dialog_shell(
-            "会话结构", 540, 480,
-            subtitle="消息时间线：双击或选中后「跳转」定位到聊天区原文",
+            "会话轨迹", 620, 480,
+            subtitle="完整轨迹：消息 + 思考 + 工具调用 + 系统事件；双击助手/用户行定位原文",
         )
         frame = tk.Frame(body, bg=t["panel"])
         frame.pack(fill="both", expand=True)
@@ -11103,151 +12636,31 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             troughcolor=t["input_bg"],
             highlightbackground=t["input_bg"], highlightcolor=t["input_bg"],
         )
-        labels = []
-        for i, m in enumerate(self.messages):
-            role = m.get("role")
-            if role == "system":
-                continue
-            if role == "user":
-                head = "💬 用户"
-            elif role == "assistant":
-                head = "🤖 助手"
-            elif role == "tool":
-                head = "🔧 工具"
-            else:
-                continue
-            raw = m.get("content") or ""
-            if role == "assistant" and not raw.strip():
-                tcs = m.get("tool_calls") or []
-                names = []
-                for tc in tcs:
-                    if isinstance(tc, dict):
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            names.append(str(fn["name"]))
-                raw = "（调用工具：" + "、".join(names[:3]) + "）"
-            first = " ".join(str(raw).split())[:40] or "（空）"
-            labels.append((i, f"[{i}] {head} {first}"))
-        if len(labels) > 200:
-            labels = labels[:200]
-        for _i, text_ in labels:
+        labels = self._timeline_items(self.blocks)
+        if len(labels) > 300:
+            labels = labels[-300:]
+        for _idx, text_, _j in labels:
             listbox.insert("end", text_)
         if not labels:
-            listbox.insert("end", "（会话暂无消息）")
+            listbox.insert("end", "（会话暂无轨迹）")
 
         def jump():
             sel = listbox.curselection()
-            if not sel or not labels:
+            if not sel or sel[0] >= len(labels):
                 return
-            idx = labels[sel[0]][0]
+            idx, _text, jumpl = labels[sel[0]]
+            if not jumpl or idx is None:
+                self._flash_status("该条目无原文可跳转（工具/事件/思考）")
+                return
             dialog.destroy()
             self._scroll_to_message(idx)
 
         listbox.bind("<Double-1>", lambda e: jump())
         listbox.bind("<Return>", lambda e: jump())
-        self._footer_hint(footer, f"{len(self.messages) - 1} 条消息")
+        self._footer_hint(footer, f"{len(labels)} 个轨迹条目 · 消息/思考/工具/事件")
         self._footer_btn(footer, "关闭", dialog.destroy)
         self._footer_btn(footer, "跳转", jump, primary=True)
 
-    def show_recipes(self):
-        """配方系统：查看/执行历史成功工具链（patterns.json），或把当前会话保存为命名配方。"""
-        t = self._theme()
-        dialog, body, footer = self._dialog_shell(
-            "配方管理", 580, 420,
-            subtitle="历史成功任务的工具链模式：选中「执行配方」注入复用，或把当前会话保存为命名配方",
-        )
-        frame = tk.Frame(body, bg=t["panel"])
-        frame.pack(fill="both", expand=True)
-        self._restyle.append((frame, "panel"))
-        listbox = tk.Listbox(
-            frame, bg=t["input_bg"], fg=t["input_fg"],
-            selectbackground=t["selection"], selectforeground=t["accent_text"],
-            activestyle="none", relief="flat", borderwidth=0,
-            highlightthickness=0, font=(FONT_FAMILY, 9), exportselection=False,
-        )
-        sb = tk.Scrollbar(
-            frame, orient="vertical", command=listbox.yview,
-            relief="flat", bd=0, highlightthickness=0, width=10,
-        )
-        sb.pack(side="right", fill="y")
-        listbox.pack(side="left", fill="both", expand=True)
-        listbox.configure(yscrollcommand=sb.set)
-        sb.configure(
-            bg=t["disabled"], activebackground=t["text_sec"],
-            troughcolor=t["input_bg"],
-            highlightbackground=t["input_bg"], highlightcolor=t["input_bg"],
-        )
-        pats = self._load_patterns()
-        for i, p in enumerate(pats):
-            name = str(p.get("name") or "").strip()
-            chain = p.get("chain") or []
-            ts = str(p.get("ts") or "")[5:16]
-            title = name or f"配方 {i + 1}"
-            listbox.insert("end", f"{title} · {ts} · {' → '.join(chain)}")
-        if not pats:
-            listbox.insert("end", "（暂无成功模式配方，任务全部成功时会自动记录）")
-
-        def use():
-            sel = listbox.curselection()
-            if not sel or not pats:
-                return
-            p = pats[sel[0]]
-            chain = p.get("chain") or []
-            if not chain:
-                self._flash_status("该配方无工具链")
-                return
-            dialog.destroy()
-            target = simpledialog.askstring(
-                "配方执行",
-                "将按工具链顺序执行：" + " → ".join(chain) + "\n\n本次任务目标：",
-                parent=self.root,
-            )
-            if target is None:
-                return
-            target = target.strip()
-            if not target:
-                return
-            self._clear_placeholder()
-            self.send(
-                text=(
-                    "请按以下已验证成功的工具链顺序执行任务，遇到问题自主修正后继续：\n"
-                    + " → ".join(chain)
-                    + "\n\n任务目标：" + target
-                )
-            )
-
-        def save_current():
-            chain = []
-            for b in self.blocks:
-                if b[0] == "tool":
-                    res = str(b[1][2] or "")
-                    if not res.startswith(_dc.TOOL_RESULT_FAIL_PREFIXES):
-                        chain.append(str(b[1][0]))
-            if not chain:
-                messagebox.showinfo("保存配方", "当前会话没有成功工具链可保存。")
-                return
-            dialog.destroy()
-            name = simpledialog.askstring(
-                "保存配方", "配方名称（如：周报生成、网站部署）：", parent=self.root
-            )
-            if name is None:
-                return
-            name = name.strip() or "未命名配方"
-            pats = self._load_patterns()
-            pats.append(
-                {"name": name, "chain": chain, "ts": datetime.now().isoformat(timespec="seconds")}
-            )
-            if len(pats) > 20:
-                del pats[: len(pats) - 20]
-            if self._save_patterns(pats):
-                self._flash_status(f"✅ 已保存配方「{name}」（{' → '.join(chain)}）")
-            else:
-                messagebox.showwarning("保存配方", "配方保存失败，请查看日志。")
-
-        self._footer_hint(footer, f"{len(pats)} 个配方")
-        self._footer_btn(footer, "关闭", dialog.destroy)
-        self._footer_btn(footer, "保存当前会话", save_current)
-        self._footer_btn(footer, "执行配方", use, primary=True)
 
     def show_batch_task(self):
         """批量任务：多选文件 + 指令模板（{file} 占位），一次发送让 AI 逐个处理。"""
@@ -11277,56 +12690,379 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         self._clear_placeholder()
         self.send(text=prompt)
 
+    @staticmethod
+    def load_user_roles():
+        """用户自定义角色（可增删改）：[{"name", "prompt", "thinking", "desc", "category"}]。"""
+        try:
+            if os.path.exists(USER_ROLES_PATH):
+                with open(USER_ROLES_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return [r for r in data if isinstance(r, dict) and r.get("name") and r.get("prompt")]
+        except Exception:
+            logging.exception("读取用户角色失败")
+        return []
+
+    @staticmethod
+    def save_user_roles(roles):
+        """保存用户角色列表（原子写）；角色变更后清识别缓存。"""
+        try:
+            tmp = USER_ROLES_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(roles, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, USER_ROLES_PATH)
+            AssistantApp._role_cache["prompt"] = None  # 角色集变更，缓存失效
+            return True
+        except Exception:
+            logging.exception("保存用户角色失败")
+            return False
+
+    _role_cache = {"prompt": None, "name": None}  # 角色识别缓存（状态栏高频调用防读盘）
+
+    @staticmethod
+    def load_all_roles():
+        """全部角色 = 内置预设（只读）+ 用户自定义。"""
+        roles = []
+        for name, role in ROLES.items():
+            roles.append({"name": name, "prompt": str(role.get("prompt") or ""),
+                          "thinking": str(role.get("thinking") or "high"),
+                          "desc": str(role.get("desc") or ""), "builtin": True})
+        for u in AssistantApp.load_user_roles():
+            u["builtin"] = False
+            roles.append(u)
+        return roles
+
+    @staticmethod
+    def _current_role_name(prompt):
+        """识别当前生效角色：system_prompt 与任一预设/用户角色完全一致 → 角色名；否则「自定义」。
+
+        结果按提示词缓存（状态栏每秒级调用，避免反复读盘匹配）。
+        """
+        prompt = str(prompt or "")
+        cache = AssistantApp._role_cache
+        if cache["prompt"] == prompt:
+            return cache["name"]
+        name = "自定义"
+        for r in AssistantApp.load_all_roles():
+            if str(r.get("prompt") or "") == prompt:
+                name = str(r.get("name") or "")
+                break
+        cache["prompt"] = prompt
+        cache["name"] = name
+        return name
+
     def show_roles(self):
-        """角色卡片：预设人格套装（system_prompt + 思考档），一键应用。"""
+        """角色与提示词：完整管理——内置/用户角色（增删改/分类）+ 自定义编辑。
+
+        概念模型：角色 = 系统提示词预设。左侧选角色应用；「✍ 自定义」直接编辑
+        当前提示词；用户角色可新增/编辑/删除/分类。当前生效角色自动识别高亮。
+        """
         t = self._theme()
         dialog, body, footer = self._dialog_shell(
-            "角色库", 540, 420,
-            subtitle="一键切换 AI 人格：应用后立即生效（会更新系统提示词，注意缓存提示）",
+            "角色与提示词", 600, 480,
+            subtitle="角色 = 系统提示词预设 · 内置只读，用户角色可增删改分类 · 自定义=直接编辑当前提示词",
         )
-        frame = tk.Frame(body, bg=t["panel"])
-        frame.pack(fill="both", expand=True)
-        self._restyle.append((frame, "panel"))
-        listbox = tk.Listbox(
-            frame, bg=t["input_bg"], fg=t["input_fg"],
-            selectbackground=t["selection"], selectforeground=t["accent_text"],
-            activestyle="none", relief="flat", borderwidth=0,
-            highlightthickness=0, font=(FONT_FAMILY, 9), exportselection=False,
-        )
-        sb = tk.Scrollbar(
-            frame, orient="vertical", command=listbox.yview,
-            relief="flat", bd=0, highlightthickness=0, width=10,
-        )
-        sb.pack(side="right", fill="y")
-        listbox.pack(side="left", fill="both", expand=True)
-        listbox.configure(yscrollcommand=sb.set)
-        sb.configure(
-            bg=t["disabled"], activebackground=t["text_sec"],
-            troughcolor=t["input_bg"],
-            highlightbackground=t["input_bg"], highlightcolor=t["input_bg"],
-        )
-        role_names = list(ROLES.keys())
-        for name in role_names:
-            desc = ROLES[name].get("desc", "")
-            listbox.insert("end", f"{name} — {desc}")
+        cur_prompt = str(self.cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT)
+        cur_role = self._current_role_name(cur_prompt)
+        roles = self.load_all_roles()
+        # 列表结构：[role...] + [自定义]（自定义固定为最后一项）
+        user_roles = [r for r in roles if not r.get("builtin")]
+        builtin_roles = [r for r in roles if r.get("builtin")]
+        CUSTOM_IDX = len(roles)
 
-        def apply():
+        left = tk.Frame(body, bg=t["panel"])
+        left.pack(side="left", fill="y", padx=(0, 8))
+        self._restyle.append((left, "panel"))
+        listbox = tk.Listbox(
+            left, width=24, bg=t["input_bg"], fg=t["input_fg"],
+            selectbackground=t["selection"], selectforeground=t["accent_text"],
+            relief="flat", highlightthickness=1, highlightbackground=t["border"],
+            highlightcolor=t["accent"], exportselection=False,
+        )
+        lb_sb = tk.Scrollbar(left, orient="vertical", command=listbox.yview,
+                             relief="flat", bd=0)
+        listbox.configure(yscrollcommand=lb_sb.set)
+        lb_sb.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+
+        def fill_list():
+            listbox.delete(0, "end")
+            listbox.insert("end", "── 内置角色 ──")
+            for r in builtin_roles:
+                mark = "✅" if r["name"] == cur_role else "⭘"
+                listbox.insert("end", f"{mark} {r['name']}")
+            if user_roles:
+                listbox.insert("end", "── 我的角色 ──")
+                cats = {}
+                for r in user_roles:
+                    cats.setdefault(str(r.get("category") or "未分类"), []).append(r)
+                for cat, items in cats.items():
+                    listbox.insert("end", f"  · {cat}")
+                    for r in items:
+                        mark = "✅" if r["name"] == cur_role else "⭘"
+                        listbox.insert("end", f"{mark} {r['name']}")
+            listbox.insert("end", "──────────")
+            listbox.insert("end", "✍ 自定义")
+
+        fill_list()
+
+        # 列表行 → role 名 映射（跳过分组标题）
+        def row_to_role(row_idx):
+            items = list(listbox.get(0, "end"))
+            if 0 <= row_idx < len(items):
+                label = items[row_idx]
+                if label.startswith(("──", "  ·", "✍", "────")):
+                    return None
+                return label[2:].strip()  # 去掉 ✅/⭘ 前缀
+            return None
+
+        right = tk.Frame(body, bg=t["panel"])
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self._restyle.append((right, "panel"))
+        desc_lbl = self._lbl(right, "", role="label_sec", bg="panel",
+                             font=(FONT_FAMILY, 9), wraplength=420, justify="left")
+        desc_lbl.pack(anchor="w", pady=(0, 4))
+        think_lbl = self._lbl(right, "", role="label_sec", bg="panel",
+                              font=(FONT_FAMILY, 9))
+        think_lbl.pack(anchor="w", pady=(0, 4))
+        prompt_text = tk.Text(
+            right, wrap="word", height=10, bg=t["input_bg"], fg=t["input_fg"],
+            insertbackground=t["input_fg"], relief="flat", highlightthickness=1,
+            highlightbackground=t["border"], highlightcolor=t["accent"],
+            font=(FONT_FAMILY, 9), padx=10, pady=8,
+        )
+        prompt_text.pack(fill="both", expand=True)
+        prompt_text.configure(state="disabled")
+        apply_btn = self._mk_button(right, "应用此角色", lambda: apply_selected(), kind="primary", fsz=9)
+        apply_btn.pack(anchor="e", pady=(8, 0))
+
+        def show_role(role):
+            desc_lbl.configure(text=f"描述：{role.get('desc', '')}"
+                                    f"{'（内置）' if role.get('builtin') else '（我的' + ('·' + str(role.get('category')) if role.get('category') else '') + '）'}")
+            think_lbl.configure(text=f"思考档位：{THINKING_MODES.get(str(role.get('thinking') or 'high'), str(role.get('thinking') or 'high'))}")
+            prompt_text.configure(state="normal")
+            prompt_text.delete("1.0", "end")
+            prompt_text.insert("1.0", role.get("prompt") or "")
+            prompt_text.configure(state="disabled")
+            apply_btn.configure(text="应用此角色", state="normal")
+
+        def show_custom():
+            desc_lbl.configure(text="自定义提示词：直接编辑当前生效的系统提示词（修改后点「保存自定义」）")
+            think_lbl.configure(text="思考档位：手动在设置面板选择")
+            prompt_text.configure(state="normal")
+            prompt_text.delete("1.0", "end")
+            prompt_text.insert("1.0", cur_prompt)
+            apply_btn.configure(text="保存自定义", state="normal")
+
+        def on_select(_e=None):
             sel = listbox.curselection()
             if not sel:
                 return
-            name = role_names[sel[0]]
-            dialog.destroy()
-            self.apply_role(name)
+            name = row_to_role(sel[0])
+            if name == "自定义":
+                show_custom()
+            elif name:
+                role = next((r for r in roles if r["name"] == name), None)
+                if role:
+                    show_role(role)
 
-        listbox.bind("<Double-1>", lambda e: apply())
-        listbox.bind("<Return>", lambda e: apply())
-        self._footer_hint(footer, "当前角色：自定义（可在设置中修改）")
+        def apply_selected():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            name = row_to_role(sel[0])
+            if name == "自定义":
+                new_prompt = prompt_text.get("1.0", "end").strip()
+                dialog.destroy()
+                self._apply_custom_prompt(new_prompt)
+            elif name:
+                role = next((r for r in roles if r["name"] == name), None)
+                if role:
+                    dialog.destroy()
+                    self.apply_role(name)
+
+        # ── 角色管理：新增 / 编辑 / 删除（仅用户角色） ──
+        def _selected_role():
+            sel = listbox.curselection()
+            if not sel:
+                return None
+            name = row_to_role(sel[0])
+            if not name or name == "自定义":
+                return None
+            return next((r for r in roles if r["name"] == name), None)
+
+        def edit_role_dialog(role=None):
+            """角色编辑对话框（新增/编辑共用）。"""
+            sub_t = self._theme()
+            sub = tk.Toplevel(self.root, bg=sub_t["panel"])
+            sub.title("新增角色" if role is None else "编辑角色")
+            sub.geometry(self._center_geometry(520, 400))
+            sub.transient(dialog)
+            sub.bind("<Escape>", lambda e: sub.destroy())
+            sub_body = tk.Frame(sub, bg=sub_t["panel"])
+            sub_body.pack(fill="both", expand=True, padx=16, pady=(12, 0))
+            self._restyle.append((sub_body, "panel"))
+            fields = {}
+            for key, label in (("name", "角色名称"), ("category", "分类（如 我的/写作/办公）"),
+                               ("desc", "描述（一句话说明用途）")):
+                self._lbl(sub_body, label, role="label_sec", bg="panel",
+                          font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(4, 2))
+                var = tk.StringVar(value=str(role.get(key, "")) if role else "")
+                ttk.Entry(sub_body, textvariable=var).pack(fill="x")
+                fields[key] = var
+            self._lbl(sub_body, "思考档位", role="label_sec", bg="panel",
+                      font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(4, 2))
+            think_var = tk.StringVar(value=str(role.get("thinking") or "high") if role else "high")
+            ttk.Combobox(sub_body, textvariable=think_var, values=list(THINKING_MODES.keys()),
+                         state="readonly").pack(fill="x")
+            self._lbl(sub_body, "系统提示词（角色人格全文）", role="label_sec", bg="panel",
+                      font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(4, 2))
+            prompt_edit = tk.Text(
+                sub_body, wrap="word", height=7, bg=sub_t["input_bg"], fg=sub_t["input_fg"],
+                insertbackground=sub_t["input_fg"], relief="flat", highlightthickness=1,
+                highlightbackground=sub_t["border"], highlightcolor=sub_t["accent"],
+                font=(FONT_FAMILY, 9), padx=8, pady=6,
+            )
+            prompt_edit.pack(fill="both", expand=True, pady=(0, 8))
+            if role:
+                prompt_edit.insert("1.0", role.get("prompt") or "")
+            bar = tk.Frame(sub, bg=sub_t["panel"])
+            bar.pack(fill="x", padx=16, pady=(6, 12))
+            self._restyle.append((bar, "panel"))
+
+            def save_edit():
+                name = fields["name"].get().strip()
+                prompt = prompt_edit.get("1.0", "end").strip()
+                if not name or not prompt:
+                    messagebox.showinfo("提示", "名称与系统提示词必填。")
+                    return
+                if role is None:
+                    if any(r["name"] == name for r in roles):
+                        messagebox.showinfo("提示", f"角色「{name}」已存在。")
+                        return
+                new_role = {
+                    "name": name,
+                    "prompt": prompt,
+                    "thinking": think_var.get(),
+                    "desc": fields["desc"].get().strip(),
+                    "category": fields["category"].get().strip() or "我的",
+                }
+                user_roles_local = self.load_user_roles()
+                if role is None:
+                    user_roles_local.append(new_role)
+                else:
+                    user_roles_local = [
+                        (new_role if r["name"] == role["name"] else r) for r in user_roles_local
+                    ]
+                if self.save_user_roles(user_roles_local):
+                    sub.destroy()
+                    dialog.destroy()
+                    self.show_roles()
+                    self._flash_status(f"角色「{name}」已保存")
+                else:
+                    messagebox.showerror("保存失败", "无法写入用户角色文件。")
+
+            self._mk_button(bar, "取消", sub.destroy, fsz=9).pack(side="right")
+            self._mk_button(bar, "保存", save_edit, kind="primary", fsz=9).pack(side="right", padx=(0, 8))
+
+        def add_role():
+            edit_role_dialog(None)
+
+        def edit_role():
+            r = _selected_role()
+            if not r:
+                messagebox.showinfo("提示", "请选择一个角色（内置角色不可编辑，可复制内容到新增）。")
+                return
+            if r.get("builtin"):
+                messagebox.showinfo("提示", "内置角色只读。可在「新增」中创建副本后编辑。")
+                return
+            edit_role_dialog(r)
+
+        def del_role():
+            r = _selected_role()
+            if not r:
+                messagebox.showinfo("提示", "请先选择一个角色。")
+                return
+            if r.get("builtin"):
+                messagebox.showinfo("提示", "内置角色不可删除。")
+                return
+            in_use = (self._current_role_name(self.cfg.get("system_prompt", "")) == r["name"])
+            note = "\n（当前正在使用此角色，删除后当前会话将显示为「自定义」，人格提示词保持不变）" if in_use else ""
+            if not messagebox.askyesno("删除角色", f"确认删除角色「{r['name']}」？{note}"):
+                return
+            user_roles_local = [x for x in self.load_user_roles() if x.get("name") != r["name"]]
+            self.save_user_roles(user_roles_local)
+            self._update_role_label()
+            self._flash_status(f"已删除角色「{r['name']}」")
+            dialog.destroy()
+            self.show_roles()
+
+        listbox.bind("<<ListboxSelect>>", on_select)
+        listbox.bind("<Double-1>", lambda e: apply_selected())
+        listbox.bind("<Return>", lambda e: apply_selected())
+        default_idx = CUSTOM_IDX
+        for i, r in enumerate(roles):
+            if r["name"] == cur_role:
+                default_idx = i + 1  # 列表首行是分组标题
+                break
+        if default_idx != CUSTOM_IDX:
+            try:
+                listbox.selection_set(default_idx)
+                listbox.activate(default_idx)
+                on_select()
+            except tk.TclError:
+                pass
+        else:
+            listbox.selection_set(listbox.size() - 1)
+            listbox.activate(listbox.size() - 1)
+            on_select()
+        # 管理按钮
+        bar = tk.Frame(body, bg=t["panel"])
+        bar.pack(fill="x", side="bottom", pady=(8, 0))
+        self._restyle.append((bar, "panel"))
+        self._mk_button(bar, "＋ 新增角色", add_role, fsz=9).pack(side="left")
+        self._mk_button(bar, "✏ 编辑", edit_role, fsz=9).pack(side="left", padx=(6, 0))
+        self._mk_button(bar, "🗑 删除", del_role, fsz=9).pack(side="left", padx=(6, 0))
+        self._lbl(bar, "内置角色只读 · 用户角色可增删改分类",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="right")
+        self._footer_hint(footer, f"当前角色：{cur_role} · 修改会破坏前缀缓存（{self._cache_cost_hint()}）")
         self._footer_btn(footer, "关闭", dialog.destroy)
-        self._footer_btn(footer, "应用", apply, primary=True)
+
+    def _apply_custom_prompt(self, new_prompt):
+        """保存自定义系统提示词（含缓存警示，逻辑吸收原 edit_system_prompt）。"""
+        new_prompt = str(new_prompt or "").strip() or DEFAULT_SYSTEM_PROMPT
+        if (
+            new_prompt != self.cfg.get("system_prompt")
+            and len(self.messages) > 1
+            and not self.cfg.get("privacy_mode")
+        ):
+            if not messagebox.askyesno(
+                "缓存提示",
+                f"修改系统提示词会破坏前缀缓存（{self._cache_cost_hint()}），并影响所有会话。\n"
+                "建议保持固定提示词，如需新提示词可新建会话后修改。\n仍要修改吗？",
+            ):
+                return
+        self.cfg["system_prompt"] = new_prompt
+        if self.messages:
+            self.messages[0]["content"] = new_prompt
+        save_config(self.cfg)
+        self._update_role_label()
+        self._flash_status("已保存自定义提示词")
+
+    def _update_role_label(self):
+        """更新设置面板「当前角色」显示（角色应用/自定义保存后调用）。"""
+        lbl = getattr(self, "_role_lbl", None)
+        if lbl is not None:
+            try:
+                lbl.configure(
+                    text=f"🎭 当前角色：{self._current_role_name(self.cfg.get('system_prompt', ''))}"
+                )
+            except tk.TclError:
+                pass
 
     def apply_role(self, name):
-        """应用角色：更新 system_prompt + 思考档（与 edit_system_prompt 同款缓存警示）。"""
-        role = ROLES.get(name)
+        """应用角色（内置或用户自定义）：更新 system_prompt + 思考档（含缓存警示，联动角色显示）。"""
+        role = next((r for r in self.load_all_roles() if r.get("name") == name), None)
         if not role:
             return
         new_prompt = str(role.get("prompt") or "")
@@ -11338,7 +13074,7 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             if not messagebox.askyesno(
                 "缓存提示",
                 f"应用角色「{name}」将修改系统提示词，会破坏前缀缓存"
-                "（缓存命中 0.02 元 vs 未命中 1 元/百万 tokens），并影响所有会话。\n仍要应用吗？",
+                f"（{self._cache_cost_hint()}），并影响所有会话。\n仍要应用吗？",
             ):
                 return
         self.cfg["system_prompt"] = new_prompt
@@ -11352,6 +13088,7 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             self.thinking_combo.set(THINKING_MODES[thinking])
         except Exception:
             pass
+        self._update_role_label()
         self._flash_status(f"🎭 已应用角色「{name}」")
 
     def show_command_palette(self):
@@ -11395,8 +13132,7 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             ("新建临时会话", lambda: self.add_tab(ephemeral=True)),
             ("生成会话纪要", self.generate_session_summary),
             ("会话结构导航", self.show_session_timeline),
-            ("配方管理", self.show_recipes),
-            ("角色库", self.show_roles),
+            ("角色与提示词", self.show_roles),
             ("切换主题", self.toggle_theme),
             ("查余额", self.check_balance),
             ("用量统计", self.show_stats),
@@ -11574,6 +13310,10 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         self._footer_btn(footer, "关闭", dialog.destroy)
 
     def compare_models(self):
+        """模型对比（参数化）：弹窗选择/输入任意两个模型，分会话对比结果。
+
+        可选模型列表 = 内置模型 + 各 Profile 配置的模型名（模型名可自由输入）。
+        """
         text = self.input_text.get("1.0", "end-1c").strip()
         if not text:
             messagebox.showinfo("提示", "请先在输入框写下要对比的问题。")
@@ -11583,10 +13323,48 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             return
         cur = self.model_combo.get().strip()
         other = "deepseek-v4-pro" if cur == "deepseek-v4-flash" else "deepseek-v4-flash"
-        self._compare_pending = text
-        self._compare_models = [cur, other]
-        self._compare_idx = 0
-        self.after(50, self._compare_step)
+        models = list(MODELS.keys())
+        try:
+            for p in (load_profiles().get("profiles") or {}).values():
+                m_ = str(p.get("model") or "").strip()
+                if m_ and m_ not in models:
+                    models.append(m_)
+        except Exception:
+            pass
+        t = self._theme()
+        dialog, body, footer = self._dialog_shell(
+            "模型对比", 460, 260,
+            subtitle="同一问题分别用两个模型生成回复，结果分会话对比（模型名可自由输入）",
+        )
+        var1 = tk.StringVar(value=cur)
+        var2 = tk.StringVar(value=other)
+        for label, var in (("模型 A", var1), ("模型 B", var2)):
+            row = tk.Frame(body, bg=t["panel"])
+            row.pack(fill="x", pady=4)
+            self._restyle.append((row, "panel"))
+            self._lbl(row, label, role="label_sec", bg="panel",
+                      font=(FONT_FAMILY, 9), width=8).pack(side="left")
+            ttk.Combobox(row, textvariable=var, values=models,
+                         state="normal").pack(side="left", fill="x", expand=True)
+        self._lbl(
+            body, f"待对比问题：{text[:60]}{'…' if len(text) > 60 else ''}",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9), wraplength=400, justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+        def start():
+            a = var1.get().strip() or cur
+            b = var2.get().strip() or other
+            if a == b:
+                messagebox.showinfo("提示", "两个模型相同，请选择不同的模型。")
+                return
+            dialog.destroy()
+            self._compare_pending = text
+            self._compare_models = [a, b]
+            self._compare_idx = 0
+            self.after(50, self._compare_step)
+
+        self._footer_btn(footer, "取消", dialog.destroy)
+        self._footer_btn(footer, "开始对比", start, primary=True)
 
     def _compare_step(self):
         if self._compare_idx >= len(self._compare_models):
@@ -11704,12 +13482,6 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             menu.add_command(
                 label="引用此消息回复",
                 command=lambda i=msg_idx: self._quote_message(i),
-            )
-            menu.add_command(
-                label="👍 有用", command=lambda i=msg_idx: self._feedback(i, "up")
-            )
-            menu.add_command(
-                label="👎 没用", command=lambda i=msg_idx: self._feedback(i, "down")
             )
             if (
                 self.messages[msg_idx].get("role") == "assistant"
@@ -11898,6 +13670,16 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                     return
 
     def _open_path(self, path):
+        # 应用内预览优先：md/txt 文本与图片在应用内查看（保留系统打开入口）
+        try:
+            if self._preview_path(path):
+                return
+        except Exception:
+            pass
+        self._open_system(path)
+
+    def _open_system(self, path):
+        """用系统默认程序打开（文件不存在时打开所在目录）。"""
         try:
             if os.path.exists(path):
                 os.startfile(path)
@@ -11908,6 +13690,156 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
             os.startfile(os.path.dirname(path))
         except Exception:
             self._flash_status(f"无法打开：{path}")
+
+    _PREVIEW_TEXT_EXTS = (
+        ".md", ".txt", ".log", ".ini", ".cfg", ".json",
+        ".py", ".js", ".css", ".yaml", ".yml", ".csv",
+    )
+    _PREVIEW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+
+    def _preview_path(self, path):
+        """路径是否可应用内预览（按扩展名分类；失败回退系统打开）。"""
+        try:
+            if not path or not os.path.isfile(path):
+                return False
+            low = str(path).lower()
+            if low.endswith(self._PREVIEW_IMAGE_EXTS):
+                return self._preview_image(path)
+            if low.endswith(self._PREVIEW_TEXT_EXTS):
+                return self._preview_text(path)
+        except Exception:
+            logging.exception("应用内预览失败")
+        return False
+
+    def _preview_text(self, path):
+        """文本/Markdown 应用内预览：md 走 mdparse 渲染（样式/链接可点击），其余原样。"""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(200000)
+            if len(content) >= 200000:
+                content += "\n…[文件较大，已截断前 200000 字符]"
+        except Exception:
+            return False
+        t = self._theme()
+        scale = self._screen_scale()
+        dialog = tk.Toplevel(self.root, bg=t["panel"])
+        dialog.title(f"预览：{os.path.basename(path)}")
+        pw, ph = int(760 * scale), int(560 * scale)
+        dialog.geometry(self._center_geometry(pw, ph))
+        dialog.transient(self.root)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        head = tk.Frame(dialog, bg=t["panel"])
+        head.pack(fill="x", padx=14, pady=(10, 6))
+        self._restyle.append((head, "panel"))
+        self._lbl(head, path, role="label_sec", bg="panel", font=(MONO_FAMILY, 8),
+                  anchor="w").pack(side="left", fill="x", expand=True)
+        self._mk_button(head, "用系统程序打开",
+                        lambda: (dialog.destroy(), self._open_system(path)), fsz=9).pack(side="right")
+        wrap = tk.Frame(dialog, bg=t["panel"])
+        wrap.pack(fill="both", expand=True, padx=14, pady=(4, 12))
+        self._restyle.append((wrap, "panel"))
+        text = tk.Text(
+            wrap, wrap="word", bg=t["chat_bg"], fg=t["text"],
+            relief="flat", highlightthickness=0, font=(FONT_FAMILY, 10),
+            padx=14, pady=10, state="disabled",
+        )
+        sb = tk.Scrollbar(wrap, orient="vertical", command=text.yview, relief="flat", bd=0)
+        text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        self._preview_tags(text, t)
+        text.configure(state="normal")
+        if str(path).lower().endswith(".md"):
+            try:
+                dtext, spans, _links, _cbs = mdparse.render_markdown(content)
+                text.insert("1.0", dtext)
+                for a, b, st in spans:
+                    try:
+                        text.tag_add(st, f"1.0+{a}c", f"1.0+{b}c")
+                    except tk.TclError:
+                        pass
+            except Exception:
+                text.insert("1.0", content)
+        else:
+            text.insert("1.0", content)
+        text.configure(state="disabled")
+        return True
+
+    def _preview_tags(self, text, t):
+        """预览窗口的样式 tag（与聊天区渲染同款视觉）。"""
+        sizes = {"small": max(8, int(self.cfg.get("font_size", 10)) - 2)}
+        text.tag_configure("code", font=(MONO_FAMILY, 10), background=t["code_bg"], foreground=t["code_fg"])
+        text.tag_configure("code_lang", background=t["surface"], foreground=t["text_sec"],
+                           font=(MONO_FAMILY, sizes["small"]))
+        text.tag_configure("bold", font=(FONT_FAMILY, 10, "bold"))
+        text.tag_configure("italic", font=(FONT_FAMILY, 10, "italic"))
+        text.tag_configure("strike", overstrike=True, foreground=t["text_sec"])
+        text.tag_configure("quote", foreground=t["text_sec"], background=t.get("quote_bg", t["surface"]))
+        text.tag_configure("list", foreground=t["text"])
+        text.tag_configure("table", font=(MONO_FAMILY, 9), foreground=t["text"])
+        text.tag_configure("table_head", font=(FONT_FAMILY, 10, "bold"))
+        text.tag_configure("link", foreground=t["accent"], underline=True)
+        for i in range(1, 7):
+            text.tag_configure(f"h{i}", font=(FONT_FAMILY, max(11, 15 - i), "bold"))
+        text.tag_bind("link", "<Button-1>", self._on_preview_link_click)
+        text.tag_bind("link", "<Enter>", lambda e: text.configure(cursor="hand2"))
+        text.tag_bind("link", "<Leave>", lambda e: text.configure(cursor=""))
+
+    def _on_preview_link_click(self, event):
+        """预览窗链接点击：仅放行 http(s)。"""
+        text = event.widget
+        try:
+            index = text.index(f"@{event.x},{event.y}")
+            rng = text.tag_prevrange("link", f"{index}+1c")
+            if not rng:
+                return
+            url = text.get(rng[0], rng[1])
+        except tk.TclError:
+            return
+        if url.startswith(("http://", "https://")):
+            webbrowser.open(url)
+        else:
+            self._flash_status(f"已阻止非 http(s) 链接：{url[:40]}", 2000)
+
+    def _preview_image(self, path):
+        """图片应用内预览：等比缩放适配窗口（最大 800x600）。"""
+        try:
+            from PIL import Image as _PILImage, ImageTk as _PILImageTk
+        except ImportError:
+            return False  # 无 Pillow 回退系统打开
+        try:
+            img = _PILImage.open(path)
+            img.load()
+        except Exception:
+            return False
+        t = self._theme()
+        scale = self._screen_scale()
+        dialog = tk.Toplevel(self.root, bg=t["panel"])
+        dialog.title(f"预览：{os.path.basename(path)}")
+        dialog.transient(self.root)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        w, h = img.size
+        max_w, max_h = int(900 * scale), int(650 * scale)
+        if w > max_w or h > max_h:
+            r = min(max_w / w, max_h / h)
+            img = img.resize((max(1, int(w * r)), max(1, int(h * r))), _PILImage.LANCZOS)
+        try:
+            photo = _PILImageTk.PhotoImage(img)
+        except Exception:
+            dialog.destroy()
+            return False
+        dialog.geometry(f"{img.width + 40}x{img.height + 100}")
+        label = tk.Label(dialog, image=photo, bg=t["panel"])
+        label.image = photo  # 防 GC 回收
+        label.pack(padx=10, pady=(10, 0))
+        foot = tk.Frame(dialog, bg=t["panel"])
+        foot.pack(fill="x", padx=14, pady=(6, 10))
+        self._restyle.append((foot, "panel"))
+        self._lbl(foot, f"{os.path.basename(path)} · {w}x{h}",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left")
+        self._mk_button(foot, "用系统程序打开",
+                        lambda: (dialog.destroy(), self._open_system(path)), fsz=9).pack(side="right")
+        return True
 
     def _on_link_click(self, event):
         text = self.chat_text
@@ -12308,58 +14240,15 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         else:
             messagebox.showerror("导出失败", detail)
 
-    def edit_system_prompt(self):
-        t = self._theme()
-        sizes = self._font_sizes()
-        dialog, body, footer = self._dialog_shell(
-            "系统提示词", 640, 440,
-            subtitle="保持固定可最大化上下文缓存命中率（降低成本）；修改会重建前缀缓存",
-        )
-        text = tk.Text(
-            body,
-            wrap="word",
-            font=(FONT_FAMILY, sizes["base"]),
-            bg=t["input_bg"],
-            fg=t["input_fg"],
-            insertbackground=t["input_fg"],
-            selectbackground=t["selection"],
-            selectforeground=t["accent_text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=t["border"],
-            highlightcolor=t["accent"],
-            padx=12,
-            pady=10,
-        )
-        text.pack(fill="both", expand=True)
-        text.insert("1.0", self.cfg["system_prompt"])
-
-        def save():
-            new_prompt = text.get("1.0", "end").strip()
-            if (
-                new_prompt != self.cfg["system_prompt"]
-                and len(self.messages) > 1
-                and not self.cfg.get("privacy_mode")
-            ):
-                if not messagebox.askyesno(
-                    "缓存提示",
-                    "修改系统提示词会破坏前缀缓存（缓存命中 0.02 元 vs 未命中 "
-                    "1 元/百万 tokens），并影响所有会话。\n"
-                    "建议保持固定提示词，如需新提示词可新建会话后修改。\n仍要修改吗？",
-                ):
-                    return
-            self.cfg["system_prompt"] = new_prompt
-            if self.messages:
-                self.messages[0]["content"] = self.cfg["system_prompt"]
-            save_config(self.cfg)
-            dialog.destroy()
-
-        def restore_default():
-            text.delete("1.0", "end")
-            text.insert("1.0", DEFAULT_SYSTEM_PROMPT)
-
-        self._footer_btn(footer, "恢复默认", restore_default)
-        self._footer_btn(footer, "保存", save, primary=True)
+    def _cache_cost_hint(self):
+        """缓存成本提示（按当前模型高峰价动态生成，配合 V4 正式版峰谷定价）。"""
+        try:
+            model = self.cfg.get("model") or "deepseek-v4-flash"
+            p = stats.pricing().get(model, stats.DEFAULT_PRICE)
+            hit, miss = p.get("cache_hit", 0.1), p.get("prompt", 3.0)
+            return f"缓存命中 {hit:.2f} 元 vs 未命中 {miss:.2f} 元/百万 tokens（高峰价）"
+        except Exception:
+            return "缓存命中 0.10 元 vs 未命中 3.00 元/百万 tokens（高峰价）"
 
     def on_enter(self, event):
         if event.state & 0x0001:
@@ -12369,6 +14258,19 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         return "break"
 
     def on_close(self):
+        # 关闭时最小化到托盘（托盘退出走 _quit_from_tray 绕过拦截；
+        # 托盘线程异常退出后不再拦截，避免窗口被隐藏后无法恢复）
+        if (
+            not getattr(self, "_quit_from_tray", False)
+            and self.cfg.get("minimize_to_tray")
+            and self._tray_alive()
+        ):
+            try:
+                self.root.withdraw()
+                self._flash_status("已最小化到系统托盘（右键托盘图标可退出）", 2500)
+                return
+            except tk.TclError:
+                pass  # 托盘拦截失败则继续正常退出流程
         if self.busy:
             if not messagebox.askyesno(
                 "正在生成", "当前正在生成回复，确定退出吗？（未完成的回复不会保存）"
@@ -12447,6 +14349,7 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
                 pass
         if not self.cfg.get("privacy_mode"):
             write_clean_exit_flag()
+        self._stop_tray()
         self.root.destroy()
 
 
@@ -12533,6 +14436,7 @@ def _apply_dpi_scaling(root):
 
 
 def main():
+    _t_start = time.perf_counter()
     _enable_dpi_awareness()
     if not single_instance_lock():
         messagebox.showwarning(
@@ -12563,6 +14467,7 @@ def main():
         root.after(600, splash.fade_out)
     root.deiconify()
     root.mainloop()
+    logging.info("鲸语退出，本次运行时长 %.1fs", time.perf_counter() - _t_start)
 
 
 if __name__ == "__main__":

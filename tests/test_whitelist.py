@@ -168,9 +168,8 @@ class TestReadonlyStmt(unittest.TestCase):
 
 class TestSSRFGuard(unittest.TestCase):
     def test_private_hosts_blocked(self):
+        """内网/元数据/非 http 协议仍阻止；回环默认放行（本地开发验证）。"""
         for url in (
-            "http://127.0.0.1/admin",
-            "http://localhost:8080",
             "http://10.0.0.5/x",
             "http://192.168.1.1/",
             "http://172.16.3.4/",
@@ -178,14 +177,74 @@ class TestSSRFGuard(unittest.TestCase):
             "file:///C:/Windows/win.ini",
         ):
             self.assertTrue(dc._safe_url(url), url)
+        for url in ("http://127.0.0.1/admin", "http://localhost:8080"):
+            self.assertEqual(dc._safe_url(url), "", url)
 
     def test_public_hosts_allowed(self):
         for url in ("https://api.deepseek.com", "http://example.com/a", "https://www.baidu.com"):
             self.assertEqual(dc._safe_url(url), "", url)
 
     def test_fetch_url_blocks_private(self):
-        out = dc.fetch_url("http://127.0.0.1:1234/")
+        out = dc.fetch_url("http://10.0.0.5:1234/")
         self.assertIn("SSRF", out) or self.assertIn("阻止", out)
+
+
+class TestArrayItemsSchema(unittest.TestCase):
+    """修复：array 参数缺 items 导致 API 400（missing field 'items'）。"""
+
+    def test_all_builtin_arrays_have_items(self):
+        """内置工具所有 array 参数均带 items（深层递归）。"""
+        def check(node, path, out):
+            if not isinstance(node, dict):
+                return
+            if node.get("type") == "array" and "items" not in node:
+                out.append(path)
+            for k, v in node.items():
+                if isinstance(v, (dict, list)):
+                    check(v, f"{path}.{k}", out)
+
+        bad = []
+        for t in dc.TOOLS:
+            check(t["function"].get("parameters", {}), t["function"]["name"], bad)
+        self.assertEqual(bad, [])
+
+    def test_patch_fills_missing_items(self):
+        """兜底：自定义工具/插件工具缺 items 时自动补齐（防 400）。"""
+        tool = {
+            "function": {
+                "name": "my_tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "rows": {"type": "array"},
+                        "nested": {
+                            "type": "object",
+                            "properties": {"tags": {"type": "array"}},
+                        },
+                    },
+                },
+            }
+        }
+        dc._patch_array_items([tool])
+        props = tool["function"]["parameters"]["properties"]
+        self.assertIn("items", props["rows"])
+        self.assertIn("items", props["nested"]["properties"]["tags"])
+
+    def test_patch_keeps_existing_items(self):
+        """已有 items 的 array 不被覆盖。"""
+        tool = {
+            "function": {
+                "name": "t",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"tasks": {"type": "array", "items": {"type": "string"}}},
+                },
+            }
+        }
+        dc._patch_array_items([tool])
+        self.assertEqual(
+            tool["function"]["parameters"]["properties"]["tasks"]["items"], {"type": "string"}
+        )
 
 
 class TestRunPythonGuard(unittest.TestCase):

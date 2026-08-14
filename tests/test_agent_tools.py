@@ -386,5 +386,298 @@ class TestAskUserInChat(unittest.TestCase):
         self.assertIn("无法询问用户", msgs[-2]["content"])
 
 
+class TestTruncationDetection(unittest.TestCase):
+    """修复回归：生成被截断/中断时 chat() 必须通过 on_truncated 告知 UI，
+    不得静默返回 True 让 UI 误报「任务完成」（此前 max_tokens 截断即静默完成）。"""
+
+    def setUp(self):
+        self.client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        self.client.client.chat.completions.create = mock.MagicMock()
+
+    @staticmethod
+    def _stream(content="", finish_reason=None, tool_calls=None):
+        c_val = content or None
+        fr_val = finish_reason
+        tc_val = tool_calls
+
+        class D:
+            reasoning_content = None
+            content = c_val
+            tool_calls = tc_val
+
+        class C:
+            delta = D()
+            finish_reason = fr_val
+            choices = [type("CC", (), {"delta": D(), "finish_reason": fr_val})()]
+
+        class S(list):
+            usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1})()
+
+        return S([C()])
+
+    def test_length_finish_reason_notifies(self):
+        """输出达 max_tokens 上限（finish_reason=length）→ on_truncated 被调用。"""
+        self.client.client.chat.completions.create.return_value = self._stream(
+            content="前半段回复", finish_reason="length"
+        )
+        reasons = []
+        msgs = [{"role": "user", "content": "hi"}]
+        result = self.client.chat(msgs, on_truncated=reasons.append)
+        self.assertTrue(result)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("截断", reasons[0])
+
+    def test_normal_stop_no_notify(self):
+        """正常结束（finish_reason=stop）→ on_truncated 不被调用。"""
+        self.client.client.chat.completions.create.return_value = self._stream(
+            content="完整回复", finish_reason="stop"
+        )
+        reasons = []
+        msgs = [{"role": "user", "content": "hi"}]
+        result = self.client.chat(msgs, on_truncated=reasons.append)
+        self.assertTrue(result)
+        self.assertEqual(reasons, [])
+
+    @staticmethod
+    def _tool(tc_id, name, args="{}"):
+        return type("T", (), {
+            "index": 0,
+            "id": tc_id,
+            "function": type("F", (), {"name": name, "arguments": args})(),
+        })()
+
+    def test_incomplete_tool_calls_notify(self):
+        """工具调用流被截断（缺 id/name）→ on_truncated 被调用且不执行工具。"""
+        self.client.client.chat.completions.create.return_value = self._stream(
+            tool_calls=[self._tool("", "write_file")]
+        )
+        reasons = []
+        msgs = [{"role": "user", "content": "hi"}]
+        result = self.client.chat(msgs, tools_enabled=True, on_truncated=reasons.append)
+        self.assertFalse(result)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("截断", reasons[0])
+        self.assertNotIn("tool_calls", msgs[-1])  # 悬空 tool_call 被移除
+
+    def test_rounds_exhausted_notify(self):
+        """工具轮数耗尽 → on_truncated 被调用（此前静默返回 True）。"""
+        # 每轮都返回工具调用（永远不结束）→ for 循环自然耗尽
+        self.client.client.chat.completions.create.return_value = self._stream(
+            tool_calls=[self._tool("c1", "get_date")]
+        )
+        reasons = []
+        msgs = [{"role": "user", "content": "hi"}]
+        with mock.patch("deepseek_client.TOOL_CALL_MAP", {"get_date": lambda: "ok"}):
+            result = self.client.chat(msgs, tools_enabled=True, max_tool_rounds=2, on_truncated=reasons.append)
+        self.assertTrue(result)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("轮数已达上限", reasons[0])
+
+    def test_auto_simple_task_no_reasoning_effort(self):
+        """V4 正式版适配：auto 档判定为简单任务时关闭思考，
+        不得传 reasoning_effort='none'（非法参数），改走采样参数路径。"""
+        self.client.client.chat.completions.create.return_value = self._stream(content="你好", finish_reason="stop")
+        captured = {}
+
+        def fake_create(**kw):
+            captured.update(kw)
+            return self.client.client.chat.completions.create.return_value
+
+        self.client.client.chat.completions.create.side_effect = fake_create
+        with mock.patch("deepseek_client._auto_effort", return_value="none"):
+            self.client.chat([{"role": "user", "content": "你好"}], thinking="auto", tools_enabled=False)
+        self.assertNotIn("reasoning_effort", captured)
+        self.assertIn("temperature", captured)
+
+    def test_ga_thinking_levels_passthrough(self):
+        """正式版思考档位 low/high/max 直接透传。"""
+        for level in ("low", "high", "max"):
+            self.client.client.chat.completions.create.return_value = self._stream(content="x", finish_reason="stop")
+            captured = {}
+            self.client.client.chat.completions.create.side_effect = (
+                lambda **kw: (captured.update(kw) or self.client.client.chat.completions.create.return_value)
+            )
+            self.client.chat([{"role": "user", "content": "hi"}], thinking=level, tools_enabled=False)
+            self.assertEqual(captured.get("reasoning_effort"), level, level)
+
+    def test_effort_mapping_medium_xhigh(self):
+        """官方映射：medium→high · xhigh→high（此前 xhigh→max 是错误假设）。"""
+        for level, expected in (("medium", "high"), ("xhigh", "high")):
+            self.client.client.chat.completions.create.return_value = self._stream(content="x", finish_reason="stop")
+            captured = {}
+            self.client.client.chat.completions.create.side_effect = (
+                lambda **kw: (captured.update(kw) or self.client.client.chat.completions.create.return_value)
+            )
+            self.client.chat([{"role": "user", "content": "hi"}], thinking=level, tools_enabled=False)
+            self.assertEqual(captured.get("reasoning_effort"), expected, level)
+
+
+class TestReasoningCostOptimization(unittest.TestCase):
+    """超越官方开箱体验：无工具轮次剥离思考内容（省输入 token）+ 缓存友好布局 + trailing 注入。"""
+
+    def setUp(self):
+        self.client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        self.client.client.chat.completions.create = mock.MagicMock()
+
+    @staticmethod
+    def _stream(content="", finish_reason="stop", tool_calls=None):
+        c_val = content or None
+        fr_val = finish_reason
+        tc_val = tool_calls
+
+        class D:
+            reasoning_content = None
+            content = c_val
+            tool_calls = tc_val
+
+        class C:
+            delta = D()
+            finish_reason = fr_val
+            choices = [type("CC", (), {"delta": D(), "finish_reason": fr_val})()]
+
+        class S(list):
+            usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1})()
+
+        return S([C()])
+
+    def _capture(self):
+        captured = {}
+        self.client.client.chat.completions.create.side_effect = (
+            lambda **kw: (captured.update(kw) or self.client.client.chat.completions.create.return_value)
+        )
+        return captured
+
+    def test_no_tool_round_reasoning_pruned(self):
+        """历史中无工具调用的 assistant 轮次：发送时剥离 reasoning_content（API 忽略，省 token）。"""
+        self.client.client.chat.completions.create.return_value = self._stream(content="好", finish_reason="stop")
+        captured = self._capture()
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "答1", "reasoning_content": "思考了5000字"},  # 无工具 → 应剥离
+            {"role": "user", "content": "q2"},
+        ]
+        self.client.chat(msgs, tools_enabled=False)
+        sent = captured["messages"]
+        sent_assistant = [m for m in sent if m.get("role") == "assistant"]
+        self.assertEqual(len(sent_assistant), 1)
+        self.assertNotIn("reasoning_content", sent_assistant[0])
+        # 内存中的原始历史不被破坏（UI/存档仍需 reasoning）
+        self.assertEqual(msgs[2]["reasoning_content"], "思考了5000字")
+
+    def test_tool_round_reasoning_kept(self):
+        """带工具调用的轮次：reasoning_content 必须完整回传（官方要求，缺失会 400）。"""
+        self.client.client.chat.completions.create.return_value = self._stream(content="好", finish_reason="stop")
+        captured = self._capture()
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": None, "reasoning_content": "先查日期",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "get_date", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "2026-08-13"},
+            {"role": "user", "content": "q2"},
+        ]
+        self.client.chat(msgs, tools_enabled=False)
+        sent = captured["messages"]
+        sent_assistant = [m for m in sent if m.get("role") == "assistant"]
+        self.assertEqual(len(sent_assistant), 1)
+        self.assertEqual(sent_assistant[0].get("reasoning_content"), "先查日期")
+
+    def test_cache_friendly_layout(self):
+        """缓存友好布局：恒定的 json_hint 在前，可变的记忆注入在末尾（前缀稳定）。"""
+        self.client.client.chat.completions.create.return_value = self._stream(
+            content='{"ok": 1}', finish_reason="stop"
+        )
+        captured = self._capture()
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "q1"}]
+        self.client.chat(msgs, json_output=True, memory_text="记忆内容（可能变）", tools_enabled=False)
+        sent = captured["messages"]
+        roles = [m.get("role") for m in sent]
+        contents = [m.get("content") for m in sent]
+        self.assertEqual(contents[0], dc.JSON_HINT_MESSAGE)   # json_hint 恒定在最前
+        # 记忆注入在末尾（此后仅追加模型回复）
+        self.assertEqual(sent[-1]["content"], "记忆内容（可能变）")
+        self.assertEqual(roles.count("system"), 3)
+
+    def test_trailing_text_appended_to_user(self):
+        """动态注入（trailing_text）追加到最近一条 user 消息尾部，不污染历史。"""
+        self.client.client.chat.completions.create.return_value = self._stream(content="好", finish_reason="stop")
+        captured = self._capture()
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "q1"}]
+        self.client.chat(msgs, trailing_text="[动态] 项目上下文摘要", tools_enabled=False)
+        sent = captured["messages"]
+        last_user = [m for m in sent if m.get("role") == "user"][-1]
+        self.assertIn("[动态] 项目上下文摘要", last_user["content"])
+        # 内存历史中的 user 消息不被污染（chat 只会在末尾追加模型回复）
+        users = [m for m in msgs if m.get("role") == "user"]
+        self.assertEqual(users[-1]["content"], "q1")
+
+
+class TestJsonOutputSelfRetry(unittest.TestCase):
+    """超越官方开箱体验：JSON 输出自校验，解析失败自动修正重试一次。"""
+
+    def setUp(self):
+        self.client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        self.client.client.chat.completions.create = mock.MagicMock()
+
+    @staticmethod
+    def _stream(content="", finish_reason="stop"):
+        c_val = content or None
+        fr_val = finish_reason
+
+        class D:
+            reasoning_content = None
+            content = c_val
+            tool_calls = None
+
+        class C:
+            delta = D()
+            finish_reason = fr_val
+            choices = [type("CC", (), {"delta": D(), "finish_reason": fr_val})()]
+
+        class S(list):
+            usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                   "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1})()
+
+        return S([C()])
+
+    def test_invalid_json_retried_with_fix_prompt(self):
+        """第一次输出非法 JSON → 自动修正重试 → 第二次合法 → 成功。"""
+        calls = []
+
+        def fake_create(**kw):
+            calls.append(kw["messages"])
+            n = len(calls)
+            if n == 1:
+                return self._stream(content='{"a": 未闭合', finish_reason="stop")
+            return self._stream(content='{"a": 1}', finish_reason="stop")
+
+        self.client.client.chat.completions.create.side_effect = fake_create
+        reasons = []
+        msgs = [{"role": "user", "content": "给我 JSON"}]
+        result = self.client.chat(msgs, json_output=True, tools_enabled=False, on_truncated=reasons.append)
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        # 修正提示被追加进第二轮的请求
+        self.assertIn("无法解析为合法 JSON", calls[1][-1]["content"])
+        self.assertIn("JSON 输出解析失败", reasons[0])
+
+    def test_valid_json_no_retry(self):
+        self.client.client.chat.completions.create.return_value = self._stream(
+            content='{"a": 1}', finish_reason="stop"
+        )
+        calls = []
+        self.client.client.chat.completions.create.side_effect = (
+            lambda **kw: (calls.append(1) or self.client.client.chat.completions.create.return_value)
+        )
+        msgs = [{"role": "user", "content": "给我 JSON"}]
+        result = self.client.chat(msgs, json_output=True, tools_enabled=False)
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

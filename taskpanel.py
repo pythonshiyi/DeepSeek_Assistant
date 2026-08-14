@@ -8,6 +8,8 @@
 import time
 import tkinter as tk
 
+from shared import PATH_RE
+
 FONT_FAMILY = "Microsoft YaHei UI"
 
 PANEL_W = 400
@@ -334,18 +336,8 @@ class TaskPanel:
             self._hide_after = None
 
 
-_PATH_RE = None
-
-
 def _count_paths(text):
-    global _PATH_RE
-    if _PATH_RE is None:
-        import re
-
-        _PATH_RE = re.compile(
-            r"[A-Za-z]:[\\/][^\s'\"()<>|,;（）【】《》，。、；：？！]+"
-        )
     try:
-        return sum(1 for _ in _PATH_RE.finditer(text or ""))
+        return sum(1 for _ in PATH_RE.finditer(text or ""))
     except Exception:
         return 0

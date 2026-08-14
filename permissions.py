@@ -78,6 +78,8 @@ ACTION_TOOLS = (
     "qrcode",
     "media_ffmpeg",
     "webdav",
+    # ===== 插件工坊（AI 安装插件 = 新增能力，走审批） =====
+    "create_plugin",
 )
 
 
@@ -219,7 +221,7 @@ def check_filesystem(path, write=False):
     if write and not _data["filesystem"].get("allow_write", False) and not FULL_AUTO:
         return (
             False,
-            "权限拒绝：写文件未开启（工具菜单 → 权限设置 → filesystem.allow_write）。"
+            "权限拒绝：写文件未开启（🛠 工具中心 → 权限 → filesystem.allow_write）。"
             "如需授权，可调用 request_permission(action_type='write') 一键开启",
         )
     blocked = _cached_dirs("blocked", _data["filesystem"].get("blocked_dirs"))
@@ -248,7 +250,7 @@ def check_shell(command):
     if not _data or (not _data["shell"].get("allow_run_command", False) and not FULL_AUTO):
         return (
             False,
-            "权限拒绝：终端执行未开启（工具菜单 → 权限设置 → shell.allow_run_command）。"
+            "权限拒绝：终端执行未开启（🛠 工具中心 → 权限 → shell.allow_run_command）。"
             "如需授权，可调用 request_permission(action_type='command') 请求开启",
             None,
         )
