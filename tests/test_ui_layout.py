@@ -5,8 +5,17 @@ import json
 import os
 import sys
 import tempfile
-import tkinter as tk
 import unittest
+
+# tkinter 可用性探测：部分 CI 环境的 Tcl/Tk 运行库缺失，此时跳过而不是报错
+try:
+    import tkinter as tk
+
+    _probe = tk.Tk()
+    _probe.destroy()
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,6 +23,8 @@ import main as m
 
 
 def _make_app():
+    if not TK_AVAILABLE:
+        raise unittest.SkipTest("tkinter 不可用（缺少 Tcl/Tk 运行库）")
     tmpdir = tempfile.mkdtemp(prefix="dsa_layout_")
     m.CONFIG_PATH = os.path.join(tmpdir, "config.json")
     m.HISTORY_DIR = tmpdir

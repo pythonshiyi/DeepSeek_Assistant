@@ -4,8 +4,18 @@ import sys
 import tempfile
 import time
 import unittest
-import tkinter as tk
 from unittest import mock
+
+# tkinter 可用性探测：部分 CI 环境的 Tcl/Tk 运行库缺失（如 init.tcl 路径失效），
+# 此时跳过需要真实 Tk 实例的测试而不是报错
+try:
+    import tkinter as tk
+
+    _probe = tk.Tk()
+    _probe.destroy()
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,6 +25,8 @@ import main as m
 class PerfBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not TK_AVAILABLE:
+            raise unittest.SkipTest("tkinter 不可用（缺少 Tcl/Tk 运行库）")
         cls.tmpdir = tempfile.mkdtemp(prefix="dsa_perf_")
         m.CONFIG_PATH = os.path.join(cls.tmpdir, "config.json")
         m.HISTORY_DIR = cls.tmpdir
