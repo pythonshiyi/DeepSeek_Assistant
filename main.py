@@ -2005,7 +2005,8 @@ class AssistantApp:
                     self.side_panel.pack_forget()
             else:
                 if not self.side_panel.winfo_manager() and not self._manual_hidden.get("panel"):
-                    self.side_panel.pack(side="right", fill="y")
+                    # 与 toggle_side_panel 一致：恢复原始 pack 顺序，避免布局错乱
+                    self.side_panel.pack(side="right", fill="y", before=self.input_frame)
         except tk.TclError:
             pass
 
@@ -2014,7 +2015,11 @@ class AssistantApp:
             self.side_panel.pack_forget()
             self._manual_hidden["panel"] = True
         else:
-            self.side_panel.pack(side="right", fill="y")
+            # 用 before 恢复原始 pack 顺序（初始构建时 side_panel 先于 input_frame/handle/chat_frame
+            # 打包）：直接 pack 会把 side_panel 追加到 slave 列表末尾，pack 重新分配时
+            # 输入框（side=bottom）不再被右侧面板挤占而变宽，聊天区却被后 pack 的面板切窄，
+            # 表现为输入框大小变动 + 挤压右侧栏位置
+            self.side_panel.pack(side="right", fill="y", before=self.input_frame)
             self._manual_hidden["panel"] = False
 
     def toggle_sidebar(self):
