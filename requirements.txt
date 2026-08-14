@@ -20,3 +20,19 @@ pyzbar>=0.1.9
 diskcache>=5.6
 # 可选：音视频处理（media_ffmpeg，内置 ffmpeg 二进制）
 imageio-ffmpeg>=0.4.9
+# 可选：图片处理（image_process / image_understand / 屏幕截图）
+Pillow>=10.0
+# 可选：Office 文档（create_doc 的 .docx 支持 / docx_read）
+python-docx>=1.1.0
+# 可选：Excel 读写（read_excel / write_excel）
+openpyxl>=3.1.0
+# 可选：数据可视化图表（chart_data）
+matplotlib>=3.8.0
+# 可选：MySQL 只读查询（database_query_mysql）
+PyMySQL>=1.1.0
+# 可选：PostgreSQL 只读查询（database_query_postgres）
+psycopg2-binary>=2.9.0
+# 可选：本地语音转写（speech_to_text，faster-whisper）
+faster-whisper>=1.0.0
+# 可选：浏览器自动化（browser_navigate / web_screenshot / 有头预览；另需 playwright install chromium）
+playwright>=1.40.0

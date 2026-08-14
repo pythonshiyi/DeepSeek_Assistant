@@ -6079,7 +6079,7 @@ def rss_fetch(action="list", url="", limit=10, since_hours=24):
         published = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
         if published:
             try:
-                pub = _dt.utcfromtimestamp(calendar.timegm(published)).strftime("%Y-%m-%d %H:%M")
+                pub = _dt.fromtimestamp(calendar.timegm(published), _dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
             except Exception:
                 pub = ""
         summary = re.sub(r"<[^>]+>", " ", str(getattr(e, "summary", "") or getattr(e, "description", "")))
