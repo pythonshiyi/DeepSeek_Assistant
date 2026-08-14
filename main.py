@@ -439,7 +439,7 @@ DEFAULT_CONFIG = {
     "call_api_allowed_hosts": [],  # call_api 内网/回环白名单（精确主机名，建议 IP；如 ["127.0.0.1"]）
 }
 
-VERSION = "2.12.10"
+VERSION = "2.12.11"
 
 ROLES = {
     "通用助手": {
