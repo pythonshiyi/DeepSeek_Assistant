@@ -2352,7 +2352,8 @@ class AssistantApp:
         def _on_list_wheel(event):
             try:
                 if abs(event.delta) >= 120:
-                    self.session_list.yview_scroll(-int(event.delta / 120), "units")
+                    # 标准鼠标滚轮：每格滚动 3 行（Tk 默认步长），避免滚轮过于费力
+                    self.session_list.yview_scroll(-3 * int(event.delta / 120), "units")
                 else:
                     # 高精度触控板 delta < 120：按像素滚动，避免 int() 截断成死区
                     self.session_list.yview_scroll(-int(event.delta / 10), "pixels")
@@ -3082,7 +3083,8 @@ class AssistantApp:
         def on_wheel(event):
             try:
                 if abs(event.delta) >= 120:
-                    canvas.yview_scroll(-int(event.delta / 120), "units")
+                    # 标准鼠标滚轮：每格滚动 3 行（Tk 默认步长），避免滚轮过于费力
+                    canvas.yview_scroll(-3 * int(event.delta / 120), "units")
                 else:
                     # 高精度触控板 delta < 120：按像素滚动，避免 int() 截断成死区
                     canvas.yview_scroll(-int(event.delta / 10), "pixels")
@@ -4145,7 +4147,8 @@ class AssistantApp:
         def _on_chat_wheel(event):
             try:
                 if abs(event.delta) >= 120:
-                    text.yview_scroll(-int(event.delta / 120), "units")
+                    # 标准鼠标滚轮：每格滚动 3 行（Tk 默认步长），避免滚轮过于费力
+                    text.yview_scroll(-3 * int(event.delta / 120), "units")
                 else:
                     # 高精度触控板 delta < 120：按像素滚动，避免 int() 截断成死区
                     text.yview_scroll(-int(event.delta / 10), "pixels")
