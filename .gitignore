@@ -1,0 +1,23 @@
+# ===== 敏感信息（切勿提交） =====
+config.json
+测试秘钥.txt
+AI API.txt
+
+# ===== 运行时 / 用户数据 =====
+data/
+backups/
+evolutions/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# ===== 构建产物 =====
+dist/
+build/
+*.zip
+*.exe

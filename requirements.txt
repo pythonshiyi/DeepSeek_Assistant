@@ -1,0 +1,22 @@
+openai>=1.75.0
+httpx>=0.27.0
+# 可选：安装后可获得更精确的 token 估算（未安装时自动回退为字符估算）
+tiktoken>=0.7.0
+# 可选：拖拽文件到输入框（未安装时拖拽功能自动禁用）
+tkinterdnd2>=0.4.0
+# 可选：朗读回复（未安装时菜单项会提示安装）
+pywin32>=306
+# 可选：PDF 处理（pdf_extract / pdf_create，未安装时工具提示安装）
+PyMuPDF>=1.24
+reportlab>=4.0
+# 可选：Office 文档读取（docx_read / pptx_read；python-docx 已用于 create_doc）
+python-pptx>=0.6.23
+# 可选：RSS 聚合（rss_fetch）
+feedparser>=6.0
+# 可选：二维码（qrcode 生成；识别 pyzbar 需系统 zbar，缺失时降级提示）
+qrcode[pil]>=7.4
+pyzbar>=0.1.9
+# 可选：嵌入式 KV 存储（kv_store）
+diskcache>=5.6
+# 可选：音视频处理（media_ffmpeg，内置 ffmpeg 二进制）
+imageio-ffmpeg>=0.4.9
