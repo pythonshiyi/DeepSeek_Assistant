@@ -592,7 +592,10 @@ TASK_TEMPLATES = {
     ),
 }
 
-UPDATE_URL = ""  # 部署时填入发布信息 JSON 地址，如 "https://example.com/latest.json"
+# 更新源：默认指向 GitHub Releases（返回 {"tag_name": "v2.12.10", "html_url": ...}）。
+# 也兼容自定义 latest.json 格式 {"version": "...", "url": "..."}（见 check_for_update）；
+# config.json 的 update_url 优先于此处。
+UPDATE_URL = "https://api.github.com/repos/pythonshiyi/WhaleTalk/releases/latest"
 CLEAN_EXIT_FLAG = os.path.join(DATA_DIR, ".clean_exit")
 
 MAX_CONTEXT_TOKENS = 1_000_000
@@ -1998,9 +2001,15 @@ class AssistantApp:
                 resp = _dc._http_client().get(url, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
-                latest = str(data.get("version", "")).strip()
+                # GitHub Releases: tag_name（"v2.12.10"）; 自定义源: version
+                latest = str(
+                    data.get("version") or data.get("tag_name") or ""
+                ).strip().lstrip("v")
                 if latest:
-                    self._ui_queue.put(("update", (latest, str(data.get("url", "") or ""))))
+                    self._ui_queue.put((
+                        "update",
+                        (latest, str(data.get("url") or data.get("html_url") or "")),
+                    ))
             except Exception as e:
                 logging.warning("检查更新失败: %s", e)
                 if manual:

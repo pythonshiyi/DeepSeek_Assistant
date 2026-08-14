@@ -1,7 +1,7 @@
 # 🐋 鲸语 WhaleTalk · AI 对话助手 / AI Desktop Assistant
 
-[![CI](https://github.com/pythonshiyi/DeepSeek_Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/pythonshiyi/DeepSeek_Assistant/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/pythonshiyi/DeepSeek_Assistant?color=blue)](https://github.com/pythonshiyi/DeepSeek_Assistant/releases)
+[![CI](https://github.com/pythonshiyi/WhaleTalk/actions/workflows/ci.yml/badge.svg)](https://github.com/pythonshiyi/WhaleTalk/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/pythonshiyi/WhaleTalk?color=blue)](https://github.com/pythonshiyi/WhaleTalk/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
 
