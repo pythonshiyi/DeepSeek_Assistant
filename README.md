@@ -1,8 +1,20 @@
-# 鲸语 WhaleTalk · AI 对话助手
+# 🐋 鲸语 WhaleTalk · AI 对话助手 / AI Desktop Assistant
 
-基于 DeepSeek V4 API 深度优化的 Windows 桌面 AI 对话助手，充分发挥 V4 的 Agent 能力、1M 上下文与性价比优势。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
+> **中文为主 · English follows**（完整中文介绍 + 完整英文简介）
 
-## 品牌
+**鲸语 WhaleTalk** 是一款基于 DeepSeek V4 API 深度优化的 Windows 桌面 AI 对话助手，充分发挥 V4 的 Agent 能力、1M 上下文与性价比优势。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
+
+*WhaleTalk is a Windows desktop AI assistant deeply optimized for the DeepSeek V4 API, unleashing its full Agent capabilities, 1M-token context, and cost-performance advantages. WhaleTalk is an independent product brand with no affiliation to DeepSeek.*
+
+## 目录 / Table of Contents
+
+- [中文介绍（完整）](#中文介绍完整)
+- [English Introduction (Full)](#english-introduction-full)
+- [品牌与关注 / Follow Us](#品牌与关注--follow-us)
+
+## 中文介绍（完整）
+
+### 品牌
 
 - 中文名：鲸语（寓意"深海鲸歌对话"），英文名：WhaleTalk
 - 品牌视觉：深海蓝渐变 + 蓝鲸徽标（启动界面、应用图标同一视觉家族）
@@ -377,3 +389,72 @@ WhaleTalk/（项目目录名可自行更改，程序不依赖目录名）
 ├── app.ico              # 应用图标（自动生成）
 └── README.md
 ```
+
+---
+
+## English Introduction (Full)
+
+### 🐋 WhaleTalk — AI Desktop Assistant (DeepSeek V4)
+
+WhaleTalk (Chinese: 鲸语, "Whale Song") is a **Windows desktop AI chat assistant** built and deeply optimized around the **DeepSeek V4 API**. It turns V4's agentic power, 1M-token context window, and peak/off-peak pricing into a polished, commercial-grade desktop experience. **WhaleTalk is an independent product brand and has no affiliation with DeepSeek.**
+
+### Highlights
+
+- **Commercial-grade 3-column layout**: session list · chat area · collapsible settings panel, fully theme-aware (light / pure-black dark), draggable dividers, compact-mode auto-collapse on narrow windows.
+- **Streaming everything**: thoughts, tool calls, and Markdown render live with 40ms batched rendering; incomplete cross-chunk markers are held until generation finishes.
+- **Agent tool system (80+ built-in tools)**: date/weather, web search (Bing + DuckDuckGo fallback), page fetching, file read/write/edit, sandboxed Python (`run_python`), terminals, databases (SQLite/MySQL/PostgreSQL, read-only by default), CSV/Excel, charts, PDF/DOCX/PPTX, RSS, QR codes, KV store, WebDAV, ffmpeg media, image generation/OCR/understanding, screen capture, TTS/STT, email, webhooks, scheduled & cron tasks, parallel subagents, and more — each individually toggleable.
+- **Smart permission & audit model**: whitelist + approval flow (auto/confirm/deny) + audit logs, path-traversal and SSRF protection; **🤖 Full-Auto Mode** lets the AI complete tasks end-to-end without approval prompts while system blocklists and audit logs stay active.
+- **Self-evolution 🧬**: WhaleTalk inspects its own codebase, writes improvement proposals (never modifying original files), one-click adoption with `.evobak` rollback, self-review reports, and feature-suggestion documents for your development AI.
+- **WeChat Writer ✍**: RSS-driven AI article writing (9 source groups → relevance filtering → LLM topic selection → 3-stage writing → quality gate) — drafts only, publication stays in your hands.
+- **Smart context management**: dual character/token thresholds, LLM summarization of old turns, archived Markdown of trimmed content, 99% cache-hit optimization with peak-pricing awareness.
+- **Profiles & multi-account**: multiple API keys / base URLs / models with one-click switching; **API keys encrypted with Windows DPAPI**.
+- **Productivity**: scenario packs (Office/Dev/Creative), task templates, prompt library, character presets, command palette (Ctrl+K), batch tasks, session tags/favorites/branching, conversation export (MD/TXT/HTML/JSONL), usage & budget reports, session minutes, and a task execution panel with per-tool results, durations and pass/fail summaries.
+- **Self-healing & safety**: auto-retry with exponential backoff (429/network), empty-response retry, crash snapshot recovery, single-instance lock, atomic config writes, log rotation, and a privacy mode that persists nothing.
+
+### Installation
+
+```bash
+# Option 1: double-click start.bat (recommended, auto-creates venv)
+# Option 2:
+pip install -r requirements.txt
+python main.py
+# Option 3: double-click build_exe.bat → dist\WhaleTalk.exe (PyInstaller one-file)
+```
+
+Requires **Python 3.9+ and Windows 10/11**.
+
+### Configuration
+
+1. Apply for an API Key at https://platform.deepseek.com
+2. Paste it into the top "API Key" field on first launch (or edit `config.json`)
+
+Key `config.json` options: `model` (deepseek-v4-flash / deepseek-v4-pro), `scenario` (通用/编程/Agent/自定义), `thinking` (none/low/high/max/xhigh), `max_tokens`, `system_prompt` (keep fixed for max cache hits), context-compression thresholds, `monthly_budget`, `privacy_mode`, `theme`, JSON output, Beta API (prefix continuation + FIM), and `permissions.json` / `webhooks.json` / `db_config.json` / `email_config.json` for agent permissions, push channels, databases, and mail.
+
+> **Security note**: `config.json` contains your API Key (DPAPI-encrypted) — never share or commit it. Clear the key before packaging an exe.
+
+### Data Locations
+
+- Logs: `%USERPROFILE%\Documents\WhaleTalk\logs\assistant.log`
+- History: `%USERPROFILE%\Documents\WhaleTalk\history\` (latest session + lazy-loaded session library)
+- Archives / stats / user tools / prompts: under `%USERPROFILE%\Documents\WhaleTalk\`
+- Old-version data directories are auto-migrated on first launch.
+
+### Tech Stack
+
+Python (Tkinter GUI) · DeepSeek V4 API (OpenAI-compatible streaming) · tiktoken · PyInstaller · Playwright (optional browser automation) · faster-whisper (optional STT) · PyMuPDF/reportlab · diskcache · pyzbar · httpx
+
+---
+
+## 品牌与关注 / Follow Us
+
+**鲸语 WhaleTalk** 与 **微墨 WeMark** 由 **十一AIGC** 出品——专注 AI 工具与效率应用的独立创作者。
+
+更多 AI 玩法、工具教程与新品动态，欢迎关注公众号：
+
+> **📱 微信公众号：十一AIGC**
+
+*WhaleTalk and WeMark are crafted by **ShiYi AIGC (十一AIGC)**, an independent creator focused on AI tools and productivity apps. Follow our official WeChat account for more AI tips, tutorials, and product news.*
+
+如果你喜欢这个项目，欢迎 ⭐ Star、分享给朋友，或在评论区留下你的建议 —— 你的支持是我们持续更新的最大动力！
+
+*If you like this project, please ⭐ Star it, share it, and leave your feedback — your support keeps us shipping!*
