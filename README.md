@@ -62,14 +62,15 @@
 ### 🤖 Agent 智能体
 
 - **100+ 内置工具**，按 14 组分类管理，可单独启停
-  - 信息：多引擎联网搜索（num/翻页/时间/站点过滤）、GitHub 搜索、实时热点（Hacker News）、网页全文抓取（含被墙站点代理通道）、RSS 订阅
+  - 信息：多引擎联网搜索（num/翻页/时间/站点过滤，引擎健康度自动降级）、GitHub 仓库搜索（org:/language: 原生语法）、实时热点（Hacker News）、网页全文抓取（含被墙站点代理通道）、RSS 订阅（精选预置源）
   - 执行：沙箱 Python、终端命令、进程管理、pip 安装、代码工程创建
   - 数据：SQLite/MySQL/PostgreSQL、CSV/Excel、图表、KV 存储、WebDAV
   - 文档：PDF 提取/生成、Word/PPT 读取、二维码、音视频处理、图片生成/理解/OCR
   - 通讯：邮件收发、桌面通知、Webhook 推送/接收
   - 协作：并行子代理、任务检查点（断点续跑）、流程编排、工作流
-- **通用 API 调用**（call_api）：对接任意开放 API，支持自定义请求头/JSON 体（含内网白名单配置）
-- 任务质量闭环：先计划再执行、产物核验（杜绝"声称已建但目录为空"）、失败模式库、成功模式记忆
+  - 环境：系统资源自检（CPU/内存/磁盘/网络连通性）
+- **通用 API 调用**（call_api）：对接任意开放 API，支持自定义请求头/JSON 体（超时 180s/响应 500KB，内网白名单配置）
+- 任务质量闭环：先计划再执行、产物核验（杜绝"声称已建但目录为空"）、失败模式库、成功模式记忆、**自动经验复盘**（任务失败自动沉淀经验到长期记忆，跨会话规避已知坑）
 - 自主模式三态：🤖 完全智能（全自动）/ 💬 纯对话（零工具）/ 标准（按配置）
 - 权限模型：默认全关，白名单 + 审批流（auto/confirm/deny）+ 审计日志，路径防穿越、命令白名单、SSRF 防护
 
@@ -188,7 +189,7 @@ WhaleTalk (Chinese: 鲸语, "Whale Song") is a **Windows desktop AI chat assista
 ### Highlights
 
 - **🧩 Plugin system (`.wtplugin`)**: tools, skills, workflows, and scenarios bundled into a single shareable JSON file. The **Plugin Workshop** lets the AI generate and install a plugin from a natural-language request. Built-in gallery with 3 sample plugins.
-- **🤖 100+ Agent tools**: multi-engine web search (num/paging/time/site filters), GitHub search, Hacker News realtime, page fetching (incl. blocked-site proxy channel), RSS, sandboxed Python, terminals, files, databases, browser automation, email, media, and more — orchestrated automatically with self-healing on failure.
+- **🤖 100+ Agent tools**: multi-engine web search (num/paging/time/site filters, engine health auto-degradation), GitHub search (org:/language: syntax), Hacker News realtime, page fetching (incl. blocked-site proxy channel), RSS presets, sandboxed Python, terminals, files, databases, browser automation, email, media, system self-check (CPU/memory/disk/network), and more — orchestrated automatically with self-healing on failure. A universal **call_api** tool connects to any public API (custom headers/JSON, 180s timeout, 500KB response, explicit intranet whitelist). Auto-reflection persists failed-task lessons into long-term memory so the AI avoids known pitfalls across sessions.
 - **🧬 Self-evolution**: reads its own codebase, writes improvement proposals (never touching original files), self-review reports with one-click adoption and rollback.
 - **✍ WeChat Writer**: multi-source collection → topic selection → 3-stage writing → quality gate → local drafts (publication stays in your hands).
 - **💰 Cost engineering**: ~99% prefix-cache hit rate, thinking-cost stripping, off-peak scheduling, budget control.
