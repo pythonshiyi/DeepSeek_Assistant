@@ -5,7 +5,7 @@
 ## 0. 品牌与版本
 
 - 品牌：鲸语（APP_NAME），英文 WhaleTalk（APP_NAME_EN），见 main.py 顶部。**任何对外展示（窗口标题/启动界面/欢迎页/关于/exe 名/备份名/单实例锁名）一律使用品牌名，不出现官方品牌**；技术描述可写"基于 DeepSeek API"。
-- 版本：VERSION（当前 1.1.0），版本升级时同步 bump；备份脚本产物名 `WhaleTalk_v{version}_*.zip`；`build_exe.bat` 产物 `WhaleTalk.exe`；单实例锁 `Local\WhaleTalkAssistant`。
+- 版本：VERSION（当前 1.11.0），版本升级时同步 bump；备份脚本产物名 `WhaleTalk_v{version}_*.zip`；`build_exe.bat` 产物 `WhaleTalk.exe`；单实例锁 `Local\WhaleTalkAssistant`。
 
 ## 1. 项目概览
 
@@ -13,7 +13,7 @@ Windows 桌面聊天助手（Tkinter），品牌名「鲸语 WhaleTalk」（独�
 
 - 语言/运行时：Python 3.9+（开发环境 3.12），仅标准库 + `openai` + `tiktoken`
 - GUI：`tkinter`（ttk 混用），无第三方 UI 框架
-- 入口：`main.py`，`AssistantApp` 类（约 5000 行）承载全部 UI 逻辑
+- 入口：`main.py`，`AssistantApp` 类（约 12000 行）承载全部 UI 逻辑
 
 ## 2. 目录与模块职责
 

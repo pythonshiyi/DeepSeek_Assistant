@@ -1,5 +1,10 @@
 # 🐋 鲸语 WhaleTalk · AI 对话助手 / AI Desktop Assistant
 
+[![CI](https://github.com/pythonshiyi/DeepSeek_Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/pythonshiyi/DeepSeek_Assistant/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/pythonshiyi/DeepSeek_Assistant?color=blue)](https://github.com/pythonshiyi/DeepSeek_Assistant/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
+
 > **中文为主 · English follows**（完整中文介绍 + 完整英文简介）
 
 **鲸语 WhaleTalk** 是一款基于 DeepSeek V4 API 深度优化的 Windows 桌面 AI 对话助手，充分发挥 V4 的 Agent 能力、1M 上下文与性价比优势。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
@@ -10,6 +15,7 @@
 
 - [中文介绍（完整）](#中文介绍完整)
 - [English Introduction (Full)](#english-introduction-full)
+- [贡献指南 / Contributing](CONTRIBUTING.md)
 - [品牌与关注 / Follow Us](#品牌与关注--follow-us)
 
 ## 中文介绍（完整）
@@ -290,7 +296,7 @@ python main.py
 - 长会话惰性折叠：在 config.json 设置 fold_early_threshold（如 1200）后，早期消息自动折叠为提示行，点击展开
 - 导出历史：文件菜单「导出历史」选择目录，生成 session_时间戳 的 .md / .txt / .html / .jsonl 四份文件
 - 提示词模板中 {{TEXT}} 会被当前输入框内容替换
-- 检查更新：帮助菜单手动检查（需在 main.py 中配置 UPDATE_URL 发布源）
+- 检查更新：帮助菜单手动检查（更新源为 GitHub Releases，发现新版本自动备份当前源码后打开下载页）；也可在 config.json 开启 check_update 实现启动时自动检查
 - 深色主题下标题栏变黑需要 Win11 22H2+，或 Win10 系统「应用模式」为深色；否则标题栏保持系统默认色
 
 ## 版本备份

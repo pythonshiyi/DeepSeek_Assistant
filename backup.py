@@ -9,7 +9,6 @@ import argparse
 import datetime
 import os
 import re
-import sys
 import zipfile
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -83,7 +82,8 @@ def main():
     parser.add_argument("--prune", type=int, default=20, help="保留最近 N 个备份（默认 20）")
     args = parser.parse_args()
     print(f"当前版本：v{current_version()}")
-    path = make_backup()
+    bpath = make_backup()
+    print(f"备份完成：{bpath}")
     prune(args.prune)
     print("提示：备份包含 config.json（含 API Key），请勿外传备份文件。")
 

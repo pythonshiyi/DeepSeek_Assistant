@@ -277,7 +277,6 @@ def render_markdown(text, plain=False):
         out_len += len(seg)
 
     def emit_inline(ln, base_tag=None):
-        nonlocal out_len
         s = out_len
         text_, sp, lk = _inline(ln)
         emit(text_)

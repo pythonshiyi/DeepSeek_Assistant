@@ -1,0 +1,25 @@
+# 统一行尾与二进制标记（消除跨平台 CRLF/LF 抖动）
+* text=auto
+
+# 源码与文档：统一 LF（仓库内）
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+
+# Windows 批处理/脚本：保留 CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.zip binary
+*.exe binary

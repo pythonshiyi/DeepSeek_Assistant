@@ -586,7 +586,9 @@ TASK_TEMPLATES = {
     ),
 }
 
-UPDATE_URL = ""  # 部署时填入发布信息 JSON 地址，如 "https://example.com/latest.json"
+# 更新源：GitHub Releases（返回 {"tag_name": "v1.11.0", "html_url": ...}）。
+# 也兼容自定义 JSON 格式 {"version": "...", "url": "..."}（见 check_for_update）。
+UPDATE_URL = "https://api.github.com/repos/pythonshiyi/DeepSeek_Assistant/releases/latest"
 CLEAN_EXIT_FLAG = os.path.join(DATA_DIR, ".clean_exit")
 
 MAX_CONTEXT_TOKENS = 1_000_000
@@ -869,12 +871,12 @@ def _build_markdown(messages, usage_total, session_start, cfg):
         if role == "system":
             continue
         if role == "user":
-            lines += ["", f"## 用户", "", m.get("content") or ""]
+            lines += ["", "## 用户", "", m.get("content") or ""]
         elif role == "assistant":
             if m.get("reasoning_content"):
-                lines += ["", f"## 助手（思考过程）", "", "```text", m["reasoning_content"], "```"]
+                lines += ["", "## 助手（思考过程）", "", "```text", m["reasoning_content"], "```"]
             if m.get("content"):
-                lines += ["", f"## 助手", "", m["content"]]
+                lines += ["", "## 助手", "", m["content"]]
             for tc in m.get("tool_calls") or ():
                 if isinstance(tc, dict):
                     fn = tc.get("function") or {}
@@ -1890,9 +1892,15 @@ class AssistantApp:
                 resp = _dc._http_client().get(url, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
-                latest = str(data.get("version", "")).strip()
+                # GitHub Releases: tag_name（"v1.11.0"）；自定义源: version
+                latest = str(
+                    data.get("version") or data.get("tag_name") or ""
+                ).strip().lstrip("v")
                 if latest:
-                    self._ui_queue.put(("update", (latest, str(data.get("url", "") or ""))))
+                    self._ui_queue.put((
+                        "update",
+                        (latest, str(data.get("url") or data.get("html_url") or "")),
+                    ))
             except Exception as e:
                 logging.warning("检查更新失败: %s", e)
                 if manual:
@@ -1964,7 +1972,6 @@ class AssistantApp:
 
     def show_about(self):
         """关于对话框：品牌信息 + 能力一览（正式版品牌视觉）。"""
-        t = self._theme()
         dialog, body, footer = self._dialog_shell(
             f"关于 {APP_NAME} {APP_NAME_EN}", 460, 420, subtitle="深海蓝鲸 · 专业桌面 AI 工作台"
         )
@@ -7606,7 +7613,6 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
 
     def _show_ask_dialog(self, prompt, ev, box):
         """主线程：Agent 向用户提问的对话框。"""
-        t = self._theme()
         dialog, body, footer = self._dialog_shell(
             "Agent 询问", 480, 240, subtitle="助手需要向你确认："
         )
@@ -7755,7 +7761,6 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
 
     def _show_approval_dialog(self, name, args, ev, box):
         """主线程：AI 权限请求弹窗（允许/拒绝）。"""
-        t = self._theme()
         dialog, body, footer = self._dialog_shell(
             "AI 权限请求", 520, 260,
             subtitle=f"AI 请求调用工具「{name}」",
@@ -7791,7 +7796,6 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         self._watch_dialog_timeout(dialog, ev, permissions.approval_timeout())
 
     def edit_permissions(self):
-        t = self._theme()
         data = permissions.get_data()
         dialog, body, footer = self._dialog_shell(
             "权限设置", 540, 540,
@@ -8560,7 +8564,6 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
         return self._monthly_cost_cache
 
     def edit_budget(self):
-        t = self._theme()
         dialog, body, footer = self._dialog_shell(
             "预算设置", 380, 220,
             subtitle="状态栏实时显示本月费用：接近预算变黄 ⚠，超限变红 ⛔",
@@ -12293,7 +12296,6 @@ if (-not $engine) { '当前系统语言不支持 OCR' } else {
     def _show_export_done(self, payload):
         ok, detail = payload
         if ok:
-            t = self._theme()
             dialog, body, footer = self._dialog_shell(
                 "导出成功", 520, 300, subtitle="会话已导出（MD / TXT / HTML / JSONL）"
             )

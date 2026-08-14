@@ -11,9 +11,7 @@ import json
 import logging
 import os
 import shlex
-import subprocess
 import threading
-import time
 from datetime import datetime
 
 PERMISSIONS_PATH = None
@@ -315,7 +313,6 @@ def set_whitelist_callback(cb):
 
 def add_to_whitelist(action_type, value):
     """把操作加入白名单并保存。返回 (allowed, message)。"""
-    global _data
     atype = str(action_type or "").strip().lower()
     value = str(value or "").strip()
     if atype == "write":

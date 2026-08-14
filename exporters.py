@@ -44,14 +44,14 @@ def export_html(messages, path, title="鲸语 WhaleTalk 会话记录", model="",
         if role == "system":
             continue
         if role == "user":
-            parts.append(f"<div class='time'>用户</div>")
+            parts.append("<div class='time'>用户</div>")
             parts.append(f"<div class='msg user'>{_render_md_inline(content)}</div>")
         elif role == "assistant":
             reasoning = m.get("reasoning_content") or ""
             if reasoning:
-                parts.append(f"<div class='time'>助手 · 思考过程</div>")
+                parts.append("<div class='time'>助手 · 思考过程</div>")
                 parts.append(f"<div class='msg tool'>{html.escape(reasoning)}</div>")
-            parts.append(f"<div class='time'>助手</div>")
+            parts.append("<div class='time'>助手</div>")
             parts.append(f"<div class='msg'>{_render_md_inline(content)}</div>")
         elif role == "tool":
             parts.append(f"<div class='msg tool'>工具结果：{html.escape(str(content))}</div>")

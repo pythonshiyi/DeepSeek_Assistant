@@ -11,7 +11,6 @@ import sys
 
 from . import config as cfg_mod
 from . import history as hist_mod
-from . import llm as llm_mod
 from . import output as out_mod
 from . import quality as q_mod
 from . import sources as src_mod
