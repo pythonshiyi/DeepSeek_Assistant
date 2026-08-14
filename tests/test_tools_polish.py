@@ -417,7 +417,9 @@ class TestSearchWebFilter(unittest.TestCase):
             {"title": "恶意", "url": "javascript:alert(1)", "snippet": ""},
             {"title": "正常", "url": "https://example.com/a", "snippet": "说明"},
         ]
-        with mock.patch("deepseek_client._search_bing", return_value=results):
+        with mock.patch("deepseek_client._search_bing", return_value=results), \
+             mock.patch("deepseek_client._search_so360", return_value=[]), \
+             mock.patch("deepseek_client._search_duckduckgo", return_value=[]):
             out = dc.search_web("测试")
         self.assertNotIn("javascript", out)
         self.assertIn("正常", out)

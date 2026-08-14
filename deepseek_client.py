@@ -337,6 +337,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_github",
+            "description": "搜索 GitHub 开源仓库（按 Star 排序），适合找代码库/开源项目/技术实现参考",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词（如 deepseek api）"},
+                    "num": {"type": "integer", "description": "可选：返回条数（1-20，默认 5）"},
+                    "language": {"type": "string", "description": "可选：限定编程语言（如 python、javascript）"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     # ===== 只读查询（需文件在允许目录内）=====
     {
         "type": "function",
@@ -3312,6 +3328,76 @@ def _search_duckduckgo(query, num=SEARCH_MAX_RESULTS, since=""):
     return results
 
 
+_SO360_RESULT_RE = re.compile(
+    r'<h3[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S
+)
+
+
+def _search_so360(query, num=SEARCH_MAX_RESULTS):
+    """360 搜索：国内可达的稳定源（结果多、反爬弱），链接可能为 /link 加密跳转。"""
+    url = f"https://www.so.com/s?q={quote(query)}"
+    resp = _http_client().get(
+        url,
+        headers={"User-Agent": _SEARCH_UA, "Accept-Language": "zh-CN,zh;q=0.9"},
+        timeout=SEARCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    results = []
+    for m in _SO360_RESULT_RE.finditer(resp.text):
+        link, title_html = m.groups()
+        if link.startswith("javascript:"):
+            continue  # 置顶功能入口/推广位，非真实结果
+        title = _strip_tags(title_html).strip()
+        if not title:
+            continue
+        if link.startswith("/"):
+            link = "https://www.so.com" + link  # /link?m= 加密跳转补全
+        results.append({"title": title, "url": link, "snippet": ""})
+        if len(results) >= num:
+            break
+    return results
+
+
+# 搜索引擎注册表：(名称, 质量权重)。函数名为 "_search_<名称>"，调用时经
+# globals() 动态查找——测试可 mock.patch 模块属性替换实现。权重决定聚合
+# 输出顺序（数值大的优先展示）。实测结论：bing/so360 国内稳定；duckduckgo
+# 时好时坏（健康度机制自动跳过）；baidu/sogou/yandex 反爬；google 等不可达。
+_SEARCH_ENGINES = (
+    ("bing", 3),
+    ("so360", 2),
+    ("duckduckgo", 1),
+)
+
+# 引擎健康度：连续失败 3 次暂停 10 分钟，成功一次即恢复
+_SEARCH_HEALTH = {}  # name -> {"fails": int, "skip_until": float}
+_SEARCH_HEALTH_FAIL_LIMIT = 3
+_SEARCH_HEALTH_COOLDOWN = 600.0
+
+
+def _search_healthy(name):
+    h = _SEARCH_HEALTH.get(name)
+    if not h:
+        return True
+    if h["fails"] >= _SEARCH_HEALTH_FAIL_LIMIT:
+        if time.time() >= h.get("skip_until", 0):
+            h["fails"] = 0  # 冷却结束，重新尝试
+            return True
+        return False
+    return True
+
+
+def _search_report(name, ok):
+    h = _SEARCH_HEALTH.setdefault(name, {"fails": 0, "skip_until": 0.0})
+    if ok:
+        h["fails"] = 0
+    else:
+        h["fails"] += 1
+        if h["fails"] >= _SEARCH_HEALTH_FAIL_LIMIT:
+            h["skip_until"] = time.time() + _SEARCH_HEALTH_COOLDOWN
+            logger.warning("搜索源 %s 连续 %d 次失败，暂停 %d 分钟", name,
+                           _SEARCH_HEALTH_FAIL_LIMIT, _SEARCH_HEALTH_COOLDOWN // 60)
+
+
 def _search_dedup(results):
     """按规范化 URL 去重（去尾部斜杠/fragment），保留首次出现。"""
     seen, out = set(), []
@@ -3331,12 +3417,15 @@ def _search_safe(results):
 
 
 def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site=""):
-    """联网搜索：Bing + DuckDuckGo 并行聚合，支持条数/翻页/时间/站点过滤。
+    """联网搜索：多引擎并行聚合（bing/360/duckduckgo），支持条数/翻页/时间/站点过滤。
+
+    引擎健康度：连续失败 3 次的引擎自动暂停 10 分钟（进程内），可用引擎互补；
+    不可用/质量差的源（baidu/sogou/yandex 反爬、google 等不可达）不在注册表中。
 
     Args:
         query: 搜索关键词
         num: 返回条数（1-20，默认 5）
-        offset: 翻页偏移（0 起，如 5 表示第 6-10 条；DuckDuckGo 不支持翻页）
+        offset: 翻页偏移（0 起，如 5 表示第 6-10 条；仅 Bing 支持）
         since/until: 时间范围过滤（YYYY-MM-DD，可只给一端；DDG 仅支持 since）
         site: 限定站点域名（如 "openai.com"，自动追加 site:）
     """
@@ -3361,29 +3450,38 @@ def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site
     since = str(since or "").strip()
     until = str(until or "").strip()
 
-    # 双引擎并行（Bing 支持 offset/时间范围；DDG 支持 since），聚合互补
+    # 并行调用所有健康引擎；每引擎请求 num*2 条供聚合裁剪
     import concurrent.futures as _cf
 
-    def _run(fn, **kw):
+    def _run(entry):
+        name, _weight = entry
+        fn = globals().get("_search_" + name)  # 动态查找：支持测试 mock 替换
+        if fn is None:
+            return name, [], None
         try:
-            return fn(q, **kw)
+            kw = {"num": max(num, 10)}
+            if name == "bing":
+                kw.update(offset=offset, since=since, until=until)
+            elif name == "duckduckgo":
+                kw["since"] = since
+            results = fn(q, **kw)
+            return name, results, None
         except Exception as e:
-            return [("err", e)]
+            return name, [], e
 
-    with _cf.ThreadPoolExecutor(max_workers=2) as ex:
-        f_bing = ex.submit(_run, _search_bing, num=max(num, 10), offset=offset, since=since, until=until)
-        f_ddg = ex.submit(_run, _search_duckduckgo, num=max(num, 10), since=since)
-        bing = f_bing.result()
-        ddg = f_ddg.result()
+    engines = [e for e in _SEARCH_ENGINES if _search_healthy(e[0])]
+    with _cf.ThreadPoolExecutor(max_workers=len(engines) or 1) as ex:
+        outcomes = list(ex.map(_run, engines))
 
-    # 引擎结果先各自安全过滤；任一侧整体异常时记录但不中断
-    last_err = None
-    merged = []
-    for src in (bing, ddg):
-        if src and isinstance(src[0], tuple) and src[0][0] == "err":
-            last_err = src[0][1]
+    merged, last_err = [], None
+    for name, results, err in outcomes:
+        if err is not None or not results:
+            _search_report(name, False)
+            if err is not None:
+                last_err = err
             continue
-        merged.extend(_search_safe(src))
+        _search_report(name, True)
+        merged.extend(_search_safe(results))
     merged = _search_dedup(merged)[:num]
     if merged:
         lines = [f"搜索结果（{len(merged)} 条）:"]
@@ -3391,7 +3489,49 @@ def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site
             lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}".rstrip())
         return "\n\n".join(lines)
     detail = f": {last_err}" if last_err is not None else ""
-    return f"错误：搜索失败（两个搜索源均不可用{detail}）"
+    return f"错误：搜索失败（可用搜索源均不可用{detail}）"
+
+
+def search_github(query, num=5, language=""):
+    """GitHub 仓库搜索（代码/开源项目垂直源，实测国内可达）。
+
+    GitHub API 未认证限流 60 次/小时，适合低频垂直检索。
+    """
+    if not query or not str(query).strip():
+        return "错误：搜索词为空"
+    try:
+        num = max(1, min(20, int(num)))
+    except (TypeError, ValueError):
+        num = 5
+    q = str(query).strip()
+    if len(q) > 200:
+        return "错误：搜索词过长（上限 200 字符）"
+    language = str(language or "").strip()
+    if language:
+        if len(language) > 40 or not re.match(r"^[A-Za-z0-9+#.\-]+$", language):
+            return "错误：language 参数不合法"
+        q = f"{q} language:{language}"
+    try:
+        resp = _http_client().get(
+            "https://api.github.com/search/repositories",
+            params={"q": q, "per_page": num, "sort": "stars"},
+            headers={"Accept": "application/vnd.github+json", "User-Agent": _SEARCH_UA},
+            timeout=10,
+        )
+        if resp.status_code == 403:
+            return "错误：GitHub API 限流（每小时 60 次），请稍后再试"
+        resp.raise_for_status()
+        items = (resp.json() or {}).get("items") or []
+    except Exception as e:
+        return f"错误：GitHub 搜索失败: {e}"
+    if not items:
+        return "未找到相关仓库"
+    lines = [f"GitHub 仓库（{len(items)} 个，按 Star 排序）:"]
+    for i, it in enumerate(items, 1):
+        desc = (it.get("description") or "").strip()[:120]
+        stars = it.get("stargazers_count", 0)
+        lines.append(f"{i}. {it.get('full_name', '?')} ⭐{stars}\n   {it.get('html_url', '')}\n   {desc}".rstrip())
+    return "\n\n".join(lines)
 
 
 def _atomic_write(path, content):
@@ -7065,6 +7205,7 @@ TOOL_CALL_MAP = {
     "fetch_url": fetch_url,
     "fetch_blocked": _run_fetch_blocked,
     "search_web": search_web,
+    "search_github": search_github,
     "database_query": database_query,
     "tts_save": tts_save,
     "image_process": image_process,

@@ -66,6 +66,14 @@ def patch_http(text):
 
 
 class TestSearchWeb(unittest.TestCase):
+    def setUp(self):
+        # 重置引擎健康度：测试间失败计数会累积导致引擎被暂停
+        dc._SEARCH_HEALTH.clear()
+
+    def tearDown(self):
+        # 防残留暂停状态影响其他测试文件（测试顺序无关）
+        dc._SEARCH_HEALTH.clear()
+
     def test_tool_registered(self):
         names = [t["function"]["name"] for t in dc.TOOLS]
         self.assertIn("search_web", names)
@@ -237,6 +245,135 @@ class TestSearchWeb(unittest.TestCase):
         with patch_http(BING_HTML):
             r2 = dc.search_web("x", until="昨天")
         self.assertIn("错误", r2)
+
+    # ===== 引擎池：so360 解析 + 健康度 =====
+
+    SO360_HTML = """
+<html><body>
+<ul class="res-list">
+  <li><h3><a href="javascript:;" data-mdurl="">推广入口</a></h3></li>
+  <li><h3><a href="https://example.com/so1">360 结果一：AI 大模型发布</a></h3><p class="res-desc">摘要一</p></li>
+  <li><h3><a href="/link?m=abc123">360 加密跳转结果</a></h3></li>
+</ul>
+</body></html>
+"""
+
+    def test_so360_parse(self):
+        with patch_http(self.SO360_HTML):
+            results = dc._search_so360("AI")
+        self.assertEqual(len(results), 2)  # 跳过 javascript:
+        self.assertEqual(results[0]["title"], "360 结果一：AI 大模型发布")
+        self.assertEqual(results[0]["url"], "https://example.com/so1")
+        self.assertEqual(results[1]["url"], "https://www.so.com/link?m=abc123")  # 补全域名
+
+    def test_so360_registered(self):
+        names = [e[0] for e in dc._SEARCH_ENGINES]
+        self.assertIn("so360", names)
+        self.assertIn("bing", names)
+
+    def test_engine_health_pauses_after_failures(self):
+        """连续失败 3 次后引擎被暂停（skip_until 设置）；成功后恢复。"""
+        for _ in range(dc._SEARCH_HEALTH_FAIL_LIMIT):
+            dc._search_report("bing", False)
+        self.assertFalse(dc._search_healthy("bing"))
+        # 冷却期内仍不可用
+        self.assertFalse(dc._search_healthy("bing"))
+        # 模拟冷却结束
+        dc._SEARCH_HEALTH["bing"]["skip_until"] = 0
+        self.assertTrue(dc._search_healthy("bing"))
+        dc._search_report("bing", True)
+        self.assertEqual(dc._SEARCH_HEALTH["bing"]["fails"], 0)
+
+    def test_unhealthy_engine_skipped(self):
+        """被暂停的引擎不再发起请求。"""
+        dc._search_report("bing", False)
+        dc._search_report("bing", False)
+        dc._search_report("bing", False)
+        requested = []
+
+        def fake_get(url, **kw):
+            requested.append(url)
+            return FakeResp(BING_HTML)
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient2(fake_get)):
+            dc.search_web("x", num=5)
+        self.assertFalse(any("bing.com" in u for u in requested))
+        self.assertTrue(any("so.com" in u for u in requested))  # 其余引擎正常
+
+    # ===== search_github 垂直源 =====
+
+    def test_github_search(self):
+        payload = {
+            "items": [
+                {"full_name": "org/repo1", "html_url": "https://github.com/org/repo1",
+                 "description": "一个好项目", "stargazers_count": 1234},
+                {"full_name": "org/repo2", "html_url": "https://github.com/org/repo2",
+                 "description": None, "stargazers_count": 0},
+            ]
+        }
+
+        class FakeGithubResp:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+
+        captured = {}
+
+        class FakeGithubClient:
+            def get(self, url, **kw):
+                captured["params"] = kw.get("params")
+                return FakeGithubResp()
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeGithubClient()):
+            result = dc.search_github("deepseek", num=2)
+        self.assertIn("org/repo1 ⭐1234", result)
+        self.assertIn("https://github.com/org/repo1", result)
+        self.assertIn("（2 个", result)
+        self.assertEqual(captured["params"]["per_page"], 2)
+
+    def test_github_language_filter(self):
+        captured = {}
+
+        class FakeGithubResp:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"items": []}
+
+        class FakeGithubClient:
+            def get(self, url, **kw):
+                captured["params"] = kw.get("params")
+                return FakeGithubResp()
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeGithubClient()):
+            dc.search_github("deepseek", language="python")
+        self.assertIn("language:python", captured["params"]["q"])
+
+    def test_github_rate_limited(self):
+        class FakeResp403:
+            status_code = 403
+
+            def raise_for_status(self):
+                pass
+
+        class FakeClient403:
+            def get(self, url, **kw):
+                return FakeResp403()
+
+        with mock.patch("deepseek_client._http_client", return_value=FakeClient403()):
+            result = dc.search_github("x")
+        self.assertIn("限流", result)
+
+    def test_github_invalid_args(self):
+        self.assertIn("错误", dc.search_github(""))
+        self.assertIn("错误", dc.search_github("x", language="bad lang!"))
 
 
 if __name__ == "__main__":
