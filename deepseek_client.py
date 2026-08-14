@@ -322,16 +322,16 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_web",
-            "description": "联网搜索最新信息，返回相关网页的标题、链接与摘要（Bing + DuckDuckGo 并行聚合去重，默认最多 5 条，可指定 num 最多 20 条）。适合查询实时新闻、最新资讯、不熟悉的事实等；找到有用链接后可配合 fetch_url 抓取全文",
+            "description": "联网搜索最新信息，返回相关网页的标题、链接与摘要（Bing + 360 + DuckDuckGo 并行聚合去重，默认最多 5 条，可指定 num 最多 20 条）。site 与 offset 参数保证生效；since/until 时间过滤依赖搜索引擎支持（可能不严格）。适合查询实时新闻、最新资讯、不熟悉的事实等；找到有用链接后可配合 fetch_url 抓取全文",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "搜索关键词（建议简洁明确）"},
                     "num": {"type": "integer", "description": "可选：返回条数（1-20，默认 5）"},
-                    "offset": {"type": "integer", "description": "可选：翻页偏移（0 起，如 5 表示第 6-10 条）"},
-                    "since": {"type": "string", "description": "可选：起始日期过滤（YYYY-MM-DD，只搜该日期之后的结果）"},
-                    "until": {"type": "string", "description": "可选：截止日期过滤（YYYY-MM-DD，只搜该日期之前的结果）"},
-                    "site": {"type": "string", "description": "可选：限定站点域名（如 openai.com），只返回该站结果"},
+                    "offset": {"type": "integer", "description": "可选：翻页偏移（0 起，如 5 表示跳过前 5 条看第 6-10 条）"},
+                    "since": {"type": "string", "description": "可选：起始日期过滤（YYYY-MM-DD，依赖引擎支持，可能不严格）"},
+                    "until": {"type": "string", "description": "可选：截止日期过滤（YYYY-MM-DD，依赖引擎支持，可能不严格）"},
+                    "site": {"type": "string", "description": "可选：限定站点域名（如 openai.com），只返回该站结果（保证生效）"},
                 },
                 "required": ["query"],
             },
@@ -341,11 +341,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_github",
-            "description": "搜索 GitHub 开源仓库（按 Star 排序），适合找代码库/开源项目/技术实现参考",
+            "description": "搜索 GitHub 开源仓库（按 Star 排序）。支持 GitHub 原生搜索语法：org:（组织）、topic:、language:、stars:、in:readme 等，例如 org:deepseek-ai 精确查官方组织",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "搜索关键词（如 deepseek api）"},
+                    "query": {"type": "string", "description": "搜索关键词（支持 org:/topic:/language:/stars: 等原生语法）"},
                     "num": {"type": "integer", "description": "可选：返回条数（1-20，默认 5）"},
                     "language": {"type": "string", "description": "可选：限定编程语言（如 python、javascript）"},
                 },
@@ -1929,12 +1929,14 @@ def _safe_url(url, allow_loopback=True):
     return ""
 
 
-def _run_fetch_blocked(args):
-    """工具分发：fetch_blocked（按需能力，模块缺失时明确提示）。"""
+def _run_fetch_blocked(url, proxy=None, **kwargs):
+    """工具分发：fetch_blocked（按需能力，模块缺失时明确提示）。
+
+    与其他工具一致使用具名参数签名（分发器以 fn(**args) 调用）——
+    此前误写成单个 dict 参数导致 unexpected keyword argument 'url'。
+    """
     if _fetch_blocked_impl is None:
         return "错误: fetch_blocked 能力未安装（需要将 fetch_blocked.py 放入程序目录并启用后可用）"
-    url = (args or {}).get("url", "")
-    proxy = (args or {}).get("proxy") or ""
     return _fetch_blocked_impl(url, proxy)
 
 
@@ -3450,7 +3452,7 @@ def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site
     since = str(since or "").strip()
     until = str(until or "").strip()
 
-    # 并行调用所有健康引擎；每引擎请求 num*2 条供聚合裁剪
+    # 并行调用所有健康引擎；每引擎请求 num+offset 条供聚合后手动翻页
     import concurrent.futures as _cf
 
     def _run(entry):
@@ -3459,7 +3461,7 @@ def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site
         if fn is None:
             return name, [], None
         try:
-            kw = {"num": max(num, 10)}
+            kw = {"num": max(num + offset, 10)}
             if name == "bing":
                 kw.update(offset=offset, since=since, until=until)
             elif name == "duckduckgo":
@@ -3482,12 +3484,24 @@ def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site
             continue
         _search_report(name, True)
         merged.extend(_search_safe(results))
-    merged = _search_dedup(merged)[:num]
+    merged = _search_dedup(merged)
+    # site 硬过滤：搜索引擎可能忽略 site: 语法，聚合后按域名兜底保证生效
+    pre_site = merged
+    if site:
+        merged = [
+            r for r in merged
+            if str(r.get("url") or "").split("/")[2].lower() in (site, "www." + site)
+            or str(r.get("url") or "").split("/")[2].lower().endswith("." + site)
+        ]
+    # offset 手动翻页：请求时已多取，这里直接切片（引擎不支持 first= 也生效）
+    merged = merged[offset:offset + num]
     if merged:
         lines = [f"搜索结果（{len(merged)} 条）:"]
         for i, r in enumerate(merged, 1):
             lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}".rstrip())
         return "\n\n".join(lines)
+    if site and pre_site:
+        return f"未找到限定站点 {site} 的结果（搜索引擎未返回该站点内容，可尝试去掉 site 参数）"
     detail = f": {last_err}" if last_err is not None else ""
     return f"错误：搜索失败（可用搜索源均不可用{detail}）"
 

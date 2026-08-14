@@ -375,6 +375,62 @@ class TestSearchWeb(unittest.TestCase):
         self.assertIn("错误", dc.search_github(""))
         self.assertIn("错误", dc.search_github("x", language="bad lang!"))
 
+    # ===== P0 修复回归：fetch_blocked 签名 / site 硬过滤 / offset 切片 =====
+
+    def test_fetch_blocked_named_args(self):
+        """分发器以 fn(**args) 调用，_run_fetch_blocked 必须接收具名参数。"""
+        import inspect
+        sig = inspect.signature(dc._run_fetch_blocked)
+        self.assertIn("url", sig.parameters)
+        # 具名调用不抛 TypeError
+        with mock.patch.object(dc, "_fetch_blocked_impl", return_value="OK"):
+            self.assertEqual(dc._run_fetch_blocked(url="https://linux.do"), "OK")
+            self.assertEqual(dc._run_fetch_blocked("https://linux.do", proxy="p"), "OK")
+
+    def test_fetch_blocked_missing_module(self):
+        with mock.patch.object(dc, "_fetch_blocked_impl", None):
+            r = dc._run_fetch_blocked(url="https://linux.do")
+        self.assertIn("错误", r)
+
+    def test_site_hard_filter(self):
+        """site 过滤在聚合后按域名兜底（引擎忽略 site: 语法也生效）。"""
+        results = [
+            {"title": "a", "url": "https://openai.com/a", "snippet": ""},
+            {"title": "b", "url": "https://www.openai.com/b", "snippet": ""},
+            {"title": "c", "url": "https://sub.openai.com/c", "snippet": ""},
+            {"title": "d", "url": "https://evil.com/d", "snippet": ""},
+        ]
+        with mock.patch("deepseek_client._search_bing", return_value=results), \
+             mock.patch("deepseek_client._search_so360", return_value=[]), \
+             mock.patch("deepseek_client._search_duckduckgo", return_value=[]):
+            out = dc.search_web("x", site="openai.com")
+        self.assertNotIn("evil.com", out)
+        self.assertIn("openai.com/a", out)
+        self.assertIn("sub.openai.com/c", out)  # 子域名匹配
+
+    def test_site_filter_empty_hint(self):
+        """site 过滤后为空时给出明确提示而非误导性错误。"""
+        results = [{"title": "a", "url": "https://other.com/a", "snippet": ""}]
+        with mock.patch("deepseek_client._search_bing", return_value=results), \
+             mock.patch("deepseek_client._search_so360", return_value=[]), \
+             mock.patch("deepseek_client._search_duckduckgo", return_value=[]):
+            out = dc.search_web("x", site="openai.com")
+        self.assertIn("未找到限定站点", out)
+
+    def test_offset_slicing(self):
+        """offset 手动翻页：请求多取，聚合后切片（引擎不支持 first= 也生效）。"""
+        results = [{"title": f"r{i}", "url": f"https://example.com/{i}", "snippet": ""}
+                   for i in range(8)]
+        with mock.patch("deepseek_client._search_bing", return_value=results), \
+             mock.patch("deepseek_client._search_so360", return_value=[]), \
+             mock.patch("deepseek_client._search_duckduckgo", return_value=[]):
+            out = dc.search_web("x", num=3, offset=5)
+        self.assertIn("example.com/5", out)
+        self.assertIn("example.com/6", out)
+        self.assertIn("example.com/7", out)
+        self.assertNotIn("example.com/0", out)
+        self.assertNotIn("example.com/4", out)
+
 
 if __name__ == "__main__":
     unittest.main()
