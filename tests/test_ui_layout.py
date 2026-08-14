@@ -46,6 +46,9 @@ def _make_app():
     root = tk.Tk()
     root.withdraw()
     app = m.AssistantApp(root)
+    # 应用默认最大化启动；测试布局逻辑用普通窗口（避免 scale 随屏幕尺寸漂移）
+    root.state("normal")
+    root.update()
     return tmpdir, root, app
 
 

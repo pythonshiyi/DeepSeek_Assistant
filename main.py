@@ -1381,36 +1381,43 @@ class AssistantApp:
     def build_ui(self):
         t = self._theme()
         self.root.title(f"{APP_NAME} {APP_NAME_EN} v{VERSION}")
-        # 窗口几何：记忆优先（config window_geometry），否则默认 1280x820 居中；
-        # 屏幕内校验：尺寸超屏收缩、位置不可见时居中（分辨率变化后仍可达）
-        geo = str(self.cfg.get("window_geometry") or "").strip()
-        if geo and re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", geo):
-            try:
-                m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geo)
-                w, h = int(m.group(1)), int(m.group(2))
-                x, y = int(m.group(3)), int(m.group(4))
-                sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-                if w >= LAYOUT["window_min_w"] and h >= LAYOUT["window_min_h"]:
-                    # 尺寸超出屏幕（分辨率变小/换显示器）：收缩到屏幕内，避免
-                    # 窗口整体偏右下方、底部在屏幕外
-                    if w > sw:
-                        w = sw
-                    if h > sh:
-                        h = sh
-                    # 位置校正：窗口完全落在屏幕内（多显示器负坐标/屏幕变化时
-                    # 左移或上移，保证启动即可见可用）
-                    if x < 0:
-                        x = 0
-                    if y < 0:
-                        y = 0
-                    if x + w > sw:
-                        x = max(0, sw - w)
-                    if y + h > sh:
-                        y = max(0, sh - h)
-                    self.root.geometry(f"{w}x{h}+{x}+{y}")
-                    self._window_geo_restored = True
-            except (AttributeError, TypeError, ValueError):
-                pass
+        # 窗口几何：默认最大化启动（Windows zoomed，铺满屏幕工作区，天然上下左右居中）；
+        # 最大化不可用时回退记忆几何（屏幕内校验：尺寸超屏收缩、位置越界校正），
+        # 再回退默认 1280x820 居中
+        try:
+            self.root.state("zoomed")
+            self._window_geo_restored = True
+        except tk.TclError:
+            self._window_geo_restored = False
+        if not getattr(self, "_window_geo_restored", False):
+            geo = str(self.cfg.get("window_geometry") or "").strip()
+            if geo and re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", geo):
+                try:
+                    m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geo)
+                    w, h = int(m.group(1)), int(m.group(2))
+                    x, y = int(m.group(3)), int(m.group(4))
+                    sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+                    if w >= LAYOUT["window_min_w"] and h >= LAYOUT["window_min_h"]:
+                        # 尺寸超出屏幕（分辨率变小/换显示器）：收缩到屏幕内，避免
+                        # 窗口整体偏右下方、底部在屏幕外
+                        if w > sw:
+                            w = sw
+                        if h > sh:
+                            h = sh
+                        # 位置校正：窗口完全落在屏幕内（多显示器负坐标/屏幕变化时
+                        # 左移或上移，保证启动即可见可用）
+                        if x < 0:
+                            x = 0
+                        if y < 0:
+                            y = 0
+                        if x + w > sw:
+                            x = max(0, sw - w)
+                        if y + h > sh:
+                            y = max(0, sh - h)
+                        self.root.geometry(f"{w}x{h}+{x}+{y}")
+                        self._window_geo_restored = True
+                except (AttributeError, TypeError, ValueError):
+                    pass
         if not getattr(self, "_window_geo_restored", False):
             try:
                 sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -14360,10 +14367,12 @@ class AssistantApp:
         except Exception:
             logging.exception("退出前保存会话失败")
         self.save_snapshot()
-        # 记忆窗口几何（屏幕内校验），下次启动恢复
+        # 记忆窗口几何（屏幕内校验），下次启动恢复；最大化状态下不覆盖记忆
+        # （zoomed 时 geometry() 无意义，保留用户上次手动调整的普通几何）
         if not self.cfg.get("privacy_mode"):
             try:
-                self.cfg["window_geometry"] = self.root.geometry()
+                if self.root.state() != "zoomed":
+                    self.cfg["window_geometry"] = self.root.geometry()
                 save_config(self.cfg)
             except Exception:
                 pass
