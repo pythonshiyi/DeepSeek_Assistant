@@ -2,6 +2,16 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.12.11（2026-08-15）
+
+v2.12.10 之后的 13 个提交汇总（源码包与本地代码对齐）：
+
+- **搜索能力**：search_web 增强（num/offset/since/until/site 参数 + 多引擎聚合去重）、搜索引擎池化（新增 360 搜索 + 健康度管理）、search_realtime 实时通道（Hacker News 热点/搜索）、search_github 垂直源、rss_fetch 精选预置源
+- **能力扩展**：call_api 万能接口（SSRF 防护 + 内网白名单）、自动经验复盘、system_status 系统自检
+- **修复**：fetch_blocked 分发签名、search_web site/offset 参数保证生效、流式 usage 统计恒为 0、设置面板布局、滚轮速度、启动窗口几何
+- **品牌**：GitHub 仓库更名为 WhaleTalk，更新机制接入新仓库
+- **文档**：README 重写为正式产品介绍，CHANGELOG 独立归档
+
 ## 开源后新增（2026-08）
 
 | 提交 | 说明 |
