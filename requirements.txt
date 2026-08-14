@@ -40,3 +40,5 @@ psycopg2-binary>=2.9.0
 faster-whisper>=1.0.0
 # 可选：浏览器自动化（browser_navigate / web_screenshot / 有头预览；另需 playwright install chromium）
 playwright>=1.40.0
+# 可选：被墙站点抓取主路径（fetch_blocked，Chrome 指纹可过 Cloudflare；缺失时自动降级标准库 TLS-in-TLS）
+curl_cffi>=0.7.0
