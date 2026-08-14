@@ -6819,6 +6819,8 @@ class DeepSeekClient:
             "messages": work,
             "max_tokens": max_tokens,
             "stream": True,
+            # 流式必须显式请求 usage（否则部分端点不返回末尾 usage chunk）
+            "stream_options": {"include_usage": True},
             "extra_body": extra_body,
         }
         if json_output:
@@ -6871,11 +6873,12 @@ class DeepSeekClient:
                 # 流中途断线（APIConnectionError）会抛在 _create_with_retry 之外：
                 # 仅在「尚无任何增量送达 UI」时整体重试，避免已显示内容重复
                 reasoning, content, tool_calls = "", "", {}
+                stream_usage = None
                 try:
                     for stream_attempt in range(2):
                         response = self._create_with_retry(kwargs, attempts=2, stop_event=stop_event)
                         try:
-                            reasoning, content, tool_calls = self._consume_stream(
+                            reasoning, content, tool_calls, stream_usage = self._consume_stream(
                                 response, on_reasoning, on_content, stop_event
                             )
                             break
@@ -6885,7 +6888,11 @@ class DeepSeekClient:
                             logger.warning("流式连接中途断开（尚未收到内容），重试: %s", e)
                 except _StopRequested:
                     return False  # 停止请求：干净返回，不把半截内容当异常抛给 UI
-                if getattr(response, "usage", None):
+                if stream_usage is not None:
+                    if on_usage:
+                        on_usage(self._usage_dict(stream_usage))
+                elif getattr(response, "usage", None):
+                    # 兼容旧版 openai SDK（Stream 对象自带聚合 usage）
                     if on_usage:
                         on_usage(self._usage_dict(response.usage))
 
@@ -7217,10 +7224,16 @@ class DeepSeekClient:
         reasoning = ""
         content = ""
         tool_calls = {}
+        usage = None
         try:
             for chunk in response:
                 if stop_event and stop_event.is_set():
                     break
+                # 流式 usage：服务端在末尾 chunk 返回（choices 为空数组，仅带 usage 字段）。
+                # openai SDK 2.x 的 Stream 不再聚合 usage，必须在这里自行捕获。
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -7250,7 +7263,7 @@ class DeepSeekClient:
                     response.close()
             except Exception:
                 pass
-        return reasoning, content, list(tool_calls.values())
+        return reasoning, content, list(tool_calls.values()), usage
 
     @staticmethod
     def _usage_dict(usage):
