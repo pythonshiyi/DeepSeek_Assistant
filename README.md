@@ -16,6 +16,7 @@
 - [中文介绍（完整）](#中文介绍完整)
 - [English Introduction (Full)](#english-introduction-full)
 - [贡献指南 / Contributing](CONTRIBUTING.md)
+- [安全策略 / Security](SECURITY.md)
 - [品牌与关注 / Follow Us](#品牌与关注--follow-us)
 
 ## 中文介绍（完整）

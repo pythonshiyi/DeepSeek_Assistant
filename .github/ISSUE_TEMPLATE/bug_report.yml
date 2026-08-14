@@ -1,0 +1,55 @@
+name: Bug 报告 / Bug report
+description: 报告鲸语 WhaleTalk 的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告问题！请尽量填写以下信息，帮助我们快速定位。
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Version
+      description: 关于对话框中的版本号，如 1.11.0
+      placeholder: "1.11.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 系统 / OS
+      options:
+        - Windows 11
+        - Windows 10
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题描述 / What happened
+      description: 发生了什么？期望是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      placeholder: |
+        1. 打开应用...
+        2. 点击...
+        3. 报错...
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / Logs
+      description: 日志位于 %USERPROFILE%\Documents\WhaleTalk\logs\assistant.log（可粘贴关键片段）
+      render: text
+  - type: checkboxes
+    id: security
+    attributes:
+      label: 安全提示
+      options:
+        - label: 我确认不包含 API Key 等敏感信息（config.json 内容请勿粘贴）
+          required: true
