@@ -159,6 +159,7 @@ _dc.EMAIL_CONFIG_FILE = os.path.join(DATA_DIR, "email_config.json")
 _dc.DB_CONFIG_FILE = os.path.join(DATA_DIR, "db_config.json")
 _dc.WEBHOOK_CONFIG_FILE = os.path.join(DATA_DIR, "webhooks.json")
 _dc.IM_CONFIG_FILE = os.path.join(DATA_DIR, "im_config.json")
+_dc.SECRETS_FILE = os.path.join(DATA_DIR, "secrets.json")
 _dc.BROWSER_HEADLESS = True
 _dc.WORKING_DIR = None  # 工作目录传导：run_command/start_process 的 cwd（由 _set_active_dir 更新）
 _dc.BROWSER_PROFILE_DIR = os.path.join(DATA_DIR, "browser_profile")
@@ -195,7 +196,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.16.2"
+VERSION = "2.17.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -664,6 +665,7 @@ class AssistantApp:
             sysm = tk.Menu(tm, **menu_opts)
             self._menus.append(sysm)
             sysm.add_command(label="🔧 失败模式库…", command=self.show_failures)
+            sysm.add_command(label="📋 行动审计…", command=self.show_action_log)
             sysm.add_command(label="🔗 推送与数据库配置…", command=self.show_external_config)
             sysm.add_command(label="📱 IM 通道配置…", command=self.show_im_config)
             sysm.add_command(label="🖼 从剪贴板图片提取文字 (OCR)…", command=self._ocr_clipboard)
@@ -5486,14 +5488,14 @@ class AssistantApp:
 
     @staticmethod
     def _autostart_command():
-        """开机自启命令：打包 exe 用 exe 本体；源码运行用 pythonw + main.py。"""
+        """开机自启命令：打包 exe 用 exe 本体；源码运行用 watchdog.py 常驻守护（崩溃自动拉起）。"""
         if getattr(sys, "frozen", False):
             return f'"{sys.executable}"'
         pyw = os.path.join(BASE_DIR, ".venv", "Scripts", "pythonw.exe")
         if not os.path.exists(pyw):
             alt = os.path.join(os.path.dirname(sys.executable) or ".", "pythonw.exe")
             pyw = alt if os.path.exists(alt) else "pythonw.exe"
-        return f'"{pyw}" "{os.path.join(BASE_DIR, "main.py")}"'
+        return f'"{pyw}" "{os.path.join(BASE_DIR, "watchdog.py")}"'
 
     @staticmethod
     def _autostart_enabled():
@@ -7399,6 +7401,31 @@ class AssistantApp:
     def show_failures(self):
         """失败模式库：查看 AI 工具曾失败的原因（供分析/规避）。"""
         dialogs.show_failures(self)
+
+    def show_action_log(self):
+        """行动审计可视化：查看鲸语都做了什么（最近 200 条）。"""
+        t = self._theme()
+        path = os.path.join(permissions.AUDIT_LOG_DIR or "", "actions.log")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = [ln.rstrip() for ln in f.readlines()[-200:] if ln.strip()]
+        except OSError:
+            lines = []
+        dialog, body, footer = self._dialog_shell(
+            "行动审计", 760, 500,
+            subtitle="鲸语做过什么 · 只记录不拦截（最近 200 条）",
+        )
+        txt = tk.Text(body, wrap="none", bg=t["input_bg"], fg=t["input_fg"],
+                      relief="flat", highlightthickness=1, highlightbackground=t["border"],
+                      highlightcolor=t["accent"], font=(MONO_FAMILY, 9), padx=10, pady=8)
+        sb = tk.Scrollbar(body, orient="vertical", command=txt.yview, relief="flat", bd=0)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", "\n".join(reversed(lines)) if lines else "（暂无行动审计记录）")
+        txt.configure(state="disabled")
+        self._footer_hint(footer, f"审计文件：{path}")
+        self._footer_btn(footer, "关闭", dialog.destroy)
 
     def copy_share_text(self):
         """把当前对话复制为可分享的 Markdown 文本。"""

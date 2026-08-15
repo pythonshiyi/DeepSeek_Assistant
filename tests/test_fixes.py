@@ -406,11 +406,11 @@ class TestBudgetThinking(unittest.TestCase):
 class TestAutostart(unittest.TestCase):
     """开机自启命令构造与注册表写入（mock winreg，不触碰真实注册表）。"""
 
-    def test_command_contains_main(self):
+    def test_command_contains_watchdog(self):
         if getattr(sys, "frozen", False):
             self.skipTest("打包环境命令为 exe 自身")
         cmd = m.AssistantApp._autostart_command()
-        self.assertIn("main.py", cmd)
+        self.assertIn("watchdog.py", cmd)
         self.assertIn("pythonw", cmd)
 
     def test_set_autostart_writes_registry(self):

@@ -289,7 +289,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_memory",
-            "description": "写入一条长期记忆（用户偏好、关键结论、重要事实），自动去重，最多 500 条；可附带类型、实体与关系三元组形成知识图谱",
+            "description": "写入一条长期记忆（用户偏好、关键结论、重要事实），自动去重，最多 2000 条；可附带类型、实体与关系三元组形成知识图谱",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -644,6 +644,103 @@ TOOLS = [
                     },
                 },
                 "required": ["project_dir", "files"],
+            },
+        },
+    },
+    # ===== 桌面 RPA（P0）=====
+    {
+        "type": "function",
+        "function": {
+            "name": "rpa_screen_size",
+            "description": "获取当前屏幕分辨率（桌面 RPA 坐标用，需 pyautogui）",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rpa_click",
+            "description": "桌面 RPA：模拟鼠标点击屏幕坐标 (x,y)，button=left/right/middle",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "屏幕 X 坐标"},
+                    "y": {"type": "integer", "description": "屏幕 Y 坐标"},
+                    "button": {"type": "string", "description": "可选：left/right/middle，默认 left"},
+                    "clicks": {"type": "integer", "description": "可选：连击次数 1-5，默认 1"},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rpa_type",
+            "description": "桌面 RPA：模拟键盘输入文本（需先点击目标输入框）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "要输入的文本"},
+                    "interval": {"type": "number", "description": "可选：每个字符间隔秒数，默认 0.02"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rpa_hotkey",
+            "description": "桌面 RPA：模拟组合键，如 ctrl+c / alt+tab / ctrl+shift+esc",
+            "parameters": {
+                "type": "object",
+                "properties": {"keys": {"type": "string", "description": "组合键串，+ 分隔"}},
+                "required": ["keys"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rpa_move",
+            "description": "桌面 RPA：把鼠标移动到屏幕坐标 (x,y)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "X 坐标"},
+                    "y": {"type": "integer", "description": "Y 坐标"},
+                    "duration": {"type": "number", "description": "可选：移动耗时秒，默认 0.2"},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rpa_scroll",
+            "description": "桌面 RPA：滚动鼠标滚轮（正数向上，负数向下）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "clicks": {"type": "integer", "description": "滚动格数 -50~50"},
+                    "x": {"type": "integer", "description": "可选：滚动位置 X"},
+                    "y": {"type": "integer", "description": "可选：滚动位置 Y"},
+                },
+                "required": ["clicks"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rpa_screenshot",
+            "description": "桌面 RPA：截取整个屏幕保存 PNG（默认工作区）",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "可选：输出 PNG 绝对路径"}},
+                "required": [],
             },
         },
     },
@@ -1405,6 +1502,20 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "email_summary",
+            "description": "读取近期邮件并整理为清单，供 AI 生成新邮件摘要（IMAP 配置同 read_email）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "可选：最多返回封数（默认 10，最大 50）"},
+                    "since_days": {"type": "integer", "description": "可选：最近 N 天（默认 1）"},
+                },
+            },
+        },
+    },
     # ===== v2 能力层 · 任务检查点（断点续跑） =====
     {
         "type": "function",
@@ -1570,6 +1681,23 @@ TOOLS = [
                     "image_path": {"type": "string", "description": "read 必填：待识别图片路径"},
                     "size": {"type": "integer", "description": "可选：生成边长像素（默认 300，64-1024）"},
                     "error_correction": {"type": "string", "description": "可选：纠错等级 L/M/Q/H（默认 M）"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    # ===== 密钥保险箱（P2 信任基建） =====
+    {
+        "type": "function",
+        "function": {
+            "name": "secret_store",
+            "description": "密钥保险箱：DPAPI 加密托管 API key/令牌等敏感值。action=set 保存（value 只写不显示）/ get 按名取用 / delete 删除 / list 仅列出名称",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "set / get / delete / list"},
+                    "name": {"type": "string", "description": "密钥名称（如 openai_key）"},
+                    "value": {"type": "string", "description": "set 必填：要托管的敏感值"},
                 },
                 "required": ["action"],
             },
@@ -3328,7 +3456,7 @@ def chart_data(data, path, kind="line", title="", x_label="", y_label=""):
 
 # ===== 长期记忆（与 main 的 memory.json 兼容：{"enabled", "facts":[{key,value}], "notes":[{text,tags,ts}]}）=====
 MEMORY_FILE = None  # 由 main 初始化时注入（DATA_DIR/memory.json）
-MEMORY_MAX_ITEMS = 500
+MEMORY_MAX_ITEMS = 2000  # v2.16.2 起扩容：伙伴需要记住的更多
 MEMORY_MAX_TEXT = 2000
 _MEMORY_LOCK = threading.Lock()  # 并行 write_memory 读-改-写串行化，防丢失更新
 
@@ -5010,6 +5138,148 @@ def _playwright_ready():
         return False, "浏览器操作需要安装 playwright：pip install playwright && playwright install chromium"
 
 
+# ===== 桌面 RPA（P0）：pyautogui 鼠标键盘，操作任意桌面软件 =====
+RPA_FAILSAFE = True  # 鼠标移到屏幕左上角时立即中断 RPA（pyautogui failsafe）
+
+
+def _rpa_ready():
+    try:
+        import pyautogui  # noqa: F401
+        return True, ""
+    except ImportError:
+        return False, "桌面 RPA 需要安装 pyautogui：pip install pyautogui"
+
+
+def rpa_screen_size():
+    """当前屏幕分辨率（RPA 坐标用）。"""
+    ok, hint = _rpa_ready()
+    if not ok:
+        return hint
+    try:
+        import pyautogui
+        w, h = pyautogui.size()
+        return f"屏幕分辨率：{w} x {h}"
+    except Exception as e:
+        return f"错误：获取屏幕尺寸失败: {e}"
+
+
+def rpa_click(x, y, button="left", clicks=1):
+    """模拟鼠标点击。"""
+    ok, hint = _rpa_ready()
+    if not ok:
+        return hint
+    try:
+        import pyautogui
+        x = int(x)
+        y = int(y)
+        button = str(button or "left").strip().lower()
+        clicks = max(1, min(5, int(clicks or 1)))
+        if button not in ("left", "right", "middle"):
+            return "错误：button 仅支持 left/right/middle"
+        pyautogui.FAILSAFE = RPA_FAILSAFE
+        pyautogui.click(x, y, button=button, clicks=clicks)
+        permissions.audit("rpa_click", f"{x},{y}", f"{button} x{clicks}")
+        return f"已点击 ({x}, {y})，{button} 键 x{clicks}"
+    except Exception as e:
+        return f"错误：RPA 点击失败: {e}"
+
+
+def rpa_type(text, interval=0.02):
+    """模拟键盘输入文本。"""
+    ok, hint = _rpa_ready()
+    if not ok:
+        return hint
+    if not str(text or ""):
+        return "错误：text 必填"
+    try:
+        import pyautogui
+        interval = max(0.0, min(0.2, float(interval or 0.02)))
+        pyautogui.FAILSAFE = RPA_FAILSAFE
+        pyautogui.typewrite(str(text), interval=interval)
+        permissions.audit("rpa_type", "键盘输入", str(text)[:60])
+        return f"已输入 {len(str(text))} 个字符"
+    except Exception as e:
+        return f"错误：RPA 输入失败: {e}"
+
+
+def rpa_hotkey(keys):
+    """模拟组合键，如 ctrl+c / alt+tab / ctrl+shift+esc。"""
+    ok, hint = _rpa_ready()
+    if not ok:
+        return hint
+    if not str(keys or "").strip():
+        return "错误：keys 必填"
+    try:
+        import pyautogui
+        seq = [str(k).strip().lower() for k in str(keys).replace(" ", "").split("+") if str(k).strip()]
+        if not seq:
+            return "错误：keys 格式应为 ctrl+c 或 alt+tab"
+        pyautogui.FAILSAFE = RPA_FAILSAFE
+        pyautogui.hotkey(*seq)
+        permissions.audit("rpa_hotkey", "+".join(seq), "组合键")
+        return f"已按下组合键 {'+'.join(seq)}"
+    except Exception as e:
+        return f"错误：RPA 组合键失败: {e}"
+
+
+def rpa_move(x, y, duration=0.2):
+    """移动鼠标到坐标。"""
+    ok, hint = _rpa_ready()
+    if not ok:
+        return hint
+    try:
+        import pyautogui
+        x, y = int(x), int(y)
+        duration = max(0.0, min(2.0, float(duration or 0.2)))
+        pyautogui.FAILSAFE = RPA_FAILSAFE
+        pyautogui.moveTo(x, y, duration=duration)
+        return f"鼠标已移动到 ({x}, {y})"
+    except Exception as e:
+        return f"错误：RPA 移动失败: {e}"
+
+
+def rpa_scroll(clicks, x=None, y=None):
+    """滚动鼠标滚轮（正数向上，负数向下）。"""
+    ok, hint = _rpa_ready()
+    if not ok:
+        return hint
+    try:
+        import pyautogui
+        n = max(-50, min(50, int(clicks or 0)))
+        if x is not None and y is not None:
+            pyautogui.scroll(n, x=int(x), y=int(y))
+        else:
+            pyautogui.scroll(n)
+        permissions.audit("rpa_scroll", str(n), "滚轮")
+        return f"已滚动 {n} 格"
+    except Exception as e:
+        return f"错误：RPA 滚动失败: {e}"
+
+
+def rpa_screenshot(path=""):
+    """截取当前屏幕保存为 PNG（不指定路径保存到工作区）。"""
+    ok, hint = _rpa_ready()
+    if not ok:
+        return hint
+    if str(path or "").strip():
+        p = permissions.resolve(path)
+    else:
+        p = permissions.resolve(os.path.join(
+            permissions.WORKSPACE_DIR or "", f"rpa_screen_{datetime.now():%Y%m%d_%H%M%S}.png"
+        ))
+    if not p:
+        return "错误：截图路径无效"
+    try:
+        import pyautogui
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        img = pyautogui.screenshot()
+        img.save(p)
+        permissions.audit("rpa_screenshot", p, "屏幕截图")
+        return f"已截屏保存至 {p}"
+    except Exception as e:
+        return f"错误：RPA 截屏失败: {e}"
+
+
 # ===== 浏览器模式（由 main 注入，True=无头静默，False=有头弹出窗口可实时预览）=====
 BROWSER_HEADLESS = True
 BROWSER_PROFILE_DIR = None  # 由 main 注入（DATA_DIR/browser_profile，登录态持久化）
@@ -6326,6 +6596,15 @@ def read_email(limit=10, since_days=3):
         return f"错误：读取邮件失败: {e}"
 
 
+# ---------- 新邮件汇总（P1 收件箱模式） ----------
+def email_summary(limit=10, since_days=1):
+    """读取近期邮件并整理为可汇总的清单（供 AI 生成摘要）。"""
+    raw = read_email(limit=limit, since_days=since_days)
+    if str(raw).startswith("错误"):
+        return raw
+    return "新邮件汇总任务：请根据以下邮件清单生成要点摘要（发件人/主题/日期）：\n\n" + raw
+
+
 # ---------- 任务检查点（断点续跑） ----------
 def task_checkpoint_save(name="", status="进行中", pending=None, notes="", auto=False):
     """保存任务进度检查点（崩溃/重启后可从此继续）。
@@ -7294,6 +7573,82 @@ def qrcode(action="generate", text="", output="", image_path="", size=300, error
 
 
 # ============================================================================
+# 密钥保险箱（P2 信任基建）：DPAPI 加密托管，按名取用，不落明文日志
+# ============================================================================
+SECRETS_FILE = None  # 由 main 注入（DATA_DIR/secrets.json）
+
+
+def _load_secrets():
+    if not SECRETS_FILE:
+        return {}
+    if not os.path.exists(SECRETS_FILE):
+        return {}
+    try:
+        with open(SECRETS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for k, v in data.items():
+            try:
+                out[str(k)] = crypto.decrypt(str(v))
+            except Exception:
+                out[str(k)] = str(v)
+        return out
+    except Exception:
+        logging.exception("读取密钥保险箱失败")
+        return {}
+
+
+def _save_secrets(data):
+    if not SECRETS_FILE:
+        return False
+    try:
+        os.makedirs(os.path.dirname(SECRETS_FILE) or ".", exist_ok=True)
+        out = {str(k): crypto.encrypt(str(v)) for k, v in (data or {}).items()}
+        from persistence import atomic_json_write
+        return atomic_json_write(SECRETS_FILE, out, indent=2)
+    except Exception:
+        logging.exception("保存密钥保险箱失败")
+        return False
+
+
+def secret_store(action="get", name="", value=""):
+    """密钥保险箱：set / get / delete / list。value 只写不显示；list 只返回名称。"""
+    act = str(action or "get").strip().lower()
+    name = str(name or "").strip()
+    data = _load_secrets()
+    if act == "set":
+        if not name:
+            return "错误：name 必填"
+        if not str(value or ""):
+            return "错误：value 必填"
+        data[name] = str(value)
+        if not _save_secrets(data):
+            return "错误：保存密钥失败"
+        permissions.audit("secret_set", name, "值已加密保存", result="ok")
+        return f"密钥「{name}」已加密保存（调用 secret_get(name) 取用）"
+    if act == "get":
+        if not name:
+            return "错误：name 必填"
+        if name not in data:
+            return f"未找到密钥「{name}」"
+        return str(data[name])
+    if act == "delete":
+        if not name:
+            return "错误：name 必填"
+        if name not in data:
+            return f"未找到密钥「{name}」"
+        data.pop(name, None)
+        _save_secrets(data)
+        permissions.audit("secret_delete", name, "删除")
+        return f"已删除密钥「{name}」"
+    if act == "list":
+        return "已保存密钥：" + ("、".join(sorted(data.keys())) if data else "（空）")
+    return "错误：action 仅支持 set / get / delete / list"
+
+
+# ============================================================================
 # 嵌入式 KV 存储（diskcache 可选依赖；支持 TTL 与模糊检索）
 # ============================================================================
 KV_VALUE_MAX_BYTES = 1024 * 1024  # value 上限 1MB
@@ -7991,6 +8346,13 @@ TOOL_CALL_MAP = {
     "create_doc": create_doc,
     "write_code_project": write_code_project,
     "browser_navigate": browser_navigate,
+    "rpa_screen_size": rpa_screen_size,
+    "rpa_click": rpa_click,
+    "rpa_type": rpa_type,
+    "rpa_hotkey": rpa_hotkey,
+    "rpa_move": rpa_move,
+    "rpa_scroll": rpa_scroll,
+    "rpa_screenshot": rpa_screenshot,
     "web_screenshot": web_screenshot,
     "publish_draft": publish_draft,
     "start_process": start_process,
@@ -8019,6 +8381,7 @@ TOOL_CALL_MAP = {
     "knowledge_search": knowledge_search,
     "database_execute": database_execute,
     "read_email": read_email,
+    "email_summary": email_summary,
     "task_checkpoint_save": task_checkpoint_save,
     "task_checkpoint_load": task_checkpoint_load,
     "run_workflow": run_workflow,
@@ -8032,6 +8395,7 @@ TOOL_CALL_MAP = {
     "rss_fetch": rss_fetch,
     "qrcode": qrcode,
     "kv_store": kv_store,
+    "secret_store": secret_store,
     "media_ffmpeg": media_ffmpeg,
     "webdav": webdav,
     "run_wechat_writer": run_wechat_writer,

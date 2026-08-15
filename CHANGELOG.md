@@ -2,6 +2,17 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.17.0（2026-08-15）
+
+- **桌面 RPA（P0）**：新增 `rpa_screen_size / rpa_click / rpa_type / rpa_hotkey / rpa_move / rpa_scroll / rpa_screenshot`（pyautogui），可模拟鼠标键盘操作任意桌面软件；加入默认启用集，默认需审批（高风险）。
+- **密钥保险箱（P2）**：新增 `secret_store` 工具，DPAPI 加密托管 API key/令牌，set/get/delete/list，明文不落日志。
+- **行动审计可视化（P2）**：系统菜单新增「📋 行动审计…」，查看最近 200 条 actions.log（只记录不拦截）。
+- **高风险动作默认审批（P2）**：`approval_actions` 默认包含删文件/数据库/邮件/命令/进程/插件/RPA 等高风险动作，用户可在权限页清空。
+- **记忆扩容（P1）**：长期记忆上限 500 → 2000 条。
+- **常驻值守（P0）**：新增 `watchdog.py` 崩溃自动拉起（3s~60s 退避）；源码运行开机自启改为 watchdog 守护。
+- **新邮件汇总（P1）**：新增 `email_summary` 工具（复用 IMAP 配置，返回可摘要清单）。
+- 全量测试 563 项通过。
+
 ## v2.16.2（2026-08-15）
 
 - **IM 通道配置 UI**：外部服务配置新增「IM 通道」页签（企业微信群机器人 Webhook、智能机器人 Bot ID/Secret、Telegram Token/Chat ID），敏感字段 DPAPI 加密保存；系统菜单新增「📱 IM 通道配置…」快捷入口。
