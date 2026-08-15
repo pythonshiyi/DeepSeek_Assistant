@@ -44,16 +44,14 @@ def show_about(app):
         body, f"\n{app.APP_NAME} 是独立产品，与 DeepSeek 官方无任何关联。",
         role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
     ).pack(anchor="w")
-    app._footer_btn(
-        footer, "Star ⭐",
-        lambda: webbrowser.open(REPO_URL), fsz=9,
+    app._mk_button(
+        footer, "Star ⭐", lambda: webbrowser.open(REPO_URL), fsz=9
     ).pack(side="left")
-    app._footer_btn(
-        footer, "Issues 反馈",
-        lambda: webbrowser.open(REPO_URL + "/issues"), fsz=9,
+    app._mk_button(
+        footer, "Issues 反馈", lambda: webbrowser.open(REPO_URL + "/issues"), fsz=9
     ).pack(side="left", padx=(8, 0))
-    app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True), fsz=9).pack(side="right")
-    app._footer_btn(footer, "关闭", dialog.destroy).pack(side="right", padx=(8, 0))
+    app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True))
+    app._footer_btn(footer, "关闭", dialog.destroy)
 
 def show_balance(app, data):
     """余额查询结果：品牌对话框展示（替代系统 messagebox）。"""
@@ -112,12 +110,11 @@ def show_help(app):
         app._lbl(row, k, role="label_accent", bg="panel", font=(FONT_FAMILY, 9, "bold"),
                  width=12, anchor="w").pack(side="left")
         app._lbl(row, v, bg="panel", font=(FONT_FAMILY, 9), anchor="w").pack(side="left")
-    app._footer_btn(
-        footer, "GitHub 仓库",
-        lambda: webbrowser.open(REPO_URL), fsz=9,
+    app._mk_button(
+        footer, "GitHub 仓库", lambda: webbrowser.open(REPO_URL), fsz=9
     ).pack(side="left")
-    app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True), fsz=9).pack(side="right")
-    app._footer_btn(footer, "关闭", dialog.destroy).pack(side="right", padx=(8, 0))
+    app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True))
+    app._footer_btn(footer, "关闭", dialog.destroy)
 
 def show_welcome(app):
     """欢迎页：首次启动配置 API Key / 体验试玩任务。"""

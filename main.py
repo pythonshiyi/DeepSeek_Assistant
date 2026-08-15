@@ -91,7 +91,7 @@ from session_utils import safe_sid as _safe_sid, session_id as _session_id_impl
 import dialogs
 import wecom_aibot
 from splash import SplashScreen
-from taskpanel import TaskPanel
+from taskpanel import InlineTaskPanel
 from processpanel import ProcessPanel
 
 try:
@@ -196,7 +196,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.21.0"
+VERSION = "2.22.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -312,6 +312,9 @@ class AssistantApp:
     def __init__(self, root):
         _t_init = time.perf_counter()
         self.root = root
+        self.APP_NAME = APP_NAME
+        self.APP_NAME_EN = APP_NAME_EN
+        self.VERSION = VERSION
         self.cfg = load_config()
         # SSRF 信任主机白名单（回环默认放行；内网经白名单显式信任后放行）
         _dc.set_ssrf_trusted(self.cfg.get("ssrf_trusted") or [])
@@ -1062,6 +1065,7 @@ class AssistantApp:
     def _step_font(self, delta):
         size = int(self.cfg.get("font_size", 10)) + delta
         self.cfg["font_size"] = max(8, min(18, size))
+        self.cfg["font_size_custom"] = True
         self.apply_font_size()
         try:
             self.font_size_combo.set(str(self.cfg["font_size"]))
@@ -1518,14 +1522,73 @@ class AssistantApp:
         save_config(self.cfg)
         return "break"
 
+    def _set_panel_width(self, w):
+        try:
+            w = max(LAYOUT["panel_min"], min(LAYOUT["panel_max"], int(w)))
+        except (TypeError, ValueError):
+            return
+        try:
+            self.side_panel.configure(width=w)
+        except tk.TclError:
+            pass
+
+    def _on_panel_width_press(self, event):
+        self._panel_drag_start_x = event.x_root
+        try:
+            self._panel_drag_base = int(self.side_panel.winfo_width())
+        except (tk.TclError, TypeError, ValueError):
+            self._panel_drag_base = int(self.cfg.get("panel_width", LAYOUT["panel_default"]) or LAYOUT["panel_default"])
+        return "break"
+
+    def _on_panel_width_drag(self, event):
+        if getattr(self, "_panel_drag_start_x", None) is None:
+            return None
+        # 向左拖 = 设置面板变宽（聊天区变窄）；向右拖 = 设置面板变窄（聊天区变宽）
+        self._set_panel_width(self._panel_drag_base - (event.x_root - self._panel_drag_start_x))
+        return "break"
+
+    def _on_panel_width_release(self, _event=None):
+        if getattr(self, "_panel_drag_start_x", None) is None:
+            return None
+        self._panel_drag_start_x = None
+        try:
+            w = int(self.side_panel.winfo_width())
+        except (tk.TclError, TypeError, ValueError):
+            w = int(self.cfg.get("panel_width", LAYOUT["panel_default"]) or LAYOUT["panel_default"])
+        self.cfg["panel_width"] = max(LAYOUT["panel_min"], min(LAYOUT["panel_max"], w))
+        save_config(self.cfg)
+        return "break"
+
+    def _reset_panel_width(self, _event=None):
+        self._set_panel_width(LAYOUT["panel_default"])
+        self.cfg["panel_width"] = LAYOUT["panel_default"]
+        save_config(self.cfg)
+        return "break"
+
     def _side_panel(self):
         t = self._theme()
-        panel = tk.Frame(self.root, bg=t["panel"], width=LAYOUT["panel_default"])
+        panel_w = max(
+            LAYOUT["panel_min"],
+            min(LAYOUT["panel_max"], int(self.cfg.get("panel_width", LAYOUT["panel_default"]) or LAYOUT["panel_default"])),
+        )
+        panel = tk.Frame(self.root, bg=t["panel"], width=panel_w)
         panel.pack(side="right", fill="y")
         panel.pack_propagate(False)
         self._restyle.append((panel, "panel"))
         self.side_panel = panel
         self._side_tab = "settings"  # settings / files
+
+        # 右侧设置面板拖拽分隔条：左右拉动调整聊天区/设置面板宽度
+        handle = tk.Frame(self.root, bg=t["page"], width=6, cursor="sb_h_double_arrow")
+        handle.pack(side="right", fill="y")
+        self._restyle.append((handle, "chat_resize_handle"))
+        self.panel_resize_handle = handle
+        handle.bind("<Button-1>", self._on_panel_width_press)
+        handle.bind("<Double-1>", self._reset_panel_width)
+        handle.bind("<Enter>", lambda e: handle.configure(bg=self.theme_color("accent")))
+        handle.bind("<Leave>", lambda e: handle.configure(bg=self.theme_color("page")))
+        self._panel_drag_start_x = None
+        self._panel_drag_base = panel_w
 
         head = tk.Frame(panel, bg=t["panel"])
         head.pack(fill="x", padx=14, pady=(10, 4))
@@ -1562,7 +1625,12 @@ class AssistantApp:
                 g, width=18, values=list(MODELS.keys()), state="normal"  # 可输入任意模型名
             )
             self.model_combo.pack(fill="x")
-            self.model_combo.bind("<<ComboboxSelected>>", lambda e: self._update_context_bar())
+            self.model_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda e: (self._update_context_bar(), self._persist_panel_settings()),
+            )
+            self.model_combo.bind("<FocusOut>", self._persist_panel_settings)
+            self.model_combo.bind("<Return>", self._persist_panel_settings)
             self._lbl(g, "场景 = 模型采样参数（温度 / 思考强度）", role="label_sec",
                       bg="panel", font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(6, 0))
             self.scenario_combo = ttk.Combobox(
@@ -1581,36 +1649,54 @@ class AssistantApp:
             row3.pack(fill="x", pady=(6, 0))
             self._restyle.append((row3, "panel"))
             self._lbl(row3, "输出上限", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left")
-            self.max_tokens_spin = ttk.Spinbox(row3, from_=1024, to=393216, increment=4096, width=10)
+            self.max_tokens_spin = ttk.Spinbox(
+                row3, from_=1024, to=393216, increment=4096, width=10,
+                command=self._persist_panel_settings,
+            )
             self.max_tokens_spin.pack(side="left", padx=(6, 10))
+            self.max_tokens_spin.bind("<FocusOut>", self._persist_panel_settings)
+            self.max_tokens_spin.bind("<Return>", self._persist_panel_settings)
             self._lbl(row3, "seed", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left")
             self.seed_var = tk.StringVar()
-            ttk.Entry(row3, textvariable=self.seed_var, width=10).pack(side="left", padx=(4, 0))
+            self.seed_entry = ttk.Entry(row3, textvariable=self.seed_var, width=10)
+            self.seed_entry.pack(side="left", padx=(4, 0))
+            self.seed_entry.bind("<FocusOut>", self._persist_panel_settings)
+            self.seed_entry.bind("<Return>", self._persist_panel_settings)
             self.custom_row = tk.Frame(g, bg=t["panel"])
             self._restyle.append((self.custom_row, "panel"))
             self._lbl(
                 self.custom_row, "温度", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)
             ).pack(side="left")
             self.custom_temp_var = tk.StringVar(value="1.00")
-            ttk.Spinbox(
+            self.custom_temp_spin = ttk.Spinbox(
                 self.custom_row, from_=0.0, to=2.0, increment=0.05, width=6,
                 textvariable=self.custom_temp_var, format="%.2f",
-            ).pack(side="left", padx=(4, 10))
+                command=self._persist_panel_settings,
+            )
+            self.custom_temp_spin.pack(side="left", padx=(4, 10))
+            self.custom_temp_spin.bind("<FocusOut>", self._persist_panel_settings)
+            self.custom_temp_spin.bind("<Return>", self._persist_panel_settings)
             self._lbl(
                 self.custom_row, "top_p", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)
             ).pack(side="left")
             self.custom_topp_var = tk.StringVar(value="1.00")
-            ttk.Spinbox(
+            self.custom_topp_spin = ttk.Spinbox(
                 self.custom_row, from_=0.0, to=1.0, increment=0.05, width=6,
                 textvariable=self.custom_topp_var, format="%.2f",
-            ).pack(side="left", padx=(4, 0))
+                command=self._persist_panel_settings,
+            )
+            self.custom_topp_spin.pack(side="left", padx=(4, 0))
+            self.custom_topp_spin.bind("<FocusOut>", self._persist_panel_settings)
+            self.custom_topp_spin.bind("<Return>", self._persist_panel_settings)
             self.json_var = tk.BooleanVar(value=False)
             self.json_check = ttk.Checkbutton(
-                g, text="JSON 输出 (response_format)", variable=self.json_var
+                g, text="JSON 输出 (response_format)", variable=self.json_var,
+                command=self._persist_panel_settings,
             )
             self.beta_var = tk.BooleanVar(value=False)
             self.beta_check = ttk.Checkbutton(
-                g, text="Beta API（前缀续写 / FIM 补全）", variable=self.beta_var
+                g, text="Beta API（前缀续写 / FIM 补全）", variable=self.beta_var,
+                command=self._persist_panel_settings,
             )
             # 高级参数折叠：温度/top_p/JSON/Beta 默认收起，减少高频面板信息密度
             self.adv_expanded = tk.BooleanVar(value=False)
@@ -1638,7 +1724,10 @@ class AssistantApp:
 
         def tools_group(g):
             self.tools_var = tk.BooleanVar(value=True)
-            ttk.Checkbutton(g, text="启用工具 (Agent 自动调用)", variable=self.tools_var).pack(anchor="w")
+            ttk.Checkbutton(
+                g, text="启用工具 (Agent 自动调用)", variable=self.tools_var,
+                command=self._persist_panel_settings,
+            ).pack(anchor="w")
             self.btn_tools = self._mk_button(g, "工具设置", self.edit_tools, fsz=9)
             self.btn_tools.pack(anchor="w", pady=(6, 0))
             self.browser_visible_var = tk.BooleanVar(value=not bool(self.cfg.get("browser_headless", True)))
@@ -1684,6 +1773,8 @@ class AssistantApp:
             self.key_var = tk.StringVar()
             self.key_entry = ttk.Entry(g, textvariable=self.key_var, show="*")
             self.key_entry.pack(fill="x")
+            self.key_entry.bind("<FocusOut>", self._persist_panel_settings)
+            self.key_entry.bind("<Return>", self._persist_panel_settings)
 
         group("API Key", api_group)
 
@@ -2005,9 +2096,9 @@ class AssistantApp:
             return 1.0
 
     def _apply_screen_font_default(self):
-        """大屏默认字号提升：仅当用户未自定义字号（=默认 10）时按屏幕高度调整。"""
+        """大屏默认字号提升：仅当用户从未手动改过字号时按屏幕高度调整。"""
         try:
-            if int(self.cfg.get("font_size", 10) or 10) != 10:
+            if bool(self.cfg.get("font_size_custom", False)):
                 return
             sh = self.root.winfo_screenheight()
             if sh >= 1300:
@@ -2255,11 +2346,13 @@ class AssistantApp:
         self._drag_max_px = 400
 
     def _on_any_drag(self, event):
-        """根窗口 B1-Motion 分发：输入区拖拽与聊天区宽度拖拽（各自按状态守卫）。"""
+        """根窗口 B1-Motion 分发：输入区拖拽与聊天区/右侧面板宽度拖拽（各自按状态守卫）。"""
         if self._drag_start_y is not None:
             return self._on_handle_drag(event)
         if getattr(self, "_width_drag_start_x", None) is not None:
             return self._on_width_drag(event)
+        if getattr(self, "_panel_drag_start_x", None) is not None:
+            return self._on_panel_width_drag(event)
         return None
 
     def _on_any_release(self, _event=None):
@@ -2269,6 +2362,9 @@ class AssistantApp:
             dragging = True
         if getattr(self, "_width_drag_start_x", None) is not None:
             self._on_width_release(_event)
+            dragging = True
+        if getattr(self, "_panel_drag_start_x", None) is not None:
+            self._on_panel_width_release(_event)
             dragging = True
         # 仅在确实拖拽过时 break，防止无条件吞掉 all 标签上的全局释放处理
         return "break" if dragging else None
@@ -2361,6 +2457,8 @@ class AssistantApp:
         self.chat_frame.pack(side="left", fill="both", expand=True)
         self._restyle.append((self.chat_frame, "page"))
         self.chat_frame.bind("<Configure>", self._layout_all)
+        # 内嵌任务进度卡（聊天区右上角，替代左下角悬浮弹窗）
+        self.task_panel = InlineTaskPanel(self.chat_frame, theme=t)
         self._add_session()
         self._show_session_text(self._current)
 
@@ -3752,6 +3850,7 @@ class AssistantApp:
         except ValueError:
             return
         self.cfg["font_size"] = max(8, min(18, size))
+        self.cfg["font_size_custom"] = True
         self.apply_font_size()
         save_config(self.cfg)
 
@@ -3782,8 +3881,18 @@ class AssistantApp:
             self._restore_input_height()
         except Exception:
             pass
-        self.on_scenario_change()
+        self.on_scenario_change(persist=False, reset_thinking=False)
         self._update_role_label()
+        self._panel_settings_ready = True
+
+    def _persist_panel_settings(self, _event=None):
+        """右侧设置面板改动即时落盘（重启/托盘驻留都不丢配置）。"""
+        if not getattr(self, "_panel_settings_ready", False):
+            return
+        try:
+            self.save_widgets_to_config()
+        except Exception:
+            logging.exception("设置面板即时保存失败")
 
     def save_widgets_to_config(self):
         new = {}
@@ -3827,10 +3936,13 @@ class AssistantApp:
             save_config(self.cfg)
         return self.cfg
 
-    def on_scenario_change(self, _event=None):
+    def on_scenario_change(self, _event=None, persist=True, reset_thinking=True):
         scenario = self.scenario_combo.get()
-        if scenario in SCENARIO_DEFAULT_THINKING:
+        # 只有用户手动切换场景时才联动思考档位；启动回填时禁止覆盖已保存的思考设置
+        if reset_thinking and scenario in SCENARIO_DEFAULT_THINKING:
             self.thinking_combo.set(THINKING_MODES[SCENARIO_DEFAULT_THINKING[scenario]])
+        if persist:
+            self._persist_panel_settings()
         if scenario == "自定义":
             # custom_row 的父容器是折叠的 adv_frame，须先展开高级参数区温度行才可见
             if not self.adv_expanded.get():
@@ -3842,6 +3954,7 @@ class AssistantApp:
 
     def _on_thinking_changed(self, _event=None):
         label = self.thinking_combo.get()
+        self._persist_panel_settings()
         if label != "最大思考 (max)":
             return
         try:
@@ -8783,13 +8896,6 @@ class AssistantApp:
         self._stream_begin = time.monotonic()
         self._thinking_received = False
         self._stream_thinking_fold = None
-        if self.task_panel is None:
-            try:
-                self.task_panel = TaskPanel(
-                    self.root, on_stop=self.stop_generate, theme=self._theme()
-                )
-            except Exception:
-                self.task_panel = None
         if self.task_panel is not None:
             try:
                 self.task_panel.prepare()

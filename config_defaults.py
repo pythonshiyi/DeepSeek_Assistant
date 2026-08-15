@@ -128,6 +128,7 @@ DEFAULT_CONFIG = {
     "timeout": 120,
     "restore_session": True,
     "font_size": 10,
+    "font_size_custom": False,  # 用户手动改过字号后为 True，启动时不再自动按屏幕调整
     "theme": "light",
     "md_render": True,
     "custom_temperature": 1.0,
@@ -141,6 +142,7 @@ DEFAULT_CONFIG = {
     "input_height": 4,
     "input_height_px": 0,
     "sidebar_width": 260,
+    "panel_width": 280,
     "browser_headless": False,  # 初始浏览器可见（有头模式）
     "json_output": False,
     "beta_api": False,

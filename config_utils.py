@@ -144,6 +144,10 @@ def normalize_config(cfg):
         cfg["sidebar_width"] = max(LAYOUT["sidebar_min"], min(LAYOUT["sidebar_max"], int(cfg.get("sidebar_width", LAYOUT["sidebar_default"]))))
     except (TypeError, ValueError):
         cfg["sidebar_width"] = LAYOUT["sidebar_default"]
+    try:
+        cfg["panel_width"] = max(LAYOUT["panel_min"], min(LAYOUT["panel_max"], int(cfg.get("panel_width", LAYOUT["panel_default"]))))
+    except (TypeError, ValueError):
+        cfg["panel_width"] = LAYOUT["panel_default"]
     # 自定义主题：仅接受 dict 值，且名称不覆盖内置主题
     try:
         custom_themes = cfg.get("custom_themes") or {}

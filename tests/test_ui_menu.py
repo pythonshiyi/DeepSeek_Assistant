@@ -293,5 +293,44 @@ class TestRoleSystem(unittest.TestCase):
         self.assertTrue(self.app.cfg["full_auto"])
 
 
+class TestPanelSettingsPersist(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir, cls.root, cls.app = _make_app()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.app.on_close()
+        except Exception:
+            pass
+        try:
+            cls.root.destroy()
+        except Exception:
+            pass
+
+    def test_panel_changes_persist_to_config(self):
+        self.app._panel_settings_ready = True
+        self.app.model_combo.set("deepseek-v4-pro")
+        self.app.thinking_combo.set(m.THINKING_MODES["none"])
+        self.app.scenario_combo.set("编程")
+        self.app._persist_panel_settings()
+        reloaded = m.load_config()
+        self.assertEqual(reloaded["model"], "deepseek-v4-pro")
+        self.assertEqual(reloaded["thinking"], "none")
+        self.assertEqual(reloaded["scenario"], "编程")
+
+    def test_thinking_none_survives_setup_roundtrip(self):
+        """用户保存的思考档位不得被启动时的场景回填覆盖。"""
+        self.app.thinking_combo.set(m.THINKING_MODES["none"])
+        self.app._persist_panel_settings()
+        self.app.setup_widgets_from_config()
+        self.assertEqual(self.app.thinking_combo.get(), m.THINKING_MODES["none"])
+        self.assertEqual(self.app.cfg["thinking"], "none")
+        self.app.save_widgets_to_config()
+        reloaded = m.load_config()
+        self.assertEqual(reloaded["thinking"], "none")
+
+
 if __name__ == "__main__":
     unittest.main()

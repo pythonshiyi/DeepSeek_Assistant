@@ -336,6 +336,113 @@ class TaskPanel:
             self._hide_after = None
 
 
+class InlineTaskPanel:
+    """聊天区右上角内嵌任务进度卡（替代左下角悬浮窗）。
+
+    小、轻、不打断：任务开始时出现，工具执行时更新状态，完成后 4 秒淡出。
+    """
+
+    def __init__(self, master, theme=None):
+        self.master = master
+        self.theme = theme or {}
+        t = self.theme
+        self.frame = tk.Frame(
+            master, bg=t.get("panel", "#ffffff"),
+            highlightthickness=1, bd=0,
+            highlightbackground=t.get("border", "#e3e5e9"),
+            highlightcolor=t.get("accent", "#3478f6"),
+        )
+        self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+        self.title_lbl = tk.Label(
+            self.frame, text="🤖 任务执行中", bg=t.get("panel", "#ffffff"),
+            fg=t.get("accent", "#3478f6"), font=(FONT_FAMILY, 9, "bold"),
+        )
+        self.title_lbl.pack(side="left", padx=(10, 8), pady=6)
+        self.status_lbl = tk.Label(
+            self.frame, text="", bg=t.get("panel", "#ffffff"),
+            fg=t.get("text_sec", "#8a9099"), font=(FONT_FAMILY, 9),
+            anchor="w", justify="left",
+        )
+        self.status_lbl.pack(side="left", padx=(0, 12), pady=6)
+        self._count = 0
+        self._started_at = 0.0
+        self._hide_after = None
+        self.frame.place_forget()
+
+    def prepare(self):
+        self._count = 0
+        self._started_at = time.monotonic()
+        try:
+            self.title_lbl.configure(text="🤖 任务执行中")
+            self.status_lbl.configure(text="准备工具…")
+            self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+            self.frame.lift()
+        except tk.TclError:
+            pass
+
+    def add_tool(self, name, result):
+        self._count += 1
+        ok = not str(result or "").startswith(("错误", "权限拒绝", "超时"))
+        mark = "✅" if ok else "⚠"
+        try:
+            self.status_lbl.configure(
+                text=f"{mark} {name} · 第 {self._count} 个 · {self._elapsed():.0f}s"
+            )
+            self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+            self.frame.lift()
+        except tk.TclError:
+            pass
+
+    def finish(self, summary=""):
+        try:
+            self.title_lbl.configure(text="🤖 任务完成")
+            self.status_lbl.configure(text=str(summary or "")[:120])
+            self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+            self.frame.lift()
+        except tk.TclError:
+            pass
+        self._cancel_hide()
+        self._hide_after = self.master.after(4000, self._hide)
+
+    def _elapsed(self):
+        return max(0.0, time.monotonic() - self._started_at)
+
+    def _hide(self):
+        self._hide_after = None
+        try:
+            self.frame.place_forget()
+        except tk.TclError:
+            pass
+
+    def _cancel_hide(self):
+        if self._hide_after is not None:
+            try:
+                self.master.after_cancel(self._hide_after)
+            except Exception:
+                pass
+            self._hide_after = None
+
+    def apply_theme(self, t):
+        self.theme = t or {}
+        try:
+            self.frame.configure(
+                bg=t.get("panel", "#ffffff"),
+                highlightbackground=t.get("border", "#e3e5e9"),
+                highlightcolor=t.get("accent", "#3478f6"),
+            )
+            self.title_lbl.configure(bg=t.get("panel", "#ffffff"), fg=t.get("accent", "#3478f6"))
+            self.status_lbl.configure(bg=t.get("panel", "#ffffff"), fg=t.get("text_sec", "#8a9099"))
+        except tk.TclError:
+            pass
+
+    def destroy(self):
+        self._cancel_hide()
+        try:
+            self.frame.destroy()
+        except tk.TclError:
+            pass
+
+
 def _count_paths(text):
     try:
         return sum(1 for _ in PATH_RE.finditer(text or ""))

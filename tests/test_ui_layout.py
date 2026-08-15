@@ -147,6 +147,17 @@ class TestInputChatAlignment(unittest.TestCase):
         except Exception as e:
             self.fail(str(e))
 
+    def test_panel_width_drag_adjusts_right_panel(self):
+        try:
+            self.app._set_panel_width(440)
+            self.app.root.update_idletasks()
+            self.assertGreaterEqual(self.app.side_panel.winfo_width(), 400)
+            self.app._reset_panel_width()
+            self.app.root.update_idletasks()
+            self.assertLessEqual(self.app.side_panel.winfo_width(), m.LAYOUT["panel_default"] + 20)
+        except Exception as e:
+            self.fail(str(e))
+
 
 class TestDialogSnap(unittest.TestCase):
     @classmethod

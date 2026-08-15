@@ -6,10 +6,10 @@
 from config_defaults import DEFAULT_SYSTEM_PROMPT
 
 ROLES = {
-    "通用助手": {
+    "通用角色": {
         "prompt": DEFAULT_SYSTEM_PROMPT,
         "thinking": "high",
-        "desc": "默认全能助手，任务拆解/工具调用/长上下文管理",
+        "desc": "默认全能角色，任务拆解/工具调用/长上下文管理",
     },
     "智能体": {
         "prompt": (
