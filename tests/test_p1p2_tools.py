@@ -199,6 +199,33 @@ class TestIMChannels(unittest.TestCase):
         self.assertIn("@me: 召唤", out)
 
 
+class TestAgentMail(unittest.TestCase):
+    def tearDown(self):
+        dc.AGENT_MAIL_ENABLED = False
+        dc.AGENT_MAIL_CLI = "agently-cli"
+
+    def test_disabled_returns_tip(self):
+        dc.AGENT_MAIL_ENABLED = False
+        out = dc.agent_mail("me")
+        self.assertIn("未启用", out)
+
+    def test_me_action(self):
+        dc.AGENT_MAIL_ENABLED = True
+        with mock.patch("deepseek_client._agent_mail_run", return_value=(0, "whaletalk@agent.qq.com")):
+            out = dc.agent_mail("me")
+        self.assertIn("whaletalk@agent.qq.com", out)
+
+    def test_send_requires_to_and_subject(self):
+        dc.AGENT_MAIL_ENABLED = True
+        self.assertIn("to", dc.agent_mail("send", body="x"))
+
+    def test_confirmation_hint(self):
+        dc.AGENT_MAIL_ENABLED = True
+        with mock.patch("deepseek_client._agent_mail_run", return_value=(8, "ctk_1")):
+            out = dc.agent_mail("send", to="a@b.com", subject="t", body="b")
+        self.assertIn("需要用户确认", out)
+
+
 class TestWecomAibotChannel(unittest.TestCase):
     def test_parse_text_frame(self):
         got = []

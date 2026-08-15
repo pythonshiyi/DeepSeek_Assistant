@@ -55,6 +55,7 @@ BUILTIN_TOOL_NAMES = [
     "im_send",
     "telegram_poll_updates",
     "email_summary",
+    "agent_mail",
     "secret_store",
     "rpa_screen_size",
     "rpa_click",
@@ -170,4 +171,6 @@ DEFAULT_CONFIG = {
     "custom_themes": {},      # 自定义主题：名称 -> 主题 token 字典（合并到内置主题）
     "shortcuts": {},          # 快捷键自定义：动作名 -> Tk 键序列（留空使用内置默认）
     "update_public_key": "",  # 更新包签名公钥（可选；配置后校验 Ed25519 签名/或 sha256 字段）
+    "agent_mail_enabled": False,  # Agent Mail（agently-cli）集成开关；默认关闭，不配置不影响使用
+    "agent_mail_cli": "agently-cli",  # agently-cli 可执行文件（或绝对路径）
 }

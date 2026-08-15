@@ -196,7 +196,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -372,6 +372,8 @@ class AssistantApp:
         permissions.set_whitelist_callback(self._request_whitelist_callback)
         permissions.set_audit_enabled(not bool(self.cfg.get("privacy_mode", False)))
         permissions.set_full_auto(bool(self.cfg.get("full_auto", False)))
+        _dc.AGENT_MAIL_ENABLED = bool(self.cfg.get("agent_mail_enabled", False))
+        _dc.AGENT_MAIL_CLI = str(self.cfg.get("agent_mail_cli") or "agently-cli").strip() or "agently-cli"
         self._aibot_listener = None
         self._im_pending_frame = None
         self._im_pending_chatid = None
@@ -5961,6 +5963,40 @@ class AssistantApp:
             role="label_sec", bg="panel", font=(FONT_FAMILY, 8),
         ).pack(anchor="w", pady=(6, 0))
 
+        # ---- Agent Mail 页（agently-cli 可选集成）----
+        am_frame = tk.Frame(nb, bg=t["panel"])
+        nb.add(am_frame, text="Agent Mail")
+        self._lbl(
+            am_frame,
+            "可选：接入 Agent 原生邮箱（agent.qq.com）。启用后 AI 可收发/搜索/整理邮件。"
+            "不启用则静默跳过，不影响其他功能。",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9), wraplength=540, justify="left",
+        ).pack(anchor="w", pady=(4, 8))
+        am_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("agent_mail_enabled", False)))
+        ttk.Checkbutton(
+            am_frame, text="启用 Agent Mail（agently-cli）", variable=am_enabled_var,
+        ).pack(anchor="w")
+        self._lbl(
+            am_frame, "CLI 可执行文件（默认 agently-cli，可填绝对路径）：",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", pady=(8, 2))
+        am_cli_var = tk.StringVar(value=str(self.cfg.get("agent_mail_cli") or "agently-cli"))
+        ttk.Entry(am_frame, textvariable=am_cli_var).pack(fill="x")
+        try:
+            import shutil as _shutil
+            am_status = "已安装" if _shutil.which(str(self.cfg.get("agent_mail_cli") or "agently-cli")) else "未检测到 CLI"
+        except Exception:
+            am_status = "未知"
+        self._lbl(
+            am_frame, f"当前状态：{am_status}（安装命令：npm install -g @tencent-qqmail/agently-cli）",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 8),
+        ).pack(anchor="w", pady=(6, 0))
+        self._lbl(
+            am_frame,
+            "授权登录请在系统终端运行：agently-cli auth login（OAuth 凭据由 CLI 自行保存，鲸语不接触敏感令牌）。",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 8), wraplength=540, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
         # ---- 数据库页 ----
         db_frame = tk.Frame(nb, bg=t["panel"])
         nb.add(db_frame, text="数据库连接")
@@ -6109,6 +6145,10 @@ class AssistantApp:
                 if imap_out:
                     mail_out["imap"] = imap_out
                 self._atomic_json_write(_dc.EMAIL_CONFIG_FILE, mail_out)
+                self.cfg["agent_mail_enabled"] = bool(am_enabled_var.get())
+                self.cfg["agent_mail_cli"] = am_cli_var.get().strip() or "agently-cli"
+                _dc.AGENT_MAIL_ENABLED = bool(self.cfg["agent_mail_enabled"])
+                _dc.AGENT_MAIL_CLI = self.cfg["agent_mail_cli"]
                 try:
                     self.cfg["inbound_port"] = max(0, min(65535, int(port_var.get() or 0)))
                 except (TypeError, ValueError):

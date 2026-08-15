@@ -1516,6 +1516,34 @@ TOOLS = [
             },
         },
     },
+    # ===== Agent Mail（agently-cli，可选配置） =====
+    {
+        "type": "function",
+        "function": {
+            "name": "agent_mail",
+            "description": "Agent 原生邮箱（agently-cli）：me 查看身份 / list 列邮件 / search 搜索 / read 读取 / send 发送 / reply 回复 / forward 转发 / trash 移回收站 / delete 永久删除 / download 下载附件。写操作需两阶段确认：首次调用返回 confirmation-token，向用户确认后再次调用",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "me / list / search / read / send / reply / forward / trash / delete / download"},
+                    "q": {"type": "string", "description": "search：关键词"},
+                    "id": {"type": "string", "description": "read/reply/forward/trash：msg_xxx"},
+                    "to": {"type": "string", "description": "send/forward：收件人，多个用逗号分隔"},
+                    "subject": {"type": "string", "description": "send：主题"},
+                    "body": {"type": "string", "description": "send/reply/forward：正文"},
+                    "dir": {"type": "string", "description": "list/search：inbox/sent/trash/spam"},
+                    "limit": {"type": "integer", "description": "list/search：返回条数（默认 10）"},
+                    "cursor": {"type": "string", "description": "list/search：翻页游标"},
+                    "confirmation_token": {"type": "string", "description": "写操作二次确认：首次调用返回的 ctk_xxx"},
+                    "attachment": {"type": "string", "description": "send/reply：附件路径，多个逗号分隔"},
+                    "msg": {"type": "string", "description": "download：msg_xxx"},
+                    "att": {"type": "string", "description": "download：att_xxx"},
+                    "output": {"type": "string", "description": "download：保存目录"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
     # ===== v2 能力层 · 任务检查点（断点续跑） =====
     {
         "type": "function",
@@ -2441,6 +2469,8 @@ def send_webhook(title="", text="", channel=""):
 
 # ===== IM 主动触达（P1）：Telegram Bot / 企业微信群机器人 =====
 IM_CONFIG_FILE = None  # 由 main 注入（DATA_DIR/im_config.json）
+AGENT_MAIL_ENABLED = False  # 由 main 按 config.agent_mail_enabled 注入（默认关闭，不配置不启用）
+AGENT_MAIL_CLI = "agently-cli"
 _TELEGRAM_OFFSET = 0   # Telegram getUpdates 游标（进程内去重）
 
 
@@ -6605,6 +6635,137 @@ def email_summary(limit=10, since_days=1):
     return "新邮件汇总任务：请根据以下邮件清单生成要点摘要（发件人/主题/日期）：\n\n" + raw
 
 
+# ---------- Agent Mail（agently-cli，可选集成） ----------
+def _agent_mail_run(args, timeout=60):
+    """调用 agently-cli 并返回 (exit_code, stdout_text)。"""
+    cli = str(AGENT_MAIL_CLI or "agently-cli").strip() or "agently-cli"
+    cmd = [cli] + args
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        out = (proc.stdout or "").strip()
+        if proc.returncode != 0 and (proc.stderr or "").strip():
+            out += (("\n" + proc.stderr.strip()) if out else proc.stderr.strip())
+        return proc.returncode, out
+    except FileNotFoundError:
+        return 127, "未找到 agently-cli（请先 npm install -g @tencent-qqmail/agently-cli，并在 系统 → 外部服务配置 → Agent Mail 开启）"
+    except Exception as e:
+        return 1, f"调用 agently-cli 失败: {e}"
+
+
+def _agent_mail_tip():
+    return (
+        "Agent Mail 未启用（不需要可忽略）。启用方法：系统菜单 → 外部服务配置 → Agent Mail 页签，"
+        "勾选启用并确认 CLI 已安装（npm install -g @tencent-qqmail/agently-cli）。"
+    )
+
+
+def agent_mail(action="list", q="", id="", to="", subject="", body="", dir="",
+               limit=10, cursor="", confirmation_token="", attachment="", msg="", att="", output=""):
+    """Agent 原生邮箱（通过 agently-cli）：me/list/search/read/send/reply/forward/trash/delete/download。
+
+    写操作遵循 CLI 两阶段确认：首次调用不带 confirmation_token 会返回 ctk 与 summary，
+    请向用户展示并等待明确许可后，再用相同参数 + confirmation_token 完成。
+    """
+    if not AGENT_MAIL_ENABLED:
+        return _agent_mail_tip()
+    act = str(action or "list").strip().lower()
+    cli = str(AGENT_MAIL_CLI or "agently-cli").strip() or "agently-cli"
+    # 解析收件人与附件（逗号分隔，CLI 要求可重复参数）
+    def _multi(value):
+        return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
+    cmd = [cli]
+    try:
+        limit = max(1, min(50, int(limit or 10)))
+    except (TypeError, ValueError):
+        limit = 10
+
+    try:
+        if act == "me":
+            cmd += ["+me"]
+        elif act == "list":
+            cmd += ["message", "+list", "--limit", str(limit)]
+            if str(dir or "").strip():
+                cmd += ["--dir", str(dir).strip()]
+            if str(cursor or "").strip():
+                cmd += ["--cursor", str(cursor).strip()]
+        elif act == "search":
+            cmd += ["message", "+search", "--q", str(q or ""), "--limit", str(limit)]
+            if str(dir or "").strip():
+                cmd += ["--dir", str(dir).strip()]
+            if str(cursor or "").strip():
+                cmd += ["--cursor", str(cursor).strip()]
+        elif act == "read":
+            if not str(id or "").strip():
+                return "错误：read 需要 id（msg_xxx）"
+            cmd += ["message", "+read", "--id", str(id).strip()]
+        elif act == "send":
+            if not _multi(to) or not str(subject or "").strip():
+                return "错误：send 需要 to（可逗号分隔多个）与 subject"
+            cmd += ["message", "+send", "--subject", str(subject).strip(), "--body", str(body or "")]
+            for x in _multi(to):
+                cmd += ["--to", x]
+            for x in _multi(attachment):
+                cmd += ["--attachment", x]
+            if str(confirmation_token or "").strip():
+                cmd += ["--confirmation-token", str(confirmation_token).strip()]
+        elif act == "reply":
+            if not str(id or "").strip():
+                return "错误：reply 需要 id（msg_xxx）"
+            cmd += ["message", "+reply", "--id", str(id).strip(), "--body", str(body or "")]
+            for x in _multi(attachment):
+                cmd += ["--attachment", x]
+            if str(confirmation_token or "").strip():
+                cmd += ["--confirmation-token", str(confirmation_token).strip()]
+        elif act == "forward":
+            if not str(id or "").strip() or not _multi(to):
+                return "错误：forward 需要 id 与 to"
+            cmd += ["message", "+forward", "--id", str(id).strip(), "--body", str(body or "")]
+            for x in _multi(to):
+                cmd += ["--to", x]
+            if str(confirmation_token or "").strip():
+                cmd += ["--confirmation-token", str(confirmation_token).strip()]
+        elif act == "trash":
+            if not str(id or "").strip():
+                return "错误：trash 需要 id"
+            cmd += ["message", "+trash", "--id", str(id).strip()]
+            if str(confirmation_token or "").strip():
+                cmd += ["--confirmation-token", str(confirmation_token).strip()]
+        elif act == "delete":
+            if str(id or "").strip():
+                cmd += ["message", "+delete", "--id", str(id).strip()]
+            else:
+                cmd += ["message", "+delete", "--all"]
+        elif act == "download":
+            if not str(msg or "").strip() or not str(att or "").strip():
+                return "错误：download 需要 msg（msg_xxx）与 att（att_xxx）"
+            cmd += ["attachment", "+download", "--msg", str(msg).strip(), "--att", str(att).strip()]
+            if str(output or "").strip():
+                cmd += ["--output", str(output).strip()]
+        else:
+            return "错误：action 仅支持 me/list/search/read/send/reply/forward/trash/delete/download"
+    except Exception as e:
+        return f"错误：参数构造失败: {e}"
+
+    timeout = 120 if act in ("send", "reply", "forward") else 60
+    code, out = _agent_mail_run(cmd, timeout=timeout)
+    if code == 127:
+        return out
+    # exit 8 = 缺少 confirmation-token：把 ctk/summary 原样交回，AI 必须停下等用户确认
+    if code == 8 and not str(confirmation_token or "").strip():
+        return (
+            "[需要用户确认] 请把下面的 summary 展示给用户并等待明确许可；"
+            "用户许可后，用相同参数加 confirmation_token 再次调用。\n\n" + out
+        )
+    if code == 0:
+        return out or "（命令成功，无输出）"
+    return f"[agently-cli exit {code}] " + out
+
+
 # ---------- 任务检查点（断点续跑） ----------
 def task_checkpoint_save(name="", status="进行中", pending=None, notes="", auto=False):
     """保存任务进度检查点（崩溃/重启后可从此继续）。
@@ -8382,6 +8543,7 @@ TOOL_CALL_MAP = {
     "database_execute": database_execute,
     "read_email": read_email,
     "email_summary": email_summary,
+    "agent_mail": agent_mail,
     "task_checkpoint_save": task_checkpoint_save,
     "task_checkpoint_load": task_checkpoint_load,
     "run_workflow": run_workflow,

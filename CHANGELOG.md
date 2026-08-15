@@ -2,6 +2,12 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.18.0（2026-08-15）
+
+- **Agent Mail 集成（可选）**：新增 `agent_mail` 工具封装 agently-cli——me/list/search/read/send/reply/forward/trash/delete/download 附件；写操作遵循两阶段确认（返回 confirmation-token，AI 必须等用户确认）。
+- **配置 UI**：外部服务配置新增「Agent Mail」页签——启用开关 + CLI 路径 + 安装状态提示；默认关闭，未配置时工具返回友好提示、不报错。
+- 全量测试 568 项通过。
+
 ## v2.17.0（2026-08-15）
 
 - **桌面 RPA（P0）**：新增 `rpa_screen_size / rpa_click / rpa_type / rpa_hotkey / rpa_move / rpa_scroll / rpa_screenshot`（pyautogui），可模拟鼠标键盘操作任意桌面软件；加入默认启用集，默认需审批（高风险）。
