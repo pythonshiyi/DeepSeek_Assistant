@@ -15,6 +15,17 @@ import permissions
 import main as m
 
 
+def _set_security_mode(mode):
+    """切换 permissions 安全模式并返回旧模式（测试用）。"""
+    if permissions.get_data() is None:
+        import json as _json
+        permissions.set_data(_json.loads(_json.dumps(permissions.DEFAULT_PERMISSIONS)))
+    data = permissions.get_data()
+    old = data.get("security_mode", "blacklist")
+    data["security_mode"] = mode
+    return old
+
+
 class TestRunPythonAstGuard(unittest.TestCase):
     """run_python 双层防线：正则 + ast（修复 from-import / 动态导入 / 反射 / 写 open 绕过）。"""
 
@@ -167,9 +178,13 @@ class TestSSRFDnsRebinding(unittest.TestCase):
             self.assertTrue(dc._is_private_host(host), host)
 
     def test_loopback_strict_when_disallowed(self):
-        """严格场景（搜索过滤等外部注入源）：回环也阻止。"""
-        self.assertTrue(dc._is_private_host("127.0.0.1", allow_loopback=False))
-        self.assertTrue(dc._safe_url("http://localhost:3000/", allow_loopback=False))
+        """严格场景（whitelist 旧模式）：回环也阻止。"""
+        old = _set_security_mode("whitelist")
+        try:
+            self.assertTrue(dc._is_private_host("127.0.0.1", allow_loopback=False))
+            self.assertTrue(dc._safe_url("http://localhost:3000/", allow_loopback=False))
+        finally:
+            _set_security_mode(old)
 
     def test_trusted_whitelist_allows_private(self):
         """SSRF 信任白名单：内网 IP/CIDR/主机名 显式信任后放行；元数据仍阻止。"""
@@ -187,16 +202,54 @@ class TestSSRFDnsRebinding(unittest.TestCase):
         for host in ("10.1.2.3", "172.16.5.5", "192.168.0.1", "0.0.0.0"):
             self.assertTrue(dc._is_private_host(host), host)
 
-    def test_fetch_url_allows_localhost(self):
-        """fetch_url 默认放行回环（本地服务器验证），内网仍拒绝。"""
-        self.assertFalse(dc._safe_url("http://localhost:3000/"))
-        self.assertFalse(dc._safe_url("http://127.0.0.1:5173/"))
-        self.assertTrue(dc._safe_url("http://192.168.1.5/"))
+    def test_whitelist_mode_blocks_private_and_allows_loopback(self):
+        """whitelist 旧模式：回环放行（本地验证），内网仍拒绝。"""
+        old = _set_security_mode("whitelist")
+        try:
+            self.assertFalse(dc._safe_url("http://localhost:3000/"))
+            self.assertFalse(dc._safe_url("http://127.0.0.1:5173/"))
+            self.assertTrue(dc._safe_url("http://192.168.1.5/"))
+        finally:
+            _set_security_mode(old)
 
-    def test_fetch_url_rejects_internal_after_resolve(self):
-        with self._patch_getaddrinfo(["10.0.0.5"]):
-            out = dc.fetch_url("http://rebind.example.com/")
-        self.assertTrue("SSRF" in out or "阻止" in out, out)
+    def test_whitelist_mode_rejects_internal_after_resolve(self):
+        old = _set_security_mode("whitelist")
+        try:
+            with self._patch_getaddrinfo(["10.0.0.5"]):
+                out = dc.fetch_url("http://rebind.example.com/")
+            self.assertTrue("SSRF" in out or "阻止" in out, out)
+        finally:
+            _set_security_mode(old)
+
+
+class TestBlacklistNetworkMode(unittest.TestCase):
+    """v2.13+ 黑名单网络哲学：默认放行，只按用户 network.blocklist 拦截。"""
+
+    def test_default_blacklist_allows_private(self):
+        old = _set_security_mode("blacklist")
+        data = permissions.get_data()
+        old_net = data.get("network", {}).get("blocklist", [])
+        data.setdefault("network", {})["blocklist"] = []
+        try:
+            self.assertEqual(dc._safe_url("http://192.168.1.5/"), "")
+            self.assertEqual(dc._safe_url("http://10.0.0.1/"), "")
+            self.assertEqual(dc._safe_url("http://169.254.169.254/"), "")
+            self.assertEqual(dc._safe_url("http://localhost:3000/"), "")
+        finally:
+            data.setdefault("network", {})["blocklist"] = old_net
+            _set_security_mode(old)
+
+    def test_network_blocklist_blocks(self):
+        old = _set_security_mode("blacklist")
+        try:
+            data = permissions.get_data()
+            data.setdefault("network", {})["blocklist"] = ["169.254.169.254", "10.0.0.0/8", "*.internal.example.com"]
+            self.assertTrue(dc._safe_url("http://169.254.169.254/latest/meta-data"))
+            self.assertTrue(dc._safe_url("http://10.2.3.4/"))
+            self.assertTrue(dc._safe_url("http://evil.internal.example.com/"))
+            self.assertEqual(dc._safe_url("http://192.168.1.5/"), "")
+        finally:
+            _set_security_mode(old)
 
 
 class TestCustomToolSSRF(unittest.TestCase):
@@ -209,10 +262,14 @@ class TestCustomToolSSRF(unittest.TestCase):
             out = dc.DeepSeekClient._run_custom_tool(handler, "{}")
         self.assertEqual(out, "ok")
 
-    def test_endpoint_internal_rejected(self):
-        handler = {"function": {"name": "t", "endpoint": "http://192.168.1.10:8080/api"}}
-        out = dc.DeepSeekClient._run_custom_tool(handler, "{}")
-        self.assertIn("endpoint", out)
+    def test_endpoint_internal_rejected_in_whitelist_mode(self):
+        old = _set_security_mode("whitelist")
+        try:
+            handler = {"function": {"name": "t", "endpoint": "http://192.168.1.10:8080/api"}}
+            out = dc.DeepSeekClient._run_custom_tool(handler, "{}")
+            self.assertIn("endpoint", out)
+        finally:
+            _set_security_mode(old)
 
     def test_endpoint_public_allowed(self):
         handler = {"function": {"name": "t", "endpoint": "https://example.com/api"}}

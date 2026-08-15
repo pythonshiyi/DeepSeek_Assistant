@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""权限模型：智能体行动能力的闸门（默认拒绝一切，只显式放行）。
+"""权限模型 v2：默认放行 + 黑名单（自由优先，用户掌权）。
 
-- 默认全部关闭：filesystem.allow_write / shell.allow_run_command 均为 false。
-- 所有路径操作必须先 resolve() 规范化（防 .. 穿越），再经 check_filesystem 判定。
-- 审批模式：auto（白名单内自动）/ confirm（每次弹窗确认）/ deny（禁止）。
-- 审计日志 actions.log（10MB 轮转），隐私模式下可关闭。
-- 纯增量模块，不修改现有工具语义；行动类工具在实现内部调用本模块判定。
+设计理念（覆盖 v2.13+ 全部版本）：
+- security_mode = "blacklist"（默认）：AI 默认拥有全部行动能力，
+  用户通过黑名单明确禁止；黑名单可以为空。
+- security_mode = "whitelist"（旧模式，可回退）：默认拒绝，按白名单放行。
+- 完全智能模式（FULL_AUTO）：跳过一切审批/开关，只受黑名单约束。
+- 审计日志只记录不拦截（隐私模式下可关闭）。
 """
 import json
 import logging
@@ -18,39 +19,39 @@ PERMISSIONS_PATH = None
 WORKSPACE_DIR = None
 AUDIT_LOG_DIR = None
 AUDIT_ENABLED = True
-FULL_AUTO = False  # 完全智能模式（完全体放行）：允许目录内全自动（免审批/免开关），系统阻止列表仍生效；由 main 按 config 同步
+FULL_AUTO = False  # 完全智能模式：零审批、零开关；黑名单仍生效
 
 _lock = threading.Lock()
 _data = None
 _approval_callback = None  # (name, args) -> (allowed, reason)
 _whitelist_callback = None  # (action_type, value) -> (allowed, reason)
-# 已 resolve 的目录缓存（Windows 大小写归一化），避免每次检查重复 expanduser/abspath
 _dirs_cache = {"blocked": None, "allowed": None, "workspace": None}
 
 DEFAULT_PERMISSIONS = {
-    "version": 1,
+    "version": 2,
+    "security_mode": "blacklist",  # blacklist（默认放行+黑名单）/ whitelist（旧默认拒绝+白名单）
     "filesystem": {
-        "allow_write": False,
-        "allowed_dirs": [],
-        "blocked_dirs": [
-            "C:/Windows",
-            "C:/Program Files",
-            "C:/Program Files (x86)",
-        ],
-        "max_write_size": 5 * 1024 * 1024,
+        "allow_write": True,       # whitelist 模式开关；blacklist 模式忽略
+        "allowed_dirs": [],        # whitelist 模式白名单；blacklist 模式忽略
+        "blocked_dirs": [],        # 两种模式均生效：命中的路径拒绝
+        "max_write_size": 50 * 1024 * 1024,
     },
     "shell": {
-        "allow_run_command": False,
-        "whitelist": ["python", "pip", "pytest", "git"],
-        "blocklist": ["rm", "del", "format", "shutdown", "taskkill", "reg"],
-        "timeout": 60,
+        "allow_run_command": True, # whitelist 模式开关；blacklist 模式忽略
+        "whitelist": ["python", "pip", "pytest", "git"],  # whitelist 模式用
+        "blocklist": [],           # 两种模式均生效：命中的命令拒绝
+        "timeout": 120,
     },
-    "approval_mode": "auto",  # auto / confirm / deny
+    "network": {
+        "blocklist": [],           # 两种模式均生效：命中的主机/网段拒绝
+    },
+    "approval_actions": [],        # blacklist 模式下需要审批的动作列表（默认空=零审批）
+    "approval_mode": "auto",       # whitelist 模式用：auto / confirm / deny
     "approval_timeout": 120,
-    "plan_confirm": False,  # 每轮工具调用前先确认整轮计划
+    "plan_confirm": False,
 }
 
-# 需要审批闸门的行动工具（confirm 模式下逐个确认）
+# whitelist 模式下的高风险动作清单（blacklist 模式改用 approval_actions）
 ACTION_TOOLS = (
     "write_file",
     "edit_file",
@@ -63,7 +64,6 @@ ACTION_TOOLS = (
     "run_python",
     "send_email",
     "pip_install",
-    # ===== v2 能力层：新加入的高危行动工具 =====
     "delete_file",
     "batch_rename",
     "extract_archive",
@@ -73,12 +73,10 @@ ACTION_TOOLS = (
     "read_email",
     "image_generate",
     "run_workflow",
-    # ===== 文档 / 媒体 / 云盘（写入或高危，走审批） =====
     "pdf_create",
     "qrcode",
     "media_ffmpeg",
     "webdav",
-    # ===== 插件工坊（AI 安装插件 = 新增能力，走审批） =====
     "create_plugin",
 )
 
@@ -102,13 +100,21 @@ def set_audit_enabled(enabled):
 
 
 def set_full_auto(enabled):
-    """完全智能模式：允许目录内的写/命令/审批全部自动放行（系统阻止列表仍生效）。"""
+    """完全智能模式：零审批、零开关；黑名单仍生效。"""
     global FULL_AUTO
     FULL_AUTO = bool(enabled)
 
 
 def is_full_auto():
     return FULL_AUTO
+
+
+def security_mode():
+    """当前安全模式：blacklist（默认放行+黑名单）/ whitelist（旧默认拒绝+白名单）。"""
+    try:
+        return str((_data or {}).get("security_mode", "blacklist"))
+    except Exception:
+        return "blacklist"
 
 
 def get_data():
@@ -121,40 +127,68 @@ def set_data(data):
         _data = data
 
 
+def _migrate_v1_to_v2(data, disk):
+    """旧权限文件迁移：过去的禁止项保留为黑名单，其余全部放行。"""
+    try:
+        fs = disk.get("filesystem") or {}
+        sh = disk.get("shell") or {}
+        data["security_mode"] = "blacklist"
+        # 旧 blocked_dirs 继续作为黑名单
+        old_blocked = [str(d) for d in (fs.get("blocked_dirs") or []) if str(d).strip()]
+        data["filesystem"]["blocked_dirs"] = old_blocked
+        data["filesystem"]["allowed_dirs"] = [str(d) for d in (fs.get("allowed_dirs") or [])]
+        data["filesystem"]["allow_write"] = bool(fs.get("allow_write", False))
+        # 旧 shell.blocklist 继续作为黑名单
+        old_sh_block = [str(s) for s in (sh.get("blocklist") or []) if str(s).strip()]
+        data["shell"]["blocklist"] = old_sh_block
+        data["shell"]["whitelist"] = [str(s) for s in (sh.get("whitelist") or [])]
+        data["shell"]["allow_run_command"] = bool(sh.get("allow_run_command", False))
+        # 旧 SSRF 永远拦截云元数据：迁移为初始网络黑名单
+        data["network"]["blocklist"] = ["169.254.169.254"]
+        data["approval_actions"] = []
+        for key in ("approval_mode", "approval_timeout", "plan_confirm"):
+            if key in disk:
+                data[key] = disk[key]
+    except Exception:
+        logging.exception("权限配置迁移失败，使用默认黑名单模式")
+
+
 def _load():
     data = json.loads(json.dumps(DEFAULT_PERMISSIONS))
     if PERMISSIONS_PATH and os.path.exists(PERMISSIONS_PATH):
         try:
             with open(PERMISSIONS_PATH, "r", encoding="utf-8") as f:
                 disk = json.load(f)
-            for section in ("filesystem", "shell"):
-                if isinstance(disk.get(section), dict):
-                    data[section].update(disk[section])
-            for key in ("approval_mode", "approval_timeout", "plan_confirm"):
-                if key in disk:
-                    data[key] = disk[key]
+            if int(disk.get("version", 1) or 1) < 2:
+                _migrate_v1_to_v2(data, disk)
+            else:
+                for section in ("filesystem", "shell", "network"):
+                    if isinstance(disk.get(section), dict):
+                        data[section].update(disk[section])
+                for key in (
+                    "security_mode",
+                    "approval_actions",
+                    "approval_mode",
+                    "approval_timeout",
+                    "plan_confirm",
+                ):
+                    if key in disk:
+                        data[key] = disk[key]
+                if str(data.get("security_mode")) not in ("blacklist", "whitelist"):
+                    data["security_mode"] = "blacklist"
         except Exception:
             logging.exception("读取权限配置失败，使用默认值")
-    # 默认允许工作目录
     if WORKSPACE_DIR and WORKSPACE_DIR not in data["filesystem"]["allowed_dirs"]:
         data["filesystem"]["allowed_dirs"].append(WORKSPACE_DIR)
-    # 动态阻止用户配置目录（权限文件中的 ~ 也展开处理）
-    appdata = os.path.expanduser("~/AppData")
-    if appdata and appdata not in data["filesystem"]["blocked_dirs"]:
-        data["filesystem"]["blocked_dirs"].append(appdata)
     return data
 
 
 def save():
-    """保存权限配置（不落盘 allowed_dirs 中的自动工作目录，避免冗余）。"""
+    """保存权限配置（原子写）。"""
     if not PERMISSIONS_PATH:
         return False
     try:
         data = json.loads(json.dumps(_data))
-        try:
-            data["filesystem"]["allowed_dirs"].remove(WORKSPACE_DIR)
-        except (ValueError, TypeError):
-            pass
         from persistence import atomic_json_write
         return atomic_json_write(PERMISSIONS_PATH, data, indent=2)
     except Exception:
@@ -163,13 +197,7 @@ def save():
 
 
 def resolve(path):
-    """规范化路径：展开 ~、绝对化、去 .. 、realpath 解析链接（杜绝路径穿越与 junction 逃逸）。
-
-    - 相对路径锚定到 WORKSPACE_DIR（不依赖进程 CWD）。
-    - realpath 解析符号链接/联接点：允许目录内的 link 指向外部时按真实位置判定。
-    - Windows 下统一大小写与分隔符（normcase）。
-    非法返回 None。
-    """
+    """规范化路径：展开 ~、绝对化、去 .. 、realpath 解析链接。非法返回 None。"""
     try:
         p = str(path or "").strip()
         if not p:
@@ -184,7 +212,7 @@ def resolve(path):
 
 
 def _under(path, base):
-    """路径是否位于 base 之下（两者均已 resolve 归一化大小写与分隔符）。"""
+    """路径是否位于 base 之下（两者均已 resolve 归一化）。"""
     base = base.rstrip("\\/")
     return path == base or path.startswith(base + os.sep)
 
@@ -199,10 +227,6 @@ def _dirs(dirs):
 
 
 def _cached_dirs(key, dirs):
-    """目录列表缓存：check 高频调用，避免每次 expanduser/abspath/realpath。
-
-    签名用内容元组（白名单运行期会增删，不能只比对列表对象身份）。
-    """
     sig = tuple(str(d) for d in (dirs or []))
     cache = _dirs_cache.get(key)
     if cache is None or cache[0] != sig:
@@ -211,22 +235,29 @@ def _cached_dirs(key, dirs):
 
 
 def check_filesystem(path, write=False):
-    """文件系统访问判定。返回 (allowed, reason)。"""
+    """文件系统访问判定。
+
+    blacklist 模式：除 blocked_dirs 外全部允许。
+    whitelist 模式：保持旧行为（写开关 + 允许目录白名单 + blocked_dirs）。
+    """
     if not _data:
         return False, "权限模块未初始化"
     p = resolve(path)
     if p is None:
         return False, f"权限拒绝：路径无效：{path}"
+    blocked = _cached_dirs("blocked", _data["filesystem"].get("blocked_dirs"))
+    for b in blocked:
+        if _under(p, b):
+            return False, f"权限拒绝：路径在黑名单内：{p}"
+    if security_mode() == "blacklist":
+        return True, ""
+    # ---- 旧 whitelist 模式 ----
     if write and not _data["filesystem"].get("allow_write", False) and not FULL_AUTO:
         return (
             False,
             "权限拒绝：写文件未开启（🛠 工具中心 → 权限 → filesystem.allow_write）。"
             "如需授权，可调用 request_permission(action_type='write') 一键开启",
         )
-    blocked = _cached_dirs("blocked", _data["filesystem"].get("blocked_dirs"))
-    for b in blocked:
-        if _under(p, b):
-            return False, f"权限拒绝：路径在阻止列表内：{p}"
     allowed = _cached_dirs("allowed", _data["filesystem"].get("allowed_dirs"))
     if not allowed or not any(_under(p, a) for a in allowed):
         return (
@@ -239,32 +270,35 @@ def check_filesystem(path, write=False):
 
 def max_write_size():
     try:
-        return int(_data["filesystem"].get("max_write_size", 5 * 1024 * 1024))
+        return int(_data["filesystem"].get("max_write_size", 50 * 1024 * 1024))
     except (TypeError, ValueError):
-        return 5 * 1024 * 1024
+        return 50 * 1024 * 1024
 
 
 def check_shell(command):
-    """命令判定：解析 argv、白名单/黑名单。返回 (allowed, reason, argv)。"""
-    if not _data or (not _data["shell"].get("allow_run_command", False) and not FULL_AUTO):
-        return (
-            False,
-            "权限拒绝：终端执行未开启（🛠 工具中心 → 权限 → shell.allow_run_command）。"
-            "如需授权，可调用 request_permission(action_type='command') 请求开启",
-            None,
-        )
+    """命令判定：解析 argv，按模式执行黑名单或白名单。返回 (allowed, reason, argv)。"""
+    if not _data:
+        return False, "权限模块未初始化", None
     try:
-        # Windows 下必须用 posix=False：默认 POSIX 模式把反斜杠当转义符，
-        # `python C:\Users\me\a.py` 会被拆成 'C:Usersmea.py'（路径被静默破坏）
         argv = shlex.split(str(command or ""), posix=(os.name != "nt"))
     except ValueError as e:
         return False, f"命令解析失败：{e}", None
     if not argv:
         return False, "命令为空", None
     base = os.path.basename(argv[0]).lower()
-    blocklist = [str(b).lower() for b in _data["shell"].get("blocklist", [])]
+    blocklist = [str(b).strip().lower() for b in _data["shell"].get("blocklist", []) if str(b).strip()]
     if base in blocklist:
-        return False, f"权限拒绝：命令在阻止列表：{argv[0]}", None
+        return False, f"权限拒绝：命令在黑名单：{argv[0]}", None
+    if security_mode() == "blacklist":
+        return True, "", argv
+    # ---- 旧 whitelist 模式 ----
+    if not _data["shell"].get("allow_run_command", False) and not FULL_AUTO:
+        return (
+            False,
+            "权限拒绝：终端执行未开启（🛠 工具中心 → 权限 → shell.allow_run_command）。"
+            "如需授权，可调用 request_permission(action_type='command') 请求开启",
+            None,
+        )
     whitelist = [
         os.path.basename(str(w)).lower()
         for w in _data["shell"].get("whitelist", [])
@@ -281,9 +315,63 @@ def check_shell(command):
 
 def shell_timeout():
     try:
-        return int(_data["shell"].get("timeout", 60))
+        return int(_data["shell"].get("timeout", 120))
     except (TypeError, ValueError):
-        return 60
+        return 120
+
+
+def _host_blocked(host, entries):
+    """主机是否命中黑名单：支持精确 IP/主机名、CIDR 网段、*.domain 后缀。"""
+    host = (host or "").strip().lower()
+    if not host:
+        return False
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    for item in entries or []:
+        item = str(item).strip().lower()
+        if not item:
+            continue
+        if item == host:
+            return True
+        if ip is not None and "/" in item:
+            try:
+                if ip in ipaddress.ip_network(item, strict=False):
+                    return True
+            except ValueError:
+                pass
+        elif item.startswith("*.") and host.endswith(item[1:]):
+            return True
+    return False
+
+
+def check_network_host(host):
+    """网络主机判定。blacklist 模式：只拦 network.blocklist；whitelist 模式：放行（由 SSRF 旧逻辑另行处理）。"""
+    if not _data:
+        return True, ""
+    if security_mode() != "blacklist":
+        return True, ""
+    blocked = _data.get("network", {}).get("blocklist", [])
+    if _host_blocked(host, blocked):
+        return False, f"权限拒绝：主机在网络黑名单：{host}"
+    return True, ""
+
+
+def check_network_url(url):
+    """URL 网络判定（仅 http/https）。返回 (allowed, reason)。"""
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(str(url or ""))
+        if u.scheme not in ("http", "https"):
+            return False, f"权限拒绝：URL 协议不允许：{u.scheme or '（空）'}"
+        host = (u.hostname or "").lower()
+        if not host:
+            return False, f"权限拒绝：URL 主机解析失败：{url[:80]}"
+        return check_network_host(host)
+    except Exception as e:
+        return False, f"权限拒绝：URL 解析失败：{e}"
 
 
 def approval_mode():
@@ -301,19 +389,19 @@ def approval_timeout():
 
 
 def set_approval_callback(cb):
-    """设置 confirm 模式下的用户确认回调：(name, args) -> (allowed, reason)。"""
     global _approval_callback
     _approval_callback = cb
 
 
 def set_whitelist_callback(cb):
-    """设置白名单请求回调：(action_type, value) -> (allowed, reason)。"""
     global _whitelist_callback
     _whitelist_callback = cb
 
 
 def add_to_whitelist(action_type, value):
-    """把操作加入白名单并保存。返回 (allowed, message)。"""
+    """把操作加入白名单（旧 whitelist 模式用）。blacklist 模式下无需白名单。"""
+    if security_mode() == "blacklist":
+        return False, "当前为黑名单模式：默认全部放行，无需加入白名单。如要禁止操作，请在权限页添加黑名单。"
     atype = str(action_type or "").strip().lower()
     value = str(value or "").strip()
     if atype == "write":
@@ -329,7 +417,6 @@ def add_to_whitelist(action_type, value):
     elif atype == "command":
         if not value:
             return False, "命令不能为空"
-        # 只取首个命令名（拒绝 "git status" 这类带参数串混入白名单——check_shell 只比对 argv[0]）
         try:
             base = os.path.basename(
                 shlex.split(value, posix=(os.name != "nt"))[0]
@@ -343,9 +430,7 @@ def add_to_whitelist(action_type, value):
             return False, f"命令 {value} 在阻止列表内，禁止加入白名单"
         whitelist = [str(w).lower() for w in _data["shell"].get("whitelist", [])]
         if base not in whitelist:
-            # 与 check_shell 的 basename 比较对齐：存 basename，不存全路径/带参串
             _data["shell"]["whitelist"].append(base)
-        # 一键授权：同时开启命令执行总开关，使该命令立即可用
         _data["shell"]["allow_run_command"] = True
     else:
         return False, f"不支持的白名单类型：{action_type}（支持 dir / command / write）"
@@ -354,11 +439,10 @@ def add_to_whitelist(action_type, value):
 
 
 def request_whitelist(action_type, value):
-    """请求用户把操作加入白名单（弹窗确认）。返回 (allowed, message)。
-
-    完全智能模式下直接放行；否则走用户确认回调。
-    """
-    if FULL_AUTO:
+    """request_permission 工具入口：blacklist 模式直接提示无需授权。"""
+    if FULL_AUTO or security_mode() == "blacklist":
+        if security_mode() == "blacklist":
+            return False, "黑名单模式默认全部放行，无需授权；如要禁止操作请添加黑名单。"
         return add_to_whitelist(action_type, value)
     if _whitelist_callback is None:
         return False, "白名单请求通道不可用"
@@ -370,8 +454,27 @@ def request_whitelist(action_type, value):
 
 
 def request_approval(name, args):
-    """审批闸门（在 chat 工具循环中调用）。完全智能模式直接放行。"""
+    """审批闸门。
+
+    blacklist 模式：仅 approval_actions 列表中的动作需要用户确认。
+    whitelist 模式：保持旧行为（ACTION_TOOLS + approval_mode）。
+    完全智能模式：直接放行（黑名单仍生效）。
+    """
     if FULL_AUTO:
+        return True, ""
+    if security_mode() == "blacklist":
+        actions = _data.get("approval_actions") or []
+        if str(name) not in actions:
+            return True, ""
+        if _approval_callback is None:
+            return False, "权限拒绝：审批通道不可用"
+        try:
+            return _approval_callback(name, args)
+        except Exception:
+            logging.exception("审批回调异常")
+            return False, "审批通道异常"
+    # ---- 旧 whitelist 模式 ----
+    if str(name) not in ACTION_TOOLS:
         return True, ""
     mode = approval_mode()
     if mode == "deny":
@@ -388,7 +491,6 @@ def request_approval(name, args):
 
 
 def _audit_sanitize(s, limit=200):
-    """审计字段净化：换行/控制字符转义 + 截断，防模型可控参数伪造日志行。"""
     if not isinstance(s, str):
         s = str(s)
     s = s.replace("\r", "\\r").replace("\n", "\\n")
@@ -398,7 +500,7 @@ def _audit_sanitize(s, limit=200):
 
 
 def audit(action, target, detail="", result="ok"):
-    """写审计日志（隐私模式下跳过）。"""
+    """写审计日志（只记录不拦截；隐私模式下跳过）。"""
     if not AUDIT_ENABLED or not AUDIT_LOG_DIR:
         return
     try:

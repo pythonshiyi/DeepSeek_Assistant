@@ -8,6 +8,17 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import deepseek_client as dc
+import permissions
+
+
+def _set_security_mode(mode):
+    if permissions.get_data() is None:
+        import json as _json
+        permissions.set_data(_json.loads(_json.dumps(permissions.DEFAULT_PERMISSIONS)))
+    data = permissions.get_data()
+    old = data.get("security_mode", "blacklist")
+    data["security_mode"] = mode
+    return old
 
 
 class FakeResp:
@@ -56,9 +67,13 @@ class TestCallApi(unittest.TestCase):
         self.assertEqual(kw["headers"]["Authorization"], "Bearer t")
 
     def test_ssrf_blocked(self):
-        for bad in ("http://10.0.0.1/x", "http://192.168.1.1/x", "http://169.254.169.254/"):
-            out = dc.call_api(bad)
-            self.assertIn("已阻止", out, bad)
+        old = _set_security_mode("whitelist")
+        try:
+            for bad in ("http://10.0.0.1/x", "http://192.168.1.1/x", "http://169.254.169.254/"):
+                out = dc.call_api(bad)
+                self.assertIn("已阻止", out, bad)
+        finally:
+            _set_security_mode(old)
 
     def test_scheme_rejected(self):
         for bad in ("file:///etc/passwd", "ftp://example.com/x", "javascript:alert(1)"):
@@ -100,6 +115,7 @@ class TestCallApi(unittest.TestCase):
         注：127.0.0.1 回环本就走「本地开发验证」放行路径（与 fetch_url 同规则），
         白名单的实际价值是显式放行 10.x / 192.168.x 等内网地址。
         """
+        old = _set_security_mode("whitelist")
         dc.CALL_API_ALLOWED_HOSTS = ["10.0.0.5"]
         try:
             fc = FakeClient(FakeResp(content=b'{"ok":1}'))
@@ -111,9 +127,11 @@ class TestCallApi(unittest.TestCase):
             self.assertIn("已阻止", dc.call_api("http://192.168.1.1/x"))
         finally:
             dc.CALL_API_ALLOWED_HOSTS = []
+            _set_security_mode(old)
 
     def test_whitelist_cleared(self):
         """白名单可清空：清空后内网地址恢复拦截。"""
+        old = _set_security_mode("whitelist")
         dc.CALL_API_ALLOWED_HOSTS = ["10.0.0.5"]
         try:
             fc = FakeClient(FakeResp(content=b'{}'))
@@ -124,6 +142,7 @@ class TestCallApi(unittest.TestCase):
             self.assertIn("已阻止", dc.call_api("http://10.0.0.5/x"))
         finally:
             dc.CALL_API_ALLOWED_HOSTS = []
+            _set_security_mode(old)
 
 
 class TestSystemStatus(unittest.TestCase):

@@ -2,6 +2,15 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.14.0（2026-08-15）
+
+- **权限哲学反转：默认放行 + 黑名单（自由优先，用户掌权）**：`permissions.py` 升级 v2——默认 `security_mode="blacklist"`，AI 拥有全部文件/命令/网络/敏感操作能力，只按用户维护的黑名单拦截；黑名单默认为空，可一键清空/增删。旧 `whitelist` 模式保留可回退。
+- **完全智能 = 无限权利**：`full_auto` 下零审批、零开关；`request_permission` 工具在 blacklist 模式下直接提示无需授权，不再弹窗。
+- **SSRF 按黑名单拦截**：`_safe_url`/fetch_url/call_api/搜索过滤/自定义工具/fetch_blocked 统一改为 blacklist 模式默认放行，仅命中 `network.blocklist` 拒绝；旧 SSRF 严格判断仅在 whitelist 模式生效。
+- **权限 UI 重写**：工具中心「权限」页签改为安全模式切换 + 黑名单管理（禁止目录/命令/网络/审批动作）+ 旧白名单配置折叠保留；概览卡显示黑名单统计。
+- **旧配置迁移**：v1 权限文件自动迁移到 v2——过去的 blocked_dirs/shell.blocklist/云元数据 SSRF 保留为初始黑名单，其余全部放行。
+- **测试**：SSRF/权限测试适配新模式并新增黑名单放行/黑名单拦截/迁移/旧模式回退用例；全量 543 项通过。
+
 ## v2.13.0（2026-08-15）
 
 - **新一轮修复与增强**：①修复 Ctrl+Backspace 多行删除范围错误（字符偏移不再误当行号）；②`call_api` 响应改为流式读取（超 500KB 即断，防大响应内存峰值），WebDAV 上传改为流式发送（不再整文件读入内存）；③`fetch_blocked` 增加 DNS 重绑定 SSRF 校验（域名解析落内网/元数据即拦截）；④`permissions.save` 改为原子写；⑤`_http_client` 增加关闭标记，退出竞态不再重建新客户端；⑥长耗时工具（公众号写作/数据库/WebDAV/下载等）与普通工具线程池隔离，避免慢任务占满快速池；⑦`read_excel` 确认只读模式（read_only=True）；⑧插件中心新增「市场」页签（远程索引浏览/下载/SHA-256 校验安装）；⑨新增自定义主题（颜色 token 可视化配置并即时应用）；⑩新增快捷键自定义（根窗口快捷键可改、立即生效、可恢复默认）；⑪更新包下载后支持 SHA-256/签名校验（防篡改）；⑫`dialogs.py` 按主题拆为 `dialogs/` 包（about_help / data_stats / workspace / session / productivity）。全量测试 537 项通过。

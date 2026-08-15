@@ -24,6 +24,7 @@ except Exception:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main as m
+import permissions
 
 
 class ProductUIBase(unittest.TestCase):
@@ -482,9 +483,22 @@ class TestHubs(ProductUIBase):
         self.app._hub_save_all()
         self.assertEqual(self.app.cfg["ssrf_trusted"], ["192.168.1.0/24", "nas.lan"])
         self.assertEqual(m._dc.SSRF_TRUSTED, ["192.168.1.0/24", "nas.lan"])
-        self.assertFalse(m._dc._safe_url("http://192.168.1.20/"))   # CIDR 放行
-        self.assertFalse(m._dc._safe_url("http://nas.lan/"))        # 主机名放行
-        self.assertTrue(m._dc._safe_url("http://10.0.0.1/"))        # 未信任阻止
+        # 默认 blacklist 模式：全部放行，SSRF trusted 仅 whitelist 模式生效
+        data = permissions.get_data()
+        data["security_mode"] = "blacklist"
+        self.assertEqual(m._dc._safe_url("http://192.168.1.20/"), "")
+        self.assertEqual(m._dc._safe_url("http://nas.lan/"), "")
+        self.assertEqual(m._dc._safe_url("http://10.0.0.1/"), "")
+        # 切到 whitelist 模式验证 trusted 生效
+        data = permissions.get_data()
+        old_mode = data.get("security_mode", "blacklist")
+        data["security_mode"] = "whitelist"
+        try:
+            self.assertFalse(m._dc._safe_url("http://192.168.1.20/"))   # CIDR 放行
+            self.assertFalse(m._dc._safe_url("http://nas.lan/"))        # 主机名放行
+            self.assertTrue(m._dc._safe_url("http://10.0.0.1/"))        # 未信任阻止
+        finally:
+            data["security_mode"] = old_mode
         m._dc.set_ssrf_trusted([])
         self.app.cfg["ssrf_trusted"] = []  # 同时清理 cfg，防止后续保存回调重新应用旧白名单
         for d in hubs:

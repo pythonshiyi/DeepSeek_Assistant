@@ -139,21 +139,54 @@ class TestWebdavStreamingUpload(unittest.TestCase):
 
 
 class TestFetchBlockedDnsRebinding(unittest.TestCase):
-    def test_hostname_resolving_to_private_is_blocked(self):
-        def fake_getaddrinfo(host, port, family=0, type_=0, proto=0, flags=0):
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.99", 80))]
+    def _set_mode(self, mode):
+        data = permissions.get_data()
+        if data is None:
+            data = {"security_mode": mode, "network": {"blocklist": []}}
+            permissions.set_data(data)
+            return "blacklist"
+        old = data.get("security_mode", "blacklist")
+        data["security_mode"] = mode
+        return old
 
-        import socket
-        with mock.patch("fetch_blocked.socket.getaddrinfo", side_effect=fake_getaddrinfo):
-            self.assertTrue(fb._is_blocked_host("evil.example.com"))
+    def test_whitelist_mode_blocks_private_dns(self):
+        old = self._set_mode("whitelist")
+        try:
+            def fake_getaddrinfo(host, port, family=0, type_=0, proto=0, flags=0):
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.99", 80))]
+
+            import socket
+            with mock.patch("fetch_blocked.socket.getaddrinfo", side_effect=fake_getaddrinfo):
+                self.assertTrue(fb._is_blocked_host("evil.example.com"))
+        finally:
+            self._set_mode(old)
+
+    def test_blacklist_mode_allows_private_dns(self):
+        old = self._set_mode("blacklist")
+        try:
+            data = permissions.get_data()
+            data.setdefault("network", {})["blocklist"] = []
+
+            def fake_getaddrinfo(host, port, family=0, type_=0, proto=0, flags=0):
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.99", 80))]
+
+            import socket
+            with mock.patch("fetch_blocked.socket.getaddrinfo", side_effect=fake_getaddrinfo):
+                self.assertFalse(fb._is_blocked_host("evil.example.com"))
+        finally:
+            self._set_mode(old)
 
     def test_hostname_resolving_to_loopback_stays_allowed(self):
-        def fake_getaddrinfo(host, port, family=0, type_=0, proto=0, flags=0):
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+        old = self._set_mode("whitelist")
+        try:
+            def fake_getaddrinfo(host, port, family=0, type_=0, proto=0, flags=0):
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
 
-        import socket
-        with mock.patch("fetch_blocked.socket.getaddrinfo", side_effect=fake_getaddrinfo):
-            self.assertFalse(fb._is_blocked_host("local.example.com"))
+            import socket
+            with mock.patch("fetch_blocked.socket.getaddrinfo", side_effect=fake_getaddrinfo):
+                self.assertFalse(fb._is_blocked_host("local.example.com"))
+        finally:
+            self._set_mode(old)
 
 
 class TestPermissionsAtomicSave(unittest.TestCase):

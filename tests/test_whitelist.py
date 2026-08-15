@@ -13,6 +13,9 @@ import permissions as perm
 
 class TestAddToWhitelist(unittest.TestCase):
     def setUp(self):
+        self._old_data = json.loads(json.dumps(perm.get_data())) if perm.get_data() is not None else None
+        self._old_path = perm.PERMISSIONS_PATH
+        self._old_ws = perm.WORKSPACE_DIR
         self.tmp = tempfile.mkdtemp(prefix="dsa_perm_")
         # 注意：tempfile 默认位于 AppData\Local\Temp（在阻止列表内），
         # 测试环境移除 AppData 阻止项以模拟真实工作区（Documents）行为
@@ -23,11 +26,20 @@ class TestAddToWhitelist(unittest.TestCase):
             audit_dir=os.path.join(self.tmp, "logs"),
         )
         data = perm.get_data()
+        data["security_mode"] = "whitelist"  # 本组测试覆盖旧 whitelist 模式
         data["filesystem"]["blocked_dirs"] = [
             d for d in data["filesystem"]["blocked_dirs"] if "AppData" not in d
         ]
         perm.set_full_auto(False)
         self.data_dir = os.path.join(self.ws, "data")
+
+    def tearDown(self):
+        perm.set_data(self._old_data)
+        perm.PERMISSIONS_PATH = self._old_path
+        perm.WORKSPACE_DIR = self._old_ws
+        perm.set_full_auto(False)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_add_dir(self):
         path = self.data_dir
@@ -53,6 +65,8 @@ class TestAddToWhitelist(unittest.TestCase):
         self.assertTrue(perm.get_data()["filesystem"]["allow_write"])
 
     def test_command_in_blocklist_rejected(self):
+        data = perm.get_data()
+        data["shell"]["blocklist"] = ["rm"]
         ok, msg = perm.add_to_whitelist("command", "rm")
         self.assertFalse(ok)
         self.assertIn("阻止列表", msg)
@@ -113,7 +127,7 @@ class TestAddToWhitelist(unittest.TestCase):
         data["filesystem"]["allow_write"] = True
         ok, reason = perm.check_filesystem(r"c:\windows\system32\cmd.exe", write=True)
         self.assertFalse(ok)
-        self.assertIn("阻止列表", reason)
+        self.assertIn("黑名单", reason)
         ok2, _ = perm.check_filesystem(r"C:\WINDOWS\Temp\x.exe")
         self.assertFalse(ok2)
 
@@ -167,6 +181,25 @@ class TestReadonlyStmt(unittest.TestCase):
 
 
 class TestSSRFGuard(unittest.TestCase):
+    def setUp(self):
+        self._old_data = json.loads(json.dumps(perm.get_data())) if perm.get_data() is not None else None
+        self._old_path = perm.PERMISSIONS_PATH
+        self._old_ws = perm.WORKSPACE_DIR
+        self.tmp = tempfile.mkdtemp(prefix="dsa_ssrf_wl_")
+        ws = os.path.join(self.tmp, "ws")
+        perm.init(os.path.join(self.tmp, "perm.json"), ws)
+        data = perm.get_data()
+        data["security_mode"] = "whitelist"
+        perm.set_data(data)
+
+    def tearDown(self):
+        perm.set_data(self._old_data)
+        perm.PERMISSIONS_PATH = self._old_path
+        perm.WORKSPACE_DIR = self._old_ws
+        perm.set_full_auto(False)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
     def test_private_hosts_blocked(self):
         """内网/元数据/非 http 协议仍阻止；回环默认放行（本地开发验证）。"""
         for url in (

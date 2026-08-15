@@ -4,7 +4,7 @@
 
 | 版本 | 支持状态 |
 |------|---------|
-| 2.13.x（main 分支） | ✅ 积极维护 |
+| 2.14.x（main 分支） | ✅ 积极维护 |
 
 ## 报告漏洞 / Reporting a Vulnerability
 
@@ -20,6 +20,6 @@
 ## 已知安全设计（供审阅者参考）
 
 - **API Key 保护**：`config.json` 中的 Key 以 Windows DPAPI 加密存储（`crypto.py`），明文永不落盘（fail-closed）
-- **权限模型**：默认全关（`permissions.py`），路径经 `resolve()` 规范化防穿越、命令走白名单/黑名单、SSRF 防护（内网/回环/元数据地址拦截）、审批流 + 审计日志
+- **权限模型**：v2 默认 `blacklist`（默认放行 + 用户黑名单，黑名单默认空；用户可自行增删/清空），旧 `whitelist` 模式可回退；路径经 `resolve()` 规范化防穿越；审计日志只记不拦
 - **沙箱**：`run_python` 静态 AST 检查 + `-I -S` 隔离执行
 - **提交规范**：`.gitignore` 强制排除 `config.json` / 密钥文件；`CONTRIBUTING.md` 要求新增行动工具接入审批流

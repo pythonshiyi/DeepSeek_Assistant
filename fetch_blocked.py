@@ -53,9 +53,18 @@ _LOOPBACK_IPS = frozenset()
 
 
 def _is_blocked_host(host):
-    """SSRF 防护：内网/链路本地/云元数据地址拒绝访问（回环放行，与 fetch_url 一致）。"""
+    """黑名单优先：blacklist 模式只按用户 network.blocklist 拦截；whitelist 模式保持旧 SSRF 严格判断。"""
     host = (host or "").strip().lower()
-    if not host or host in ("localhost", "ipv6-localhost"):
+    if not host:
+        return True
+    try:
+        import permissions
+        if permissions.security_mode() == "blacklist":
+            ok, _reason = permissions.check_network_host(host)
+            return not ok
+    except Exception:
+        pass
+    if host in ("localhost", "ipv6-localhost"):
         return False
     if host.replace(".", "").isdigit():
         parts = host.split(".")

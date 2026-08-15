@@ -139,9 +139,21 @@ class TestFileLoop(unittest.TestCase):
         self.assertIn("已", r)
         self.assertFalse(os.path.exists(p))
 
-    def test_delete_outside_allowed(self):
+    def test_delete_outside_allowed_in_blacklist_mode(self):
         permissions.set_full_auto(False)
         p = os.path.join(self.tmp, "nope.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("x")
+        # v2.13+ 黑名单模式默认放行：临时目录不在黑名单内，删除应成功
+        r = dc.delete_file(p)
+        self.assertIn("已", r)
+        self.assertFalse(os.path.exists(p))
+
+    def test_delete_outside_rejected_in_whitelist_mode(self):
+        permissions.set_full_auto(False)
+        data = permissions.get_data()
+        data["security_mode"] = "whitelist"
+        p = os.path.join(self.tmp, "nope2.txt")
         with open(p, "w", encoding="utf-8") as f:
             f.write("x")
         r = dc.delete_file(p)

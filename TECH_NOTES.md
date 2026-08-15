@@ -23,7 +23,7 @@ WhaleTalk/（项目目录名不依赖，可自由改名）
 ├── splash.py            # 启动界面（深海渐变 + 蓝鲸徽标 + 加载动画 + 淡出）
 ├── deepseek_client.py   # DeepSeekClient（流式/思考/JSON/续写/工具循环/重试）、工具实现、check_balance、is_peak_hour
 ├── exporters.py         # 会话导出扩展（HTML / JSONL，纯函数无状态）
-├── permissions.py       # 权限模型（resolve/白名单/审批/审计，默认全关）
+├── permissions.py       # 权限模型 v2（默认放行+黑名单，旧 whitelist 可回退，审计只记不拦）
 ├── mdparse.py           # Markdown 块解析 + 内联解析 + 渲染（纯函数，无 Tk 依赖）
 ├── tokens.py            # tiktoken 估算（含回退 1.5 字符/token）
 ├── prompts.py           # 提示词库（默认模板 + 读写）
@@ -183,13 +183,13 @@ _finish                →  _re_render_stream(start, block_start)  # 结束后�
 
 ### 1.3.0（智能体行动层，默认全部关闭）
 
-- **permissions.py**：模块级 `init(path, workspace, audit_dir)`；`DEFAULT_PERMISSIONS` 全关闭；`resolve()` 规范化路径防 `..` 穿越；`check_filesystem(path, write)` 判定（允许目录内 + 系统目录/AppData 阻止列表 + 写开关）；`check_shell(cmd)` 解析 argv 并白名单/黑名单判定；`request_approval(name, args)` 按 approval_mode 放行（auto/confirm/deny）；`audit()` 写 actions.log（10MB 轮转，`set_audit_enabled` 关隐私模式）。
+- **permissions.py（v2.14 起为 v2 权限模型）**：模块级 `init(path, workspace, audit_dir)`；`DEFAULT_PERMISSIONS` 默认 `security_mode="blacklist"`（默认放行+黑名单，黑名单默认为空）；旧 `whitelist` 模式保留可回退。`resolve()` 规范化路径防 `..` 穿越；`check_filesystem(path, write)` 在 blacklist 模式只拦 `filesystem.blocked_dirs`；`check_shell(cmd)` 在 blacklist 模式只拦 `shell.blocklist`；`check_network_host/url` 只拦 `network.blocklist`；`request_approval(name, args)` 在 blacklist 模式仅对 `approval_actions` 中动作弹窗（默认空=零审批），whitelist 模式仍按 `ACTION_TOOLS + approval_mode`；`audit()` 写 actions.log（只记不拦，10MB 轮转，`set_audit_enabled` 关隐私模式）。
 - **工具**（TOOLS 尾部新增 6 个，`TOOL_CALL_MAP` 同步）：`write_file`（原子写 .tmp→os.replace + 覆盖前 .bak + 大小上限）、`edit_file`（文本或正则替换 + .bak）、`list_dir`（只读）、`run_command`（argv 直传 subprocess，禁止 shell 拼接，超时/截断）、`search_local`（允许目录内文本检索，跳过常见噪音目录）、`create_doc`（md/html 原生，docx 需 python-docx 可选）。
-- **审批闸门**：`chat(..., on_approval=None)`——工具执行前回调 `(name, raw_args) -> (allowed, reason)`；拒绝时 `args={}` 并把 reason 回传模型（利用现有"参数解析失败回传自主修正"机制）。main 侧 `_tool_approval` 仅对 `permissions.ACTION_TOOLS` 生效；confirm 模式 `_request_approval_dialog`（worker 线程 put `approval_req` + `threading.Event` 阻塞等待，超时自动拒绝），主线程 `_show_approval_dialog` 弹「允许/拒绝」。
+- **审批闸门**：`chat(..., on_approval=None)`——工具执行前回调 `(name, raw_args) -> (allowed, reason)`；拒绝时 `args={}` 并把 reason 回传模型。main 侧 `_tool_approval` 统一调用 `permissions.request_approval`（blacklist 模式默认全放行，仅 approval_actions 弹窗；whitelist 模式保持 ACTION_TOOLS + approval_mode）。审批弹窗 `_request_approval_dialog`（worker 线程 put `approval_req` + `threading.Event` 阻塞等待，超时自动拒绝），主线程 `_show_approval_dialog` 弹「允许/拒绝」。
 - **队列**：`_drain_ui_queue` 仅新增 `approval_req` 分支（不改其他消息）。
-- **默认启用边界**：`DEFAULT_CONFIG["enabled_tools"]` 与 `normalize_config` 的 else 分支均为 `BUILTIN_TOOL_NAMES`（6 个内建）——行动工具默认不进请求，须用户在「工具设置」勾选 +「权限设置」开启开关。
-- **UI**：工具菜单「权限设置」对话框（写开关/允许目录/命令白名单/审批模式），保存走 `permissions.save()`（不落盘自动工作区目录）。
-- ⚠️ 铁律：权限拒绝结果必须回传模型（不能静默丢弃）；`run_command` 永远默认 false；审批弹窗是唯一允许的跨线程 UI 通道（仍走队列）。
+- **默认启用边界**：`DEFAULT_CONFIG["enabled_tools"]` 与 `normalize_config` 的 else 分支均为 `BUILTIN_TOOL_NAMES`——blacklist 权限模式下工具默认有权限，是否调用仍按 `enabled_tools` / 完全智能模式控制。
+- **UI**：工具中心「权限」页签（blacklist：安全模式切换 + 禁目录/禁命令/禁网络/审批动作；whitelist：旧白名单开关/审批模式），保存走 `permissions.save()`。
+- ⚠️ 铁律：权限拒绝结果必须回传模型（不能静默丢弃）；审计只记不拦；审批弹窗是唯一允许的跨线程 UI 通道（仍走队列）。
 
 ### 1.4.0（L2 浏览器 / L3 工程 / L4 草稿）
 
@@ -231,9 +231,9 @@ _finish                →  _re_render_stream(start, block_start)  # 结束后�
 
 ### 1.6.1（完全智能模式）
 
-- **permissions.py**：`FULL_AUTO` 全局 + `set_full_auto()`/`is_full_auto()`；三处放行——`check_filesystem` 跳过 allow_write、`check_shell` 跳过 allow_run_command、`request_approval` 直接 True。**blocked_dirs 阻止列表仍生效**（系统目录永不碰），审计照常。
+- **permissions.py**：`FULL_AUTO` 全局 + `set_full_auto()`/`is_full_auto()`；完全智能 = 无限权利（零审批、零开关），**黑名单仍生效**（用户禁止的目录/命令/网络仍拦截），审计照常（只记不拦）。
 - **main.py**：`full_auto` 配置（默认 false，normalize/启动 `set_full_auto` 同步）；设置面板「自主模式」组 checkbox → `_on_full_auto_toggle`（开启时 askyesno 确认，同步 permissions + cfg + save + update_status）；`_plan_gate` 在 full_auto 时直接放行；状态栏 `🤖 完全智能` 标识；权限设置对话框显示当前模式提示。
-- 安全语义：完全智能 = 授权范围放大（允许目录内全自动），**不是**权限边界消失——resolve 防穿越、blocked_dirs、审计日志、隐私模式全部保留。
+- 安全语义：完全智能 = 默认全部放行（v2.14 黑名单哲学）；`resolve` 防穿越、审计日志、隐私模式全部保留。
 
 ### 1.7.0（任务执行可见性）
 

@@ -17,6 +17,18 @@ from fetch_blocked import (
     _test_node,
 )
 import fetch_blocked as fb_mod
+import permissions
+
+
+def _set_security_mode(mode):
+    if permissions.get_data() is None:
+        import json as _json
+        permissions.set_data(_json.loads(_json.dumps(permissions.DEFAULT_PERMISSIONS)))
+    data = permissions.get_data()
+    old = data.get("security_mode", "blacklist")
+    data["security_mode"] = mode
+    return old
+
 
 SAMPLE_YAML = """
 proxies:
@@ -49,22 +61,50 @@ class TestFetchBlockedValidation(unittest.TestCase):
         self.assertIn("proxy 格式", fetch_blocked("https://example.com/a", proxy="http://bad"))
 
     def test_ssrf_internal_blocked(self):
-        for u in ("http://192.168.1.5/x", "http://10.0.0.1/", "http://169.254.169.254/"):
-            self.assertIn("SSRF", fetch_blocked(u), u)
+        old = _set_security_mode("whitelist")
+        try:
+            for u in ("http://192.168.1.5/x", "http://10.0.0.1/", "http://169.254.169.254/"):
+                self.assertIn("SSRF", fetch_blocked(u), u)
+        finally:
+            _set_security_mode(old)
+
+    def test_blacklist_mode_allows_internal(self):
+        old = _set_security_mode("blacklist")
+        try:
+            data = permissions.get_data()
+            data.setdefault("network", {})["blocklist"] = []
+            for u in ("http://192.168.1.5/x", "http://10.0.0.1/"):
+                self.assertNotIn("SSRF", fetch_blocked(u), u)
+        finally:
+            _set_security_mode(old)
 
     def test_ssrf_loopback_allowed(self):
-        """回环放行（本地开发验证语义，与 fetch_url 一致）——应进入后续抓取流程。"""
+        """回环放行——应进入后续抓取流程。"""
         with mock.patch("fetch_blocked._discover_nodes", return_value=[]):
             out = fetch_blocked("http://127.0.0.1:1/")
         self.assertNotIn("SSRF", out)
 
     def test_is_blocked_host(self):
-        self.assertTrue(_is_blocked_host("192.168.1.1"))
-        self.assertTrue(_is_blocked_host("169.254.169.254"))
-        self.assertTrue(_is_blocked_host("10.1.2.3"))
-        self.assertFalse(_is_blocked_host("linux.do"))
-        self.assertFalse(_is_blocked_host("127.0.0.1"))
-        self.assertFalse(_is_blocked_host("localhost"))
+        old = _set_security_mode("whitelist")
+        try:
+            self.assertTrue(_is_blocked_host("192.168.1.1"))
+            self.assertTrue(_is_blocked_host("169.254.169.254"))
+            self.assertTrue(_is_blocked_host("10.1.2.3"))
+            self.assertFalse(_is_blocked_host("linux.do"))
+            self.assertFalse(_is_blocked_host("127.0.0.1"))
+            self.assertFalse(_is_blocked_host("localhost"))
+        finally:
+            _set_security_mode(old)
+
+    def test_blacklist_host_only_blocks_listed(self):
+        old = _set_security_mode("blacklist")
+        try:
+            data = permissions.get_data()
+            data.setdefault("network", {})["blocklist"] = ["10.1.2.3"]
+            self.assertTrue(_is_blocked_host("10.1.2.3"))
+            self.assertFalse(_is_blocked_host("192.168.1.1"))
+        finally:
+            _set_security_mode(old)
 
 
 class TestNodeParsing(unittest.TestCase):

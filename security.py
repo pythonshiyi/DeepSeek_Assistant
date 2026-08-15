@@ -138,12 +138,27 @@ def _is_private_host(host, allow_loopback=True):
 
 
 def _safe_url(url, allow_loopback=True):
-    """URL 安全校验：仅 http/https + 非内网/回环主机。非法返回原因字符串。"""
+    """URL 安全校验。
+
+    v2.13+ 权限哲学：默认放行，只按用户黑名单拦截。
+    - permissions.security_mode() == "blacklist"（默认）：只拦 network.blocklist。
+    - permissions.security_mode() == "whitelist"（旧模式）：保持旧 SSRF 严格判断。
+    """
     if not url or not str(url).startswith(("http://", "https://")):
         return "URL 必须以 http:// 或 https:// 开头"
     host = _url_host(url)
     if not host:
         return f"URL 主机名解析失败：{url[:80]}"
+    try:
+        import permissions
+        if permissions.security_mode() == "blacklist":
+            ok, reason = permissions.check_network_host(host)
+            if not ok:
+                return f"{reason}：{url[:80]}"
+            return ""
+    except Exception:
+        pass
+    # 旧 whitelist 模式 / 权限模块未初始化：保留严格 SSRF 判断
     if _is_private_host(host, allow_loopback=allow_loopback):
         return f"已阻止访问内网/回环地址（SSRF 防护）：{url[:80]}"
     return ""

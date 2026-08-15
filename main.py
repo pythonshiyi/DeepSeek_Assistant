@@ -193,7 +193,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.13.0"
+VERSION = "2.14.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -7256,10 +7256,20 @@ class AssistantApp:
         card("任务能力", [f"自主模式 → {cap_line}"])
         # 安全
         d = permissions.get_data()
-        mode = d.get("approval_mode", "auto")
-        auto = "🤖 完全智能（允许目录内全自动）" if permissions.is_full_auto() else f"审批模式：{mode}"
-        card("安全", [auto, f"写文件：{'开' if d['filesystem'].get('allow_write') else '关'} · "
-                           f"命令执行：{'开' if d['shell'].get('allow_run_command') else '关'}"])
+        sec_mode = permissions.security_mode()
+        if sec_mode == "blacklist":
+            n_block = len(d["filesystem"].get("blocked_dirs", []))
+            c_block = len(d["shell"].get("blocklist", []))
+            net_block = len(d.get("network", {}).get("blocklist", []))
+            a_block = len(d.get("approval_actions", []))
+            sec_line = (
+                f"🔓 黑名单模式：默认放行 · 禁目录 {n_block} / 禁命令 {c_block} / "
+                f"禁网络 {net_block} / 审批动作 {a_block}"
+            )
+        else:
+            sec_line = f"⬜ 白名单模式（旧）· 审批：{d.get('approval_mode', 'auto')}"
+        auto = " · 🤖 完全智能：零审批" if permissions.is_full_auto() else ""
+        card("安全", [sec_line + auto])
 
     def _hub_tools_settings(self, nb):
         """工具中心-工具设置（可启停全部工具）。"""
@@ -7410,9 +7420,11 @@ class AssistantApp:
         self._footer_btn(footer, "保存", save_all, primary=True)
 
     def _tool_approval(self, name, raw_args):
-        """工具执行前审批闸门（worker 线程调用，禁碰 Tk，只走队列）。"""
-        if name not in permissions.ACTION_TOOLS:
-            return True, ""
+        """工具执行前审批闸门（worker 线程调用，禁碰 Tk，只走队列）。
+
+        blacklist 模式：默认全放行，仅 approval_actions 中的动作弹窗。
+        whitelist 模式：保持旧 ACTION_TOOLS + approval_mode 逻辑。
+        """
         try:
             args = json.loads(raw_args) if raw_args else {}
             if not isinstance(args, dict):
@@ -7522,7 +7534,12 @@ class AssistantApp:
             pass
 
     def _request_whitelist_callback(self, action_type, value):
-        """request_permission 工具回调（worker 线程调用）：弹窗确认后一键加入白名单。"""
+        """request_permission 工具回调（worker 线程调用）：弹窗确认后一键加入白名单。
+
+        blacklist 模式：默认全部放行，直接返回无需授权，不弹窗。
+        """
+        if permissions.security_mode() == "blacklist":
+            return True, "当前为黑名单模式，默认全部放行，无需授权"
         ev = threading.Event()
         box = {"allow": False}
         self._ui_queue.put(("whitelist_req", (str(action_type), str(value), ev, box)))
@@ -7629,8 +7646,8 @@ class AssistantApp:
     def edit_permissions(self):
         """权限设置（工具中心面板版）。"""
         dialog, body, footer = self._dialog_shell(
-            "权限设置", 540, 540,
-            subtitle="⚠ 所有行动能力默认关闭；开启前请确认信任范围。",
+            "权限设置", 560, 600,
+            subtitle="🔓 自由优先：默认放行 + 黑名单。AI 拥有全部行动能力，只按你禁止的拦截。",
         )
         save = self._edit_permissions_panel(body)
         self._footer_hint(footer, "配置文件：permissions.json")
@@ -7638,21 +7655,82 @@ class AssistantApp:
         self._footer_btn(footer, "保存", lambda: (save(), dialog.destroy()), primary=True)
 
     def _edit_permissions_panel(self, body):
-        """权限设置面板（嵌入工具中心）：返回保存回调。"""
+        """权限设置面板（嵌入工具中心）：返回保存回调。
+
+        v2.13+ 默认黑名单模式：默认放行，用户只维护黑名单；
+        旧 whitelist 模式保留为可回退选项。
+        """
         data = permissions.get_data()
-        # 滚动容器：内容超出面板高度时可滚动，杜绝底部元素被截断
         canvas, inner = self._scroll_panel(body)
         body = inner
         self._lbl(
-            body, "⚠ 所有行动能力默认关闭；开启前请确认信任范围。",
-            role="label_error", bg="panel", font=(FONT_FAMILY, 9, "bold"),
+            body, "🔓 自由优先：默认放行 + 黑名单。AI 拥有全部行动能力，只按你禁止的拦截。",
+            role="label_accent", bg="panel", font=(FONT_FAMILY, 9, "bold"),
         ).pack(anchor="w", pady=(0, 10))
         if permissions.is_full_auto():
             self._lbl(
-                body, "🤖 完全智能模式已开启：允许目录内全自动，本页开关被跳过（系统阻止列表仍生效）。",
+                body, "🤖 完全智能模式已开启：零审批、零开关，AI 拥有无限权利（黑名单仍生效）。",
                 role="label_accent", bg="panel", font=(FONT_FAMILY, 8, "bold"),
             ).pack(anchor="w", pady=(0, 8))
 
+        # ---- 安全模式 ----
+        self._lbl(body, "安全模式：", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w")
+        sec_mode_var = tk.StringVar(value=permissions.security_mode())
+        ttk.Combobox(
+            body, textvariable=sec_mode_var, values=["blacklist", "whitelist"],
+            state="readonly",
+        ).pack(fill="x")
+        self._lbl(
+            body, "blacklist（推荐）：默认放行，只拦黑名单；whitelist：旧默认拒绝+白名单模式。",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 8), wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        # ---- 黑名单区（blacklist 模式生效） ----
+        self._lbl(
+            body, "🚫 黑名单（可全部留空 = 完全不设限）：",
+            role="label_error", bg="panel", font=(FONT_FAMILY, 9, "bold"),
+        ).pack(anchor="w", pady=(12, 4))
+        self._lbl(
+            body, "禁止目录（逗号分隔，如 C:/Windows, ~/AppData）：",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+        ).pack(anchor="w")
+        blocked_dirs_var = tk.StringVar(
+            value=", ".join(str(d) for d in data["filesystem"].get("blocked_dirs", []))
+        )
+        ttk.Entry(body, textvariable=blocked_dirs_var).pack(fill="x")
+
+        self._lbl(
+            body, "禁止命令（逗号分隔，如 format, diskpart）：",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", pady=(8, 0))
+        cmd_block_var = tk.StringVar(
+            value=", ".join(str(s) for s in data["shell"].get("blocklist", []))
+        )
+        ttk.Entry(body, textvariable=cmd_block_var).pack(fill="x")
+
+        self._lbl(
+            body, "禁止网络主机（逗号分隔，支持 IP / 主机名 / CIDR / *.domain）：",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", pady=(8, 0))
+        net_block_var = tk.StringVar(
+            value=", ".join(str(h) for h in data.get("network", {}).get("blocklist", []))
+        )
+        ttk.Entry(body, textvariable=net_block_var).pack(fill="x")
+
+        self._lbl(
+            body, "需要审批的动作（逗号分隔，如 screen_capture, send_email；留空=零审批）：",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", pady=(8, 0))
+        approval_actions_var = tk.StringVar(
+            value=", ".join(str(a) for a in data.get("approval_actions", []))
+        )
+        ttk.Entry(body, textvariable=approval_actions_var).pack(fill="x")
+
+        # ---- 旧 whitelist 模式区（仅切到 whitelist 时用） ----
+        self._lbl(
+            body, "⬜ 旧白名单模式配置（仅在切换 whitelist 模式时生效）：",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold"),
+        ).pack(anchor="w", pady=(12, 4))
         write_var = tk.BooleanVar(value=bool(data["filesystem"].get("allow_write", False)))
         ttk.Checkbutton(
             body, text="允许 AI 写文件（write_file / edit_file / create_doc）",
@@ -7678,39 +7756,42 @@ class AssistantApp:
         ttk.Entry(body, textvariable=wl_var).pack(fill="x")
 
         self._lbl(
-            body, "审批模式：", role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+            body, "审批模式（whitelist 模式）：", role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
         ).pack(anchor="w", pady=(8, 2))
-        mode_var = tk.StringVar(value=data.get("approval_mode", "auto"))
+        approval_mode_var = tk.StringVar(value=data.get("approval_mode", "auto"))
         ttk.Combobox(
-            body, textvariable=mode_var, values=["auto", "confirm", "deny"],
+            body, textvariable=approval_mode_var, values=["auto", "confirm", "deny"],
             state="readonly",
         ).pack(fill="x")
-        self._lbl(
-            body, "auto：白名单内自动执行；confirm：每次调用弹窗确认；deny：全部拒绝。",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-            wraplength=480, justify="left",
-        ).pack(anchor="w", pady=(4, 0))
         plan_var = tk.BooleanVar(value=bool(data.get("plan_confirm", False)))
         ttk.Checkbutton(
-            body, text="计划确认：每轮工具调用前先确认整轮计划（推荐开启）",
+            body, text="计划确认：每轮工具调用前先确认整轮计划",
             variable=plan_var,
         ).pack(anchor="w", pady=(10, 0))
 
-        # SSRF 信任白名单：回环默认放行（本地开发服务器验证），内网/保留网段
-        # 需在此显式信任后模型才能访问（云元数据 169.254.169.254 永远不可豁免）
+        # SSRF 信任白名单（whitelist 模式用；blacklist 模式忽略）
         self._lbl(
-            body, "SSRF 信任主机（内网访问需显式信任；回环 localhost 已默认放行）：",
+            body, "SSRF 信任主机（仅 whitelist 模式生效；支持 IP / 主机名 / CIDR）：",
             role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
         ).pack(anchor="w", pady=(10, 2))
         ssrf_var = tk.StringVar(value=", ".join(self.cfg.get("ssrf_trusted") or []))
         ttk.Entry(body, textvariable=ssrf_var).pack(fill="x")
-        self._lbl(
-            body, "支持 IP / 主机名 / CIDR 网段（如 192.168.1.0/24）；可访问内网服务（NAS、公司系统等）。",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 8),
-            wraplength=480, justify="left",
-        ).pack(anchor="w", pady=(4, 0))
 
         def save_perms():
+            data["security_mode"] = str(sec_mode_var.get()) or "blacklist"
+            data["filesystem"]["blocked_dirs"] = [
+                d.strip() for d in blocked_dirs_var.get().split(",") if d.strip()
+            ]
+            data["shell"]["blocklist"] = [
+                s.strip() for s in cmd_block_var.get().split(",") if s.strip()
+            ]
+            data.setdefault("network", {})["blocklist"] = [
+                h.strip() for h in net_block_var.get().split(",") if h.strip()
+            ]
+            data["approval_actions"] = [
+                a.strip() for a in approval_actions_var.get().split(",") if a.strip()
+            ]
+            # 旧 whitelist 模式配置（保留，切回时使用）
             data["filesystem"]["allow_write"] = bool(write_var.get())
             data["filesystem"]["allowed_dirs"] = [
                 d.strip() for d in dirs_var.get().split(",") if d.strip()
@@ -7719,12 +7800,11 @@ class AssistantApp:
             data["shell"]["whitelist"] = [
                 w.strip() for w in wl_var.get().split(",") if w.strip()
             ]
-            data["approval_mode"] = str(mode_var.get()) or "auto"
+            data["approval_mode"] = str(approval_mode_var.get()) or "auto"
             data["plan_confirm"] = bool(plan_var.get())
             permissions.set_data(data)
             if permissions.save():
                 self._flash_status("权限设置已保存")
-            # SSRF 信任白名单保存（回环默认放行；内网需显式信任）
             trusted = [h.strip() for h in ssrf_var.get().split(",") if h.strip()]
             self.cfg["ssrf_trusted"] = trusted
             _dc.set_ssrf_trusted(trusted)
