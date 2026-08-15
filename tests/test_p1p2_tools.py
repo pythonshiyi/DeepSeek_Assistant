@@ -220,6 +220,17 @@ class TestWecomAibotChannel(unittest.TestCase):
         listener = wecom_aibot.AibotListener("bid", "sec")
         self.assertFalse(listener.reply_text({"headers": {"req_id": "r1"}}, "hi"))
 
+    def test_reply_body_uses_stream_type(self):
+        body = wecom_aibot.AibotListener._reply_body("hello")
+        self.assertEqual(body["msgtype"], "stream")
+        self.assertTrue(body["stream"]["finish"])
+        self.assertEqual(body["stream"]["content"], "hello")
+
+    def test_send_body_uses_markdown_type(self):
+        body = wecom_aibot.AibotListener._send_body("hello")
+        self.assertEqual(body["msgtype"], "markdown")
+        self.assertEqual(body["markdown"]["content"], "hello")
+
 
 class TestToolRegistration(unittest.TestCase):
     def test_new_tools_registered(self):

@@ -2,6 +2,10 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.16.1（2026-08-15）
+
+- **修复企业微信回复失败（errcode=40008）**：`wecom_aibot.reply_text` 消息体从 `msgtype=text` 改为官方支持的 `msgtype=stream`（finish=True + 唯一 stream id）；`send_text` 主动发送改为 `msgtype=markdown`。新增消息体类型回归测试。
+
 ## v2.16.0（2026-08-15）
 
 - **企业微信智能机器人长连接**：新增 `wecom_aibot.py` 通道（基于官方 `wecom-aibot-python-sdk`）。配置 `im_config.json` 的 `wecom_aibot_bot_id` / `wecom_aibot_secret` 后，鲸语启动时自动连接 `wss://openws.work.weixin.qq.com`；收到单聊/群聊@消息后自动交给 AI 处理，并把最后回复发回企业微信会话。支持断线重连、心跳保活、IM 消息状态提示。

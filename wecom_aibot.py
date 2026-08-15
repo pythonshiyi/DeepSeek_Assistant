@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import threading
+import uuid
 
 logger = logging.getLogger("whaletalk.wecom_aibot")
 
@@ -137,19 +138,32 @@ class AibotListener:
             logger.warning("企业微信发送失败：%s", e)
             return None
 
+    @staticmethod
+    def _reply_body(text):
+        """回复消息体：智能机器人长连接只支持 stream（官方 SDK reply_stream 同构）。"""
+        stream = {
+            "id": uuid.uuid4().hex,
+            "finish": True,
+            "content": str(text)[:4000],
+        }
+        return {"msgtype": "stream", "stream": stream}
+
+    @staticmethod
+    def _send_body(text):
+        """主动发送消息体：send_message 支持 markdown / template_card。"""
+        return {"msgtype": "markdown", "markdown": {"content": str(text)[:4000]}}
+
     def reply_text(self, frame, text):
-        """回复当前收到的消息（长连接 RESPONSE）。"""
+        """回复当前收到的消息（长连接 RESPONSE，智能机器人使用 stream 类型）。"""
         if self._client is None:
             return False
-        body = {"msgtype": "text", "text": {"content": str(text)[:4000]}}
-        return self._run_coro(self._client.reply(frame, body)) is not None
+        return self._run_coro(self._client.reply(frame, self._reply_body(text))) is not None
 
     def send_text(self, chatid, text):
-        """主动发送消息到指定会话（chatid 来自收到的消息/缓存）。"""
+        """主动发送消息到指定会话（chatid 来自收到的消息/缓存；send_message 支持 markdown）。"""
         if self._client is None or not chatid:
             return False
-        body = {"msgtype": "text", "text": {"content": str(text)[:4000]}}
-        return self._run_coro(self._client.send_message(chatid, body)) is not None
+        return self._run_coro(self._client.send_message(chatid, self._send_body(text))) is not None
 
 
 # 模块级单例（由 main 注入配置后启动）
