@@ -5,29 +5,55 @@ from tkinter import ttk
 
 from .common import FONT_FAMILY, MONO_FAMILY
 
+REPO_URL = "https://github.com/pythonshiyi/WhaleTalk"
+
+
 def show_about(app):
-    """关于对话框：品牌信息 + 能力一览（正式版品牌视觉）。"""
+    """关于对话框：品牌信息 + 能力一览 + 开源仓库入口（正式版品牌视觉）。"""
+    import webbrowser
+
     dialog, body, footer = app._dialog_shell(
-        f"关于 {app.APP_NAME} {app.APP_NAME_EN}", 460, 420,
-        subtitle="深海蓝鲸 · 专业桌面 AI 工作台",
+        f"关于 {app.APP_NAME} {app.APP_NAME_EN}", 560, 620,
+        subtitle="深海蓝鲸 · 开源桌面 AI 工作台",
     )
     app._lbl(body, f"🐋 {app.APP_NAME} {app.APP_NAME_EN}", role="label_accent", bg="panel",
              font=(FONT_FAMILY, 18, "bold")).pack(anchor="w", pady=(0, 2))
-    app._lbl(body, f"版本 {app.VERSION} · 基于 DeepSeek V4 API", role="label_sec", bg="panel",
-             font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(0, 14))
+    app._lbl(body, f"版本 v{app.VERSION} · 基于 DeepSeek V4 API", role="label_sec", bg="panel",
+             font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(0, 12))
     for line in (
         "· 流式思考与回答、1M 长上下文、缓存命中优化",
         "· 100+ Agent 工具：文档/代码/浏览器/数据/媒体/云盘/公众号写作",
-        "· 产物面板与产物条：生成的文件一键直达",
-        "· 会话快照、用量统计、预算控制、隐私模式",
+        "· 完全智能/纯对话双模式，权限黑名单制由用户掌控",
+        "· 产物面板、会话快照、用量统计、预算控制、隐私模式",
         "· 自我进化：AI 可感知自身代码并提出改进提案",
     ):
         app._lbl(body, "✓ " + line, bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=1)
     app._lbl(
+        body, "\n🌐 开源信息", role="label_accent", bg="panel",
+        font=(FONT_FAMILY, 10, "bold"),
+    ).pack(anchor="w", pady=(10, 2))
+    app._lbl(
+        body, f"MIT 开源协议 · 源码仓库：{REPO_URL}",
+        bg="panel", font=(FONT_FAMILY, 9),
+    ).pack(anchor="w")
+    app._lbl(
+        body, "欢迎 Star / Fork / Issue / PR，一起把鲸语做得更好。",
+        role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+    ).pack(anchor="w", pady=(2, 0))
+    app._lbl(
         body, f"\n{app.APP_NAME} 是独立产品，与 DeepSeek 官方无任何关联。",
         role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
     ).pack(anchor="w")
-    app._footer_btn(footer, "关闭", dialog.destroy)
+    app._footer_btn(
+        footer, "Star ⭐",
+        lambda: webbrowser.open(REPO_URL), fsz=9,
+    ).pack(side="left")
+    app._footer_btn(
+        footer, "Issues 反馈",
+        lambda: webbrowser.open(REPO_URL + "/issues"), fsz=9,
+    ).pack(side="left", padx=(8, 0))
+    app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True), fsz=9).pack(side="right")
+    app._footer_btn(footer, "关闭", dialog.destroy).pack(side="right", padx=(8, 0))
 
 def show_balance(app, data):
     """余额查询结果：品牌对话框展示（替代系统 messagebox）。"""
@@ -56,10 +82,12 @@ def show_balance(app, data):
     app._footer_btn(footer, "关闭", dialog.destroy)
 
 def show_help(app):
-    """帮助对话框：常用操作速查（正式版排版）。"""
+    """帮助对话框：常用操作速查 + 开源与更新（正式版排版）。"""
+    import webbrowser
+
     t = app._theme()
     dialog, body, footer = app._dialog_shell(
-        "使用说明", 520, 460, subtitle="常用操作速查 · F1 随时打开"
+        "使用说明", 560, 620, subtitle="常用操作速查 · F1 随时打开"
     )
     rows = [
         ("发送消息", "Enter 发送 · Shift+Enter 换行 · Ctrl+Enter 快速发送"),
@@ -74,6 +102,8 @@ def show_help(app):
         ("生成中打断", "直接发送新消息即可打断并继续"),
         ("设置面板", "左栏「⚙ 设置」按钮收起/展开右侧面板"),
         ("主题与字号", "菜单 视图 → 切换主题 / 增大/减小字号"),
+        ("开源仓库", REPO_URL + "（Star / Issues / PR）"),
+        ("检查更新", "菜单 帮助 → 检查更新；更新源为 GitHub Releases"),
     ]
     for k, v in rows:
         row = tk.Frame(body, bg=t["panel"])
@@ -82,7 +112,12 @@ def show_help(app):
         app._lbl(row, k, role="label_accent", bg="panel", font=(FONT_FAMILY, 9, "bold"),
                  width=12, anchor="w").pack(side="left")
         app._lbl(row, v, bg="panel", font=(FONT_FAMILY, 9), anchor="w").pack(side="left")
-    app._footer_btn(footer, "关闭", dialog.destroy)
+    app._footer_btn(
+        footer, "GitHub 仓库",
+        lambda: webbrowser.open(REPO_URL), fsz=9,
+    ).pack(side="left")
+    app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True), fsz=9).pack(side="right")
+    app._footer_btn(footer, "关闭", dialog.destroy).pack(side="right", padx=(8, 0))
 
 def show_welcome(app):
     """欢迎页：首次启动配置 API Key / 体验试玩任务。"""

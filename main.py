@@ -196,7 +196,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.20.0"
+VERSION = "2.21.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -3094,24 +3094,25 @@ class AssistantApp:
         )
         text.tag_configure(
             "user",
-            foreground=t["accent"],
-            lmargin1=8,
-            lmargin2=8,
-            rmargin=12,
-            spacing1=4,
-            spacing3=4,
-            justify="right",
+            foreground=t["text"],
+            background=t.get("quote_bg", t["surface"]),
+            lmargin1=10,
+            lmargin2=10,
+            rmargin=14,
+            spacing1=8,
+            spacing3=8,
+            justify="left",
         )
         text.tag_configure(
             "user_time",
             foreground=t["text_sec"],
             font=(FONT_FAMILY, sizes["small"]),
-            lmargin1=8,
-            lmargin2=8,
-            rmargin=12,
+            lmargin1=10,
+            lmargin2=10,
+            rmargin=14,
             spacing1=8,
             spacing3=2,
-            justify="right",
+            justify="left",
         )
         text.tag_configure(
             "assistant",
@@ -3129,7 +3130,7 @@ class AssistantApp:
             lmargin1=8,
             lmargin2=8,
             spacing1=2,
-            spacing3=2,
+            spacing3=8,  # 正式回答与思考过程之间留出换行间距
         )
         text.tag_configure(
             "tool",

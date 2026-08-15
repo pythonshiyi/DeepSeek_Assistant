@@ -133,7 +133,7 @@ DEFAULT_CONFIG = {
     "custom_temperature": 1.0,
     "custom_top_p": 1.0,
     "privacy_mode": False,
-    "check_update": False,
+    "check_update": True,  # 初始自动检测 GitHub Releases 更新
     "welcomed": False,
     "max_tool_rounds": 10,
     "monthly_budget": 0.0,
