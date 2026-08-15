@@ -6,6 +6,7 @@ from tkinter import ttk
 from .common import FONT_FAMILY, MONO_FAMILY
 
 REPO_URL = "https://github.com/pythonshiyi/WhaleTalk"
+WEBSITE_URL = "https://whaletalk.top/"
 
 
 def show_about(app):
@@ -37,6 +38,10 @@ def show_about(app):
         bg="panel", font=(FONT_FAMILY, 9),
     ).pack(anchor="w")
     app._lbl(
+        body, f"🌐 官方网站：{WEBSITE_URL}",
+        bg="panel", font=(FONT_FAMILY, 9),
+    ).pack(anchor="w", pady=(2, 0))
+    app._lbl(
         body, "欢迎 Star / Fork / Issue / PR，一起把鲸语做得更好。",
         role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
     ).pack(anchor="w", pady=(2, 0))
@@ -49,6 +54,9 @@ def show_about(app):
     ).pack(side="left")
     app._mk_button(
         footer, "Issues 反馈", lambda: webbrowser.open(REPO_URL + "/issues"), fsz=9
+    ).pack(side="left", padx=(8, 0))
+    app._mk_button(
+        footer, "🌐 官网", lambda: webbrowser.open(WEBSITE_URL), fsz=9
     ).pack(side="left", padx=(8, 0))
     app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True))
     app._footer_btn(footer, "关闭", dialog.destroy)
@@ -100,6 +108,7 @@ def show_help(app):
         ("生成中打断", "直接发送新消息即可打断并继续"),
         ("设置面板", "左栏「⚙ 设置」按钮收起/展开右侧面板"),
         ("主题与字号", "菜单 视图 → 切换主题 / 增大/减小字号"),
+        ("官方网站", WEBSITE_URL + "（产品介绍 / 下载 / 动态）"),
         ("开源仓库", REPO_URL + "（Star / Issues / PR）"),
         ("检查更新", "菜单 帮助 → 检查更新；更新源为 GitHub Releases"),
     ]
@@ -113,6 +122,9 @@ def show_help(app):
     app._mk_button(
         footer, "GitHub 仓库", lambda: webbrowser.open(REPO_URL), fsz=9
     ).pack(side="left")
+    app._mk_button(
+        footer, "🌐 官网", lambda: webbrowser.open(WEBSITE_URL), fsz=9
+    ).pack(side="left", padx=(8, 0))
     app._footer_btn(footer, "检查更新", lambda: app.check_for_update(manual=True))
     app._footer_btn(footer, "关闭", dialog.destroy)
 

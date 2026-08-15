@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/pythonshiyi/WhaleTalk/actions/workflows/ci.yml/badge.svg)](https://github.com/pythonshiyi/WhaleTalk/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/pythonshiyi/WhaleTalk?color=blue)](https://github.com/pythonshiyi/WhaleTalk/releases)
+[![官网](https://img.shields.io/badge/%E5%AE%98%E7%BD%91-whaletalk.top-0a84ff)](https://whaletalk.top/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
 
@@ -10,6 +11,8 @@
 **鲸语 WhaleTalk** 是一款为 DeepSeek V4 API 深度优化的 Windows 桌面 AI 对话助手——不只是聊天窗口，而是一个**能自主完成任务、能扩展能力、能自我进化**的 AI 工作台。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
 
 *WhaleTalk is a Windows desktop AI assistant deeply optimized for the DeepSeek V4 API — not just a chat window, but an AI workbench that executes tasks autonomously, extends itself with plugins, and evolves its own codebase. WhaleTalk is an independent product brand with no affiliation to DeepSeek.*
+
+> 🌐 **官网 / Website：https://whaletalk.top/**
 
 ## 📋 目录
 
@@ -173,6 +176,7 @@ python main.py
 
 ## 📚 文档
 
+- [🌐 官方网站](https://whaletalk.top/)（产品介绍 / 下载 / 动态）
 - [更新记录](CHANGELOG.md)（完整版本历史）
 - [贡献指南](CONTRIBUTING.md)（开发环境/代码规范）
 - [安全策略](SECURITY.md)（漏洞报告）
@@ -215,6 +219,8 @@ Python (Tkinter) · DeepSeek V4 API (OpenAI-compatible streaming) · tiktoken ·
 ## 📱 品牌与关注
 
 **鲸语 WhaleTalk** 与 **微墨 WeMark** 由 **十一AIGC** 出品——专注 AI 工具与效率应用的独立创作者。
+
+🌐 **官网：https://whaletalk.top/**
 
 更多 AI 玩法、工具教程与新品动态，欢迎关注公众号：
 
