@@ -2,6 +2,12 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.16.0（2026-08-15）
+
+- **企业微信智能机器人长连接**：新增 `wecom_aibot.py` 通道（基于官方 `wecom-aibot-python-sdk`）。配置 `im_config.json` 的 `wecom_aibot_bot_id` / `wecom_aibot_secret` 后，鲸语启动时自动连接 `wss://openws.work.weixin.qq.com`；收到单聊/群聊@消息后自动交给 AI 处理，并把最后回复发回企业微信会话。支持断线重连、心跳保活、IM 消息状态提示。
+- **IM 配置增强**：`_load_im_config` 提示补充 aibot 字段；`deps.py` 新增 aibot/ebooklib/mobi/extract_msg/py7zr/rarfile 可选依赖项。
+- **测试**：新增 aibot 帧解析用例；全量 557 项通过。
+
 ## v2.15.0（2026-08-15）
 
 - **IM 主动触达**：新增 `im_send`（Telegram Bot / 企业微信群机器人，im_config.json 配置，敏感字段 DPAPI 加密）与 `telegram_poll_updates`（长轮询接收用户消息，游标自动去重）——AI 可主动汇报、用户可随时召唤。

@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import deepseek_client as dc
 import permissions
+import wecom_aibot
 
 
 def _init_blacklist_perm(tmp):
@@ -196,6 +197,28 @@ class TestIMChannels(unittest.TestCase):
             hc.return_value.post.return_value = fake
             out = dc.telegram_poll_updates(timeout=1)
         self.assertIn("@me: 召唤", out)
+
+
+class TestWecomAibotChannel(unittest.TestCase):
+    def test_parse_text_frame(self):
+        got = []
+        listener = wecom_aibot.AibotListener(
+            "bid", "sec",
+            on_message=lambda chatid, user, text, frame: got.append((chatid, user, text)),
+        )
+        listener._on_text({
+            "body": {
+                "msgtype": "text",
+                "chatid": "chat-1",
+                "from": {"name": "张三", "userid": "u1"},
+                "text": {"content": "鲸语在吗"},
+            },
+        })
+        self.assertEqual(got, [("chat-1", "张三", "鲸语在吗")])
+
+    def test_reply_requires_client(self):
+        listener = wecom_aibot.AibotListener("bid", "sec")
+        self.assertFalse(listener.reply_text({"headers": {"req_id": "r1"}}, "hi"))
 
 
 class TestToolRegistration(unittest.TestCase):

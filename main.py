@@ -89,6 +89,7 @@ from config_utils import normalize_config, load_config, save_config
 import stores
 from session_utils import safe_sid as _safe_sid, session_id as _session_id_impl
 import dialogs
+import wecom_aibot
 from splash import SplashScreen
 from taskpanel import TaskPanel
 from processpanel import ProcessPanel
@@ -194,7 +195,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.15.0"
+VERSION = "2.16.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -370,6 +371,9 @@ class AssistantApp:
         permissions.set_whitelist_callback(self._request_whitelist_callback)
         permissions.set_audit_enabled(not bool(self.cfg.get("privacy_mode", False)))
         permissions.set_full_auto(bool(self.cfg.get("full_auto", False)))
+        self._aibot_listener = None
+        self._im_pending_frame = None
+        self._im_pending_chatid = None
         if self.cfg.get("privacy_mode"):
             _apply_privacy_logging(True, LOG_DIR)
         self._ctx_counts = None
@@ -7554,6 +7558,66 @@ class AssistantApp:
             )
         return ok, msg
 
+    def _start_aibot_listener(self):
+        """启动企业微信智能机器人长连接（可选依赖 + im_config.json 配置）。"""
+        try:
+            cfg, _err = _dc._load_im_config()
+            bot_id = str(cfg.get("wecom_aibot_bot_id") or "").strip()
+            secret = str(cfg.get("wecom_aibot_secret") or "").strip()
+            if not (bot_id and secret):
+                return
+            self._aibot_listener = wecom_aibot.ensure_listener(
+                bot_id, secret,
+                on_message=self._on_aibot_message,
+                on_status=lambda msg: self._ui_queue.put(("flash", msg)),
+            )
+            self._aibot_listener.start()
+        except Exception:
+            logging.exception("启动企业微信智能机器人失败")
+
+    def _on_aibot_message(self, chatid, user, text, frame):
+        """企业微信消息到达（后台线程）：排队给主线程处理。"""
+        self._ui_queue.put(("im_message", (str(chatid), str(user), str(text), frame)))
+
+    def _handle_im_message(self, payload):
+        chatid, user, text, frame = payload
+        self._im_pending_frame = frame
+        self._im_pending_chatid = chatid
+        self._flash_status(f"📱 企业微信 @{user}: {text[:60]}", 5000)
+        if self.busy:
+            self._show_note(f"[IM] 企业微信 @{user}：{text[:120]}\n鲸语正在处理其他任务，稍后请重试。")
+            return
+        self.send(text=f"[企业微信 · {user}] {text}")
+
+    def _reply_im_if_needed(self, aborted=False):
+        """本轮生成结束后，把 AI 最后一条回复发回企业微信会话。"""
+        frame = self._im_pending_frame
+        chatid = self._im_pending_chatid
+        if frame is None or not chatid:
+            return
+        self._im_pending_frame = None
+        self._im_pending_chatid = None
+        try:
+            with self._messages_lock:
+                answer = ""
+                for msg in reversed(self.messages):
+                    if msg.get("role") == "assistant" and str(msg.get("content") or "").strip():
+                        answer = " ".join(str(msg["content"]).split())
+                        break
+            if not answer:
+                answer = "（鲸语已完成，但未生成文本回复）"
+            if len(answer) > 1500:
+                answer = answer[:1500] + "\n…（回复过长已截断）"
+            if aborted:
+                answer += "\n\n⚠ 本轮生成被中断，请稍后让鲸语继续。"
+            listener = getattr(self, "_aibot_listener", None) or wecom_aibot._LISTENER
+            if listener is not None and listener.is_running():
+                threading.Thread(
+                    target=listener.reply_text, args=(frame, answer), daemon=True
+                ).start()
+        except Exception:
+            logging.exception("企业微信回复失败")
+
     def _show_whitelist_dialog(self, action_type, value, ev, box):
         """主线程：AI 请求添加白名单的确认弹窗。"""
         t = self._theme()
@@ -8731,6 +8795,8 @@ class AssistantApp:
             self._round_aborted = True
         elif kind == "balance_done":
             self.btn_balance.configure(state="normal")
+        elif kind == "im_message":
+            self._handle_im_message(payload)
         elif kind == "update":
             self._handle_update_result(payload)
         elif kind == "update_downloaded":
@@ -9325,6 +9391,7 @@ class AssistantApp:
                     ).start()
                 except Exception:
                     pass
+        self._reply_im_if_needed(aborted=aborted)
         self._set_busy(False)
         self._variant_seed_override = None  # 变体 seed 只对本轮生效，防止污染后续生成
         self._pending_tool_durations.clear()  # 清残留工具耗时，防马拉松会话累积
@@ -12371,6 +12438,10 @@ class AssistantApp:
         except Exception:
             pass
         try:
+            wecom_aibot.stop_listener()
+        except Exception:
+            pass
+        try:
             self.save_widgets_to_config()
         except Exception:
             pass
@@ -12509,6 +12580,7 @@ def main():
         except Exception:
             pass
     app = AssistantApp(root)
+    app._start_aibot_listener()
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     if splash is not None:
         root.after(600, splash.fade_out)

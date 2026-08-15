@@ -2322,7 +2322,8 @@ def _load_im_config():
         return {}, (
             "未配置 IM 通道。请在数据目录创建 im_config.json："
             '{"telegram_bot_token": "123:abc", "telegram_chat_id": "123456", '
-            '"wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"}'
+            '"wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx", '
+            '"wecom_aibot_bot_id": "机器人 Bot ID", "wecom_aibot_secret": "机器人 Secret"}'
         )
     try:
         with open(IM_CONFIG_FILE, "r", encoding="utf-8") as f:
