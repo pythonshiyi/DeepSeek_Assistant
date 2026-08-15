@@ -6636,9 +6636,26 @@ def email_summary(limit=10, since_days=1):
 
 
 # ---------- Agent Mail（agently-cli，可选集成） ----------
+def _resolve_agent_mail_cli(cli):
+    """把 cli 名解析为 subprocess 可直接执行的绝对路径（兼容 Windows .CMD/.BAT shim）。
+
+    Windows 下 shell=False 不会解析 npm 全局安装的 .CMD shim，直接传命令名会
+    FileNotFoundError；这里显式解析出完整路径后仍保持 shell=False 执行。
+    """
+    cli = str(cli or "agently-cli").strip() or "agently-cli"
+    if os.path.isabs(cli):
+        return cli
+    found = shutil.which(cli)
+    if not found:
+        return cli  # 兜底：让 FileNotFoundError 走 127 提示
+    if os.name == "nt" and found.lower().endswith((".cmd", ".bat")):
+        return found
+    return found
+
+
 def _agent_mail_run(args, timeout=60):
     """调用 agently-cli 并返回 (exit_code, stdout_text)。"""
-    cli = str(AGENT_MAIL_CLI or "agently-cli").strip() or "agently-cli"
+    cli = _resolve_agent_mail_cli(str(AGENT_MAIL_CLI or "agently-cli").strip() or "agently-cli")
     cmd = [cli] + args
     try:
         proc = subprocess.run(
@@ -6673,12 +6690,11 @@ def agent_mail(action="list", q="", id="", to="", subject="", body="", dir="",
     if not AGENT_MAIL_ENABLED:
         return _agent_mail_tip()
     act = str(action or "list").strip().lower()
-    cli = str(AGENT_MAIL_CLI or "agently-cli").strip() or "agently-cli"
     # 解析收件人与附件（逗号分隔，CLI 要求可重复参数）
     def _multi(value):
         return [x.strip() for x in str(value or "").split(",") if x.strip()]
 
-    cmd = [cli]
+    cmd = []
     try:
         limit = max(1, min(50, int(limit or 10)))
     except (TypeError, ValueError):
@@ -6755,6 +6771,12 @@ def agent_mail(action="list", q="", id="", to="", subject="", body="", dir="",
     code, out = _agent_mail_run(cmd, timeout=timeout)
     if code == 127:
         return out
+    # 授权失效：提示用户重新 OAuth，不自动重试
+    if code == 3 or "invalid_grant" in str(out).lower() or "unauthorized" in str(out).lower():
+        return (
+            "[授权失效] Agent Mail 登录状态已过期。请在系统终端运行 "
+            "`agently-cli auth login` 重新授权后再试。\n\n" + out
+        )
     # exit 8 = 缺少 confirmation-token：把 ctk/summary 原样交回，AI 必须停下等用户确认
     if code == 8 and not str(confirmation_token or "").strip():
         return (

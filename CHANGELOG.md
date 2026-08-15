@@ -2,6 +2,12 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.18.1（2026-08-15）
+
+- **修复 Agent Mail CLI 可调用性**：新增 `_resolve_agent_mail_cli`（shutil.which + Windows .CMD/.BAT 显式解析，shell=False 安全执行）；修复 `agent_mail` 与 `_agent_mail_run` 重复前置 CLI 导致的 `unknown command "agently-cli"` 参数错误。
+- **授权失效处理**：agent_mail 返回 exit 3 / unauthorized / invalid_grant 时，提示用户运行 `agently-cli auth login` 重新授权，不自动重试。
+- 全量测试 570 项通过。
+
 ## v2.18.0（2026-08-15）
 
 - **Agent Mail 集成（可选）**：新增 `agent_mail` 工具封装 agently-cli——me/list/search/read/send/reply/forward/trash/delete/download 附件；写操作遵循两阶段确认（返回 confirmation-token，AI 必须等用户确认）。

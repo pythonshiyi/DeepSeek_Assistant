@@ -90,7 +90,11 @@ class TestFetchBlockedValidation(unittest.TestCase):
             self.assertTrue(_is_blocked_host("192.168.1.1"))
             self.assertTrue(_is_blocked_host("169.254.169.254"))
             self.assertTrue(_is_blocked_host("10.1.2.3"))
-            self.assertFalse(_is_blocked_host("linux.do"))
+            with mock.patch("fetch_blocked.socket.getaddrinfo",
+                            return_value=[(__import__("socket").AF_INET,
+                                           __import__("socket").SOCK_STREAM, 6, "",
+                                           ("31.13.72.36", 0))]):
+                self.assertFalse(_is_blocked_host("linux.do"))
             self.assertFalse(_is_blocked_host("127.0.0.1"))
             self.assertFalse(_is_blocked_host("localhost"))
         finally:

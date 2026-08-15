@@ -225,6 +225,19 @@ class TestAgentMail(unittest.TestCase):
             out = dc.agent_mail("send", to="a@b.com", subject="t", body="b")
         self.assertIn("需要用户确认", out)
 
+    def test_resolve_cmd_shim(self):
+        with mock.patch("shutil.which", return_value=r"C:\Users\me\AppData\Roaming\npm\agently-cli.CMD"):
+            resolved = dc._resolve_agent_mail_cli("agently-cli")
+        self.assertTrue(resolved.lower().endswith(".cmd"))
+
+    def test_run_does_not_duplicate_cli(self):
+        dc.AGENT_MAIL_CLI = "agently-cli"
+        with mock.patch("shutil.which", return_value=r"C:\npm\agently-cli.CMD"), \
+             mock.patch("subprocess.run", return_value=type("P", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()) as run:
+            code, out = dc._agent_mail_run(["+me"])
+        self.assertEqual(run.call_args.args[0][0], r"C:\npm\agently-cli.CMD")
+        self.assertEqual(run.call_args.args[0][1], "+me")
+
 
 class TestWecomAibotChannel(unittest.TestCase):
     def test_parse_text_frame(self):
