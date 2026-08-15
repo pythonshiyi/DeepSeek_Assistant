@@ -294,6 +294,12 @@ class TestNewConfigFeatures(unittest.TestCase):
         self.assertEqual(cfg["theme"], "mytheme")
         self.assertIn("mytheme", cfg["custom_themes"])
 
+    def test_max_tool_rounds_capability_max(self):
+        self.assertEqual(m.DEFAULT_CONFIG["max_tool_rounds"], 100)
+        cfg = dict(m.DEFAULT_CONFIG)
+        cfg["max_tool_rounds"] = 999
+        self.assertEqual(m.config_utils.normalize_config(cfg)["max_tool_rounds"], 100)
+
 
 if __name__ == "__main__":
     unittest.main()

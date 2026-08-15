@@ -75,9 +75,9 @@ def normalize_config(cfg):
     except (TypeError, ValueError):
         cfg["custom_top_p"] = 1.0
     try:
-        cfg["max_tool_rounds"] = max(1, min(50, int(cfg.get("max_tool_rounds", 10))))
+        cfg["max_tool_rounds"] = max(1, min(100, int(cfg.get("max_tool_rounds", 100))))
     except (TypeError, ValueError):
-        cfg["max_tool_rounds"] = 10
+        cfg["max_tool_rounds"] = 100
     try:
         cfg["monthly_budget"] = max(0.0, float(cfg.get("monthly_budget", 0.0)))
     except (TypeError, ValueError):

@@ -136,7 +136,7 @@ DEFAULT_CONFIG = {
     "privacy_mode": False,
     "check_update": True,  # 初始自动检测 GitHub Releases 更新
     "welcomed": False,
-    "max_tool_rounds": 10,
+    "max_tool_rounds": 100,  # 单条消息工具轮数上限：能力最大化，默认 100
     "monthly_budget": 0.0,
     "block_on_budget": False,
     "input_height": 4,

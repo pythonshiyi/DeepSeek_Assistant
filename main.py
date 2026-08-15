@@ -196,7 +196,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.22.0"
+VERSION = "2.22.1"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -8813,7 +8813,7 @@ class AssistantApp:
                 tools_enabled=tools_enabled,
                 enabled_tools=enabled_tools,
                 custom_tools=load_user_tools(USER_TOOLS_PATH),
-                max_tool_rounds=int(cfg.get("max_tool_rounds", 10)),
+                max_tool_rounds=int(cfg.get("max_tool_rounds", 100)),
                 on_reasoning=self._push_reasoning,
                 on_content=self._push_content,
                 on_tool=self._push_tool,
