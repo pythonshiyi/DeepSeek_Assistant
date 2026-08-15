@@ -2,6 +2,18 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.13.0（2026-08-15）
+
+- **新一轮修复与增强**：①修复 Ctrl+Backspace 多行删除范围错误（字符偏移不再误当行号）；②`call_api` 响应改为流式读取（超 500KB 即断，防大响应内存峰值），WebDAV 上传改为流式发送（不再整文件读入内存）；③`fetch_blocked` 增加 DNS 重绑定 SSRF 校验（域名解析落内网/元数据即拦截）；④`permissions.save` 改为原子写；⑤`_http_client` 增加关闭标记，退出竞态不再重建新客户端；⑥长耗时工具（公众号写作/数据库/WebDAV/下载等）与普通工具线程池隔离，避免慢任务占满快速池；⑦`read_excel` 确认只读模式（read_only=True）；⑧插件中心新增「市场」页签（远程索引浏览/下载/SHA-256 校验安装）；⑨新增自定义主题（颜色 token 可视化配置并即时应用）；⑩新增快捷键自定义（根窗口快捷键可改、立即生效、可恢复默认）；⑪更新包下载后支持 SHA-256/签名校验（防篡改）；⑫`dialogs.py` 按主题拆为 `dialogs/` 包（about_help / data_stats / workspace / session / productivity）。全量测试 537 项通过。
+- **隐私安全**：修复隐私模式仍写快照/会话/成功模式/任务记录/最近产物的问题；敏感配置（inbound_token / image_api_key / 邮件 / 数据库 / Webhook）改为 DPAPI 加密存储。
+- **SSRF**：新增逐跳重定向 SSRF 校验；`call_api` 默认禁止回环；`rss_fetch` 增加 SSRF/本地文件校验；`image_generate` 下载地址校验。
+- **沙箱**：`run_python` AST 检查阻断别名导入、`from os import *`、`from importlib import import_module`、`globals/vars/getattr` 反射等更多绕过。
+- **可靠性**：`_pending_send` 改为队列，连续发送不再丢消息；退出保存会话改为同步落盘；`ensure_client` 加锁；多处消息快照加锁。
+- **工具正确性**：strict 模式不再破坏自由对象/强制可选参数必填；`call_api`/自定义工具响应限流；解压/打包增加 zip 炸弹与总量限制；CSV/PDF 改为惰性读取；MySQL 增加慢查询超时；`run_tests` pytest 支持指定路径；子代理增加重试；`_SEARCH_HEALTH` 加锁。
+- **测试**：修复无效断言、环境依赖跳过、CI 增加 Python 3.9；新增 run_python 绕过与 SSRF 重定向回归用例。全量 525 项通过。
+- **后续加固**：WebDAV 下载改为流式写盘；`_drain_ui_queue` 重构为逐消息容错；侧栏宽度常量统一走 `LAYOUT`；移除自证式布局测试。全量 524 项通过。
+- **模块拆分**：新增 `uiutils.py`（CappedList/MAX_BLOCKS/index_num）、`security.py`（SSRF 校验函数）、`db_utils.py`（只读 SQL 校验 / 变更预览 / 表格格式化）、`persistence.py`（原子 JSON 写入）、`pdf_utils.py`（页码范围 / 中文字体 / Markdown 转 PDF 片段）、`proc_utils.py`（进程树终止）、`net_utils.py`（共享 HTTP 客户端 / 重定向校验）、`search_utils.py`（搜索解析 / 去重 / 安全过滤）、`layout.py`（布局常量）、`themes.py`（主题 token）、`deps.py`（可选依赖清单）、`config_defaults.py`（默认配置 / 系统提示词 / 内建工具 / 行为指令 / 更新源 / 场景思考默认值）、`roles.py`（内置角色）、`templates.py`（任务模板 / 试玩任务）、`app_utils.py`（布尔转换 / 空壳目录 / 清理 / 干净退出 / 隐私日志）、`render_utils.py`（流式 Markdown 切分 / 代码块切分）、`ui_utils.py`（菜单销毁）、`migration.py`（旧数据迁移）、`user_tools.py`（自定义工具加载缓存）、`profiles.py`（Profile 配置读写）、`config_utils.py`（配置加载 / 规范化 / 保存）、`stores.py`（最近产物 / 模式 / 失败 / 任务日志 / 记忆 / 调度等 JSON 存取）、`session_utils.py`（会话 ID 工具）与 `dialogs.py`（关于/帮助/余额/用量统计/依赖状态/失败模式/任务记录/检查点/最近产物/工作目录/数据清理/工作区文件树/历史会话库/命令面板/上下文详情/会话轨迹/批量任务/FIM/回复变体/收藏消息/自我进化提案/功能建议/自我审查/插件安装引导/欢迎页对话框）；`shared.py` 新增 `defer_until` / `budget_thinking`；`exporters.py` 新增 `build_markdown`；新增 `MODULES.md` 记录模块拆分清单。`main.py` / `deepseek_client.py` 改为导入复用，为后续继续拆分打下基础。
+
 ## v2.12.11（2026-08-15）
 
 v2.12.10 之后的 13 个提交汇总（源码包与本地代码对齐）：

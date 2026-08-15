@@ -5,6 +5,49 @@ import json
 import logging
 
 
+def build_markdown(messages, usage_total, session_start, cfg,
+                   app_name="鲸语", app_name_en="WhaleTalk"):
+    """把消息快照构建为 Markdown 导出文本（纯函数，供后台线程导出）。
+
+    与 AssistantApp.build_markdown 等价，但接收快照参数而非访问会话状态。
+    """
+    lines = [
+        f"# {app_name} {app_name_en} 会话记录",
+        "",
+        f"- 开始时间: {session_start:%Y-%m-%d %H:%M:%S}",
+        f"- 模型: {cfg.get('model', '')}",
+        f"- 场景: {cfg.get('scenario', '')} | 思考模式: {cfg.get('thinking', '')}",
+        f"- 累计 Token: 输入 {usage_total.get('prompt', 0)} / 输出 {usage_total.get('completion', 0)}",
+        "",
+        "---",
+    ]
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        if role == "user":
+            lines += ["", "## 用户", "", m.get("content") or ""]
+        elif role == "assistant":
+            if m.get("reasoning_content"):
+                lines += ["", "## 助手（思考过程）", "", "```text", m["reasoning_content"], "```"]
+            if m.get("content"):
+                lines += ["", "## 助手", "", m["content"]]
+            for tc in m.get("tool_calls") or ():
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    lines += [
+                        "",
+                        f"## 工具调用: {fn.get('name')}",
+                        "",
+                        "```json",
+                        fn.get("arguments") or "",
+                        "```",
+                    ]
+        elif role == "tool":
+            lines += ["", f"> 工具结果: {m.get('content')}", ""]
+    return "\n".join(lines)
+
+
 def export_html(messages, path, title="鲸语 WhaleTalk 会话记录", model="", scenario=""):
     """将会话消息渲染为自包含的单文件 HTML（内联样式，可离线打开）。"""
     import os

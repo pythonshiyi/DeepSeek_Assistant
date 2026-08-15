@@ -81,6 +81,29 @@ def _is_blocked_host(host):
         return ip.is_private or ip.is_link_local or ip.is_reserved
     except ValueError:
         pass
+    # 非 IP 主机名：解析 DNS，任一解析结果落内网/链路本地/保留段即拦截（防 DNS 重绑定）。
+    # 回环解析结果仍放行（本地开发验证语义，与 fetch_url 一致）。
+    try:
+        infos = socket.getaddrinfo(
+            host, None, socket.AF_INET | socket.AF_INET6, socket.SOCK_STREAM
+        )
+    except Exception:
+        return False  # 解析失败（离线/DNS 不可用）：维持放行，避免误杀
+    seen = set()
+    for info in infos:
+        try:
+            ip = (info[4] or ["", ""])[0]
+            ip = ip.split("%")[0]  # 去掉 IPv6 区域 ID
+            if ip in seen:
+                continue
+            seen.add(ip)
+            addr = ipaddress.ip_address(ip)
+            if addr.is_loopback:
+                continue
+            if addr.is_private or addr.is_link_local or addr.is_reserved:
+                return True
+        except ValueError:
+            continue
     return False
 
 

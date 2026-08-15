@@ -7,7 +7,7 @@
 - Windows OCR PowerShell 脚本（占位符统一 @PATH@，避免与 $ 变量名冲突）
 """
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ============================ 峰谷定价 ============================
 # DeepSeek 峰谷定价：高峰时段（北京时间 9:00-12:00 / 14:00-18:00），
@@ -98,6 +98,33 @@ def cron_field_ok(field, pos=0):
             if v is None or not (lo <= v <= hi):
                 return False
     return True
+
+
+def defer_until(now):
+    """高峰错峰顺延目标时刻：最近空闲时段开始（12:00 / 18:00；已过则次日 0:00）。
+
+    仅在高峰时段调用：9-12 高峰 → 12:00；14-18 高峰 → 18:00；
+    若对应空闲开始时刻已过（极端情况）→ 次日 0:00。
+    """
+    h = now.hour
+    defer_h = 12 if h < 14 else 18
+    ts = now.replace(hour=defer_h, minute=0, second=0, microsecond=0).timestamp()
+    if ts <= now.timestamp():
+        ts = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    return ts
+
+
+def budget_thinking(budget, cost, thinking):
+    """预算感知思考降档：接近月度预算 80% 时，auto/max 档自动降为 high。
+
+    返回 (effective_thinking, near_budget)。用户显式选择的 low/medium/high
+    档位不干预（尊重手动选择）；仅对智能路由与最高档做降级。
+    """
+    if budget > 0 and cost >= budget * 0.8:
+        if thinking in ("auto", "max"):
+            return "high", True
+        return thinking, True
+    return thinking, False
 
 
 def cron_match(expr, now):

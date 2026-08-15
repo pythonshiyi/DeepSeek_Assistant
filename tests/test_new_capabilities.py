@@ -298,11 +298,12 @@ class TestStrictTools(unittest.TestCase):
             },
         }
         st = dc._strictify_schema(schema)
-        self.assertEqual(sorted(st["required"]), ["files", "path"])
-        self.assertFalse(st["additionalProperties"])
+        # 修复后：不自动把可选属性全部设为 required，也不强制封闭自由对象
+        self.assertNotIn("required", st)
+        self.assertNotIn("additionalProperties", st)
         items = st["properties"]["files"]["items"]
-        self.assertEqual(sorted(items["required"]), ["content", "path"])
-        self.assertFalse(items["additionalProperties"])
+        self.assertNotIn("required", items)
+        self.assertNotIn("additionalProperties", items)
 
     def test_strictify_tools_all_strict(self):
         tools = [{
@@ -319,7 +320,8 @@ class TestStrictTools(unittest.TestCase):
         out = dc._strictify_tools(tools)
         self.assertTrue(out[0]["function"]["strict"])
         self.assertEqual(out[0]["function"]["parameters"]["required"], ["location"])
-        self.assertFalse(out[0]["function"]["parameters"]["additionalProperties"])
+        # 修复后：不额外强制 additionalProperties=false（原 schema 未声明则不添加）
+        self.assertNotIn("additionalProperties", out[0]["function"]["parameters"])
         # 原 schema 不被修改（浅拷贝）
         self.assertNotIn("strict", tools[0]["function"])
 
@@ -341,8 +343,12 @@ class TestStrictTools(unittest.TestCase):
         self.assertTrue(all(t["function"].get("strict") for t in tools))
         for t in tools:
             params = t["function"]["parameters"]
-            self.assertFalse(params.get("additionalProperties", False))
-            self.assertEqual(sorted(params.get("required", [])), sorted(params["properties"].keys()))
+            # 修复后：不强制所有属性必填，也不强制封闭自由对象
+            required = params.get("required", [])
+            self.assertTrue(set(required) <= set(params.get("properties", {}).keys()))
+            # 自由对象（如 call_api.params/json_body）不应被锁成空对象
+            if "properties" not in params:
+                self.assertNotEqual(params.get("additionalProperties"), False)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,6 @@
+import contextlib
+import copy
+import itertools
 import json
 import logging
 import os
@@ -27,6 +30,45 @@ from openai import (
 import permissions
 import crypto
 from shared import cron_field_ok, OCR_IMAGE_PS, is_peak_hour  # noqa: F401  # is_peak_hour 由 main.py 经本模块 re-export
+from security import (  # noqa: F401  # 供 main/tests 继续经 deepseek_client 访问
+    SSRF_TRUSTED,
+    set_ssrf_trusted,
+    _trusted_host,
+    _is_private_host,
+    _safe_url,
+    _url_host,
+)
+from db_utils import (  # noqa: F401  # 兼容旧访问名
+    TABLE_CELL_MAX as _TABLE_CELL_MAX,
+    DB_FORBIDDEN_KEYWORDS as _DB_FORBIDDEN_KEYWORDS,
+    readonly_stmt as _readonly_stmt,
+    db_preview_sql as _db_preview_sql,
+    table_to_md as _table_to_md,
+)
+from pdf_utils import (  # noqa: F401  # 兼容旧访问名
+    parse_page_range as _parse_page_range,
+    find_cjk_font as _find_cjk_font,
+    register_cjk_font as _register_cjk_font,
+    md_inline_html as _md_inline_html,
+    md_table_rows as _md_table_rows,
+)
+from proc_utils import kill_tree as _kill_tree  # noqa: F401  # 兼容旧访问名
+from net_utils import (  # noqa: F401  # 兼容旧访问名
+    DEFAULT_UA as _SEARCH_UA,
+    FETCH_URL_TIMEOUT,
+    _http_client,
+    _shutdown_http_client,
+    _safe_redirect_url,
+)
+from search_utils import (  # noqa: F401  # 兼容旧访问名
+    BING_RESULT_RE as _BING_RESULT_RE,
+    DDG_RESULT_RE as _DDG_RESULT_RE,
+    SO360_RESULT_RE as _SO360_RESULT_RE,
+    strip_tags as _strip_tags,
+    decode_ddg_url as _decode_ddg_url,
+    search_dedup as _search_dedup,
+    search_safe as _search_safe,
+)
 import plugins as plugins_mod
 
 # 按需加载能力：fetch_blocked（机场代理访问被墙站点）。独立模块按用户需要放
@@ -37,6 +79,17 @@ except ImportError:
     _fetch_blocked_impl = None
 
 logger = logging.getLogger("whaletalk")
+
+
+def _decrypt_secret(v):
+    """解密外部配置中的 dpapi: 密文字段；明文或空串原样返回。"""
+    if isinstance(v, str) and v.startswith("dpapi:"):
+        try:
+            return crypto.decrypt(v)
+        except Exception:
+            logger.exception("外部配置敏感字段解密失败")
+            return ""
+    return v
 
 
 class _DaemonThreadPool(ThreadPoolExecutor):
@@ -71,6 +124,42 @@ class _DaemonThreadPool(ThreadPoolExecutor):
 
 
 _TOOL_EXECUTOR = _DaemonThreadPool(max_workers=4, thread_name_prefix="tool")
+# 长耗时工具独立线程池：避免 run_wechat_writer / pip_install / 数据库大查询等
+# 长时间占用普通工具池的全部 4 个 worker，导致同轮快速工具被慢任务排队拖死。
+_LONG_TOOL_EXECUTOR = _DaemonThreadPool(max_workers=2, thread_name_prefix="longtool")
+_LONG_TOOL_NAMES = frozenset({
+    "run_wechat_writer",
+    "pip_install",
+    "database_execute",
+    "database_query_mysql",
+    "database_query_postgres",
+    "webdav",
+    "fetch_blocked",
+    "download_file",
+    "media_ffmpeg",
+    "run_python",
+    "run_command",
+    "browser_navigate",
+    "web_screenshot",
+    "image_generate",
+    "knowledge_index",
+    "run_workflow",
+    "schedule_task",
+    "subagent_run",
+    "run_tests",
+    "verify_output",
+    "read_email",
+    "rss_fetch",
+    "daily_brief",
+    "search_web",
+    "search_github",
+    "search_realtime",
+})
+
+
+def _tool_executor_for(name):
+    """按工具名选择执行池：长任务走独立池，普通任务走快速池。"""
+    return _LONG_TOOL_EXECUTOR if name in _LONG_TOOL_NAMES else _TOOL_EXECUTOR
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -1515,12 +1604,13 @@ RUN_PY_MAX_CHARS = 8000
 RUN_PY_MAX_OUTPUT = 20000
 READ_FILE_MAX_BYTES = 102400
 _READ_LINE_MAX = 102400  # 按行读取的每行上限（防单行数百 MB 撑爆内存）
-FETCH_URL_TIMEOUT = 10
 FETCH_URL_MAX_CHARS = 500000
 WEATHER_TIMEOUT = 5
 EDIT_FILE_MAX_SIZE = 20 * 1024 * 1024  # edit_file 全量读入上限（20MB）
 EDIT_FILE_REGEX_MAX = 1000  # 正则长度上限（防灾难性回溯挂死工具线程的粗略防线）
-_TABLE_CELL_MAX = 100  # CSV/Excel 单元格单格显示上限（防超长单元格撑爆上下文）
+EXTRACT_MAX_ENTRIES = 10000  # 解压条目数上限（防 zip 海量小文件 DoS）
+EXTRACT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024  # 解压总字节上限（防磁盘写满）
+EXTRACT_MAX_SINGLE_BYTES = 2 * 1024 * 1024 * 1024  # 单文件解压大小上限
 
 # ===== run_python 执行模式 =====
 # 完全体模式：沙箱降为用户权限级（默认 -S 不加载第三方库），
@@ -1584,45 +1674,52 @@ def _run_python_ast_blocked(code):
         tree = ast.parse(code)
     except SyntaxError:
         return ""
+    # 第一遍：收集 os / importlib 的别名，并拦截星号导入与危险模块
+    os_aliases = set()
+    importlib_aliases = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = (alias.name or "").split(".")[0]
-                if root in _RUN_PY_FORBIDDEN_MODULES:
+                if root in _RUN_PY_FORBIDDEN_MODULES or root == "builtins":
                     return f"静态拦截：禁止导入模块 {alias.name}（完全智能模式可放行）"
+                if root == "os":
+                    os_aliases.add(alias.asname or alias.name)
+                if root == "importlib":
+                    importlib_aliases.add(alias.asname or alias.name)
         elif isinstance(node, ast.ImportFrom):
             mod = (node.module or "").split(".")[0]
-            if mod in _RUN_PY_FORBIDDEN_MODULES:
+            if mod in _RUN_PY_FORBIDDEN_MODULES or mod == "builtins":
                 return f"静态拦截：禁止导入模块 {node.module}（完全智能模式可放行）"
             if mod == "os":
                 for a in node.names or ():
+                    if a.name == "*":
+                        return "静态拦截：禁止 from os import *（完全智能模式可放行）"
                     if a.name in _RUN_PY_FROM_FORBIDDEN:
                         return f"静态拦截：禁止 from os import {a.name}（完全智能模式可放行）"
-        elif isinstance(node, ast.Call):
+            if mod == "importlib":
+                for a in node.names or ():
+                    if a.name == "import_module":
+                        return "静态拦截：禁止 importlib 动态导入（完全智能模式可放行）"
+    # 第二遍：检查调用/反射/索引
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
             f = node.func
             if isinstance(f, ast.Name):
-                if f.id in ("eval", "exec", "__import__"):
+                if f.id in ("eval", "exec", "__import__", "compile"):
                     return f"静态拦截：禁止调用 {f.id}()（完全智能模式可放行）"
                 if f.id == "open":
                     mode = _call_open_mode(node)
                     if mode and any(ch in mode for ch in "wax+"):
                         return "静态拦截：禁止以写模式打开文件（写文件请用 write_file 工具）"
-                if f.id == "getattr" and node.args:
-                    base, _, rest = node.args[0], None, node.args[1:]
-                    if isinstance(base, ast.Name) and base.id == "os" and rest:
-                        target = rest[0]
-                        if (
-                            isinstance(target, ast.Constant)
-                            and isinstance(target.value, str)
-                            and target.value in _RUN_PY_FROM_FORBIDDEN
-                        ):
-                            return f"静态拦截：禁止反射调用 os.{target.value}（完全智能模式可放行）"
+                if f.id in ("getattr", "setattr", "delattr", "vars", "globals", "locals"):
+                    return f"静态拦截：禁止反射/内省调用 {f.id}()（完全智能模式可放行）"
             elif isinstance(f, ast.Attribute):
                 attr = f.attr
                 base = f.value
-                if isinstance(base, ast.Name) and base.id == "os" and attr in _RUN_PY_DANGEROUS_ATTRS:
-                    return f"静态拦截：禁止调用 os.{attr}()（完全智能模式可放行）"
-                if attr == "import_module" and isinstance(base, ast.Name) and base.id == "importlib":
+                if isinstance(base, ast.Name) and base.id in os_aliases and attr in _RUN_PY_DANGEROUS_ATTRS:
+                    return f"静态拦截：禁止调用 {base.id}.{attr}()（完全智能模式可放行）"
+                if attr == "import_module" and isinstance(base, ast.Name) and base.id in importlib_aliases:
                     return "静态拦截：禁止 importlib 动态导入（完全智能模式可放行）"
                 if attr in ("write_text", "write_bytes"):
                     # Path('f').write_text(...) / pathlib.Path('f').write_text(...)
@@ -1635,15 +1732,15 @@ def _run_python_ast_blocked(code):
                     if p_name in ("Path", "PurePath"):
                         return "静态拦截：禁止 pathlib 写文件（写文件请用 write_file 工具）"
         elif isinstance(node, ast.Subscript):
-            # os["system"] 索引式调用绕过
+            # os["system"] / 别名索引式调用绕过
             if (
                 isinstance(node.value, ast.Name)
-                and node.value.id == "os"
+                and node.value.id in os_aliases
                 and isinstance(node.slice, ast.Constant)
                 and isinstance(node.slice.value, str)
                 and node.slice.value in _RUN_PY_FROM_FORBIDDEN
             ):
-                return f"静态拦截：禁止索引调用 os[{node.slice.value!r}]（完全智能模式可放行）"
+                return f"静态拦截：禁止索引调用 {node.value.id}[{node.slice.value!r}]（完全智能模式可放行）"
     return ""
 
 
@@ -1813,20 +1910,6 @@ def read_file(path, start_line=None, max_lines=None):
         return f"错误：无法读取文件 {path}: {e}"
 
 
-def _url_host(url):
-    """解析 URL 主机名；非法返回 None。"""
-    try:
-        from urllib.parse import urlparse
-
-        host = urlparse(str(url)).hostname
-        return (host or "").lower()
-    except Exception:
-        return None
-
-
-SSRF_TRUSTED = []
-
-
 def _patch_array_items(tools):
     """递归补齐 array 参数的 items（API 要求 type=array 必须带 items，缺则 400）。"""
     def fix(node):
@@ -1845,134 +1928,6 @@ def _patch_array_items(tools):
         fix((tool.get("function") or {}).get("parameters"))
 
 
-def set_ssrf_trusted(hosts):
-    """设置 SSRF 信任主机白名单（内网/保留网段经用户显式信任后放行）。
-
-    支持：主机名精确匹配、IP 精确匹配、CIDR 网段（192.168.1.0/24）、
-    域后缀（example.com. 通配 *.example.com）。云元数据地址永远不可豁免。
-    """
-    global SSRF_TRUSTED
-    SSRF_TRUSTED = [str(h).strip().lower() for h in (hosts or []) if str(h).strip()]
-
-
-def _trusted_host(host, trusted):
-    """信任白名单匹配：主机名/IP 精确、CIDR 网段、域后缀。"""
-    try:
-        import ipaddress
-
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        ip = None
-    for item in trusted or []:
-        if not item:
-            continue
-        if item == host:
-            return True
-        if ip is not None and "/" in item:
-            try:
-                if ip in ipaddress.ip_network(item, strict=False):
-                    return True
-            except ValueError:
-                pass
-        elif item.startswith("*.") and host.endswith(item[1:]):
-            return True
-    return False
-
-
-def _is_private_host(host, allow_loopback=True):
-    """SSRF 防护：主机是否为回环/内网/链路本地地址（模型可控 URL 禁止访问）。
-
-    安全分层（桌面单用户智能体：模型指令均来自用户）：
-    - 回环（localhost / 127.0.0.0/8 / ::1）：默认放行——本地开发服务器验证
-      （localhost:3000 等）是最高频正当场景；严格场景（如搜索结果过滤）传
-      allow_loopback=False。
-    - 内网 / 链路本地 / 保留网段：默认阻止，SSRF_TRUSTED 白名单可显式信任
-      （内网服务 / NAS 等）。
-    - 云元数据地址（169.254.169.254 等 169.254.0.0/16）：永远阻止，白名单
-      不可豁免（云环境 SSRF 的最终攻击面）。
-
-    DNS 重绑定防护：域名先解析，只要任一解析结果落在内网即拦截——
-    模型可控的域名指向 127.0.0.1 时（恶意/失陷 DNS）不再放行。解析失败
-    时放行并保持原行为（避免离线环境误杀可用功能）。
-    """
-    host = (host or "").strip().lower()
-    if not host:
-        return True
-    if _trusted_host(host, SSRF_TRUSTED):
-        return False
-    if host in ("localhost", "ipv6-localhost"):
-        return not allow_loopback
-    # 形如 127.0.0.1 的纯数字点分式
-    if host.replace(".", "").isdigit():
-        parts = host.split(".")
-        if len(parts) == 4:
-            try:
-                a, b = int(parts[0]), int(parts[1])
-                if a == 127:
-                    return not allow_loopback
-                if a == 10:
-                    return True
-                if a == 172 and 16 <= b <= 31:
-                    return True
-                if a == 192 and b == 168:
-                    return True
-                if a == 169 and b == 254:
-                    return True  # 云元数据 / 链路本地：永远阻止
-                if a == 0:
-                    return True
-            except (ValueError, IndexError):
-                return True
-    try:
-        import ipaddress
-
-        ip = ipaddress.ip_address(host)
-        if ip.is_loopback:
-            return not allow_loopback
-        # 链路本地（含 169.254.169.254 云元数据）与保留地址永远阻止
-        if ip.is_link_local or ip.is_reserved:
-            return True
-        if ip.is_private:
-            return True
-        return False
-    except ValueError:
-        pass
-    # 非 IP 主机名：解析 DNS，任一解析结果落内网即拦截（防 DNS 重绑定）
-    try:
-        import socket
-
-        infos = socket.getaddrinfo(host, None, socket.AF_INET | socket.AF_INET6, socket.SOCK_STREAM)
-    except Exception:
-        return False  # 解析失败（离线/DNS 不可用）：维持放行，避免误杀
-    seen = set()
-    for info in infos:
-        try:
-            ip = (info[4] or ["", ""])[0]
-            ip = ip.split("%")[0]  # 去掉 IPv6 区域 ID
-            if ip in seen:
-                continue
-            seen.add(ip)
-            addr = ipaddress.ip_address(ip)
-            if addr.is_loopback:
-                return not allow_loopback
-            if addr.is_link_local or addr.is_reserved or addr.is_private:
-                return True
-        except ValueError:
-            continue
-    return False
-
-
-def _safe_url(url, allow_loopback=True):
-    """URL 安全校验：仅 http/https + 非内网/回环主机。非法返回原因字符串。"""
-    if not url or not str(url).startswith(("http://", "https://")):
-        return "URL 必须以 http:// 或 https:// 开头"
-    host = _url_host(url)
-    if not host:
-        return f"URL 主机名解析失败：{url[:80]}"
-    if _is_private_host(host, allow_loopback=allow_loopback):
-        return f"已阻止访问内网/回环地址（SSRF 防护）：{url[:80]}"
-    return ""
-
-
 def _run_fetch_blocked(url, proxy=None, **kwargs):
     """工具分发：fetch_blocked（按需能力，模块缺失时明确提示）。
 
@@ -1981,7 +1936,86 @@ def _run_fetch_blocked(url, proxy=None, **kwargs):
     """
     if _fetch_blocked_impl is None:
         return "错误: fetch_blocked 能力未安装（需要将 fetch_blocked.py 放入程序目录并启用后可用）"
+    if not str(url or "").startswith(("http://", "https://")):
+        return "错误: URL 必须以 http:// 或 https:// 开头"
+    # SSRF 校验由 fetch_blocked.py 内部实现执行（含内网/元数据拦截）；
+    # 包装层只做协议与参数分发，避免在 DNS 被测试/网络环境临时改写时误伤。
     return _fetch_blocked_impl(url, proxy)
+
+
+def _safe_request(method, url, *, allow_loopback=True, max_redirects=5,
+                  validate=None, **kwargs):
+    """发起 HTTP 请求并逐跳校验重定向（防 SSRF 重定向绕过）。
+
+    validate 可传入自定义校验函数：返回空串表示允许，返回字符串表示拒绝原因。
+    """
+    current = url
+    for _ in range(max_redirects + 1):
+        err = validate(current) if validate is not None else _safe_url(
+            current, allow_loopback=allow_loopback
+        )
+        if err:
+            raise ValueError(err)
+        resp = _http_client().request(
+            method, current, follow_redirects=False, **kwargs
+        )
+        resp_headers = getattr(resp, "headers", {}) or {}
+        location = resp_headers.get("location") if hasattr(resp_headers, "get") else None
+        if getattr(resp, "is_redirect", False) is True and location:
+            loc = str(location)
+            next_url = _safe_redirect_url(current, loc, allow_loopback=allow_loopback)
+            if next_url is None:
+                resp.close()
+                raise ValueError("重定向目标被 SSRF 防护拦截")
+            resp.close()
+            current = next_url
+            continue
+        return resp
+    raise ValueError("重定向次数过多")
+
+
+@contextlib.contextmanager
+def _safe_stream(method, url, *, allow_loopback=True, max_redirects=5,
+                 validate=None, **kwargs):
+    """流式请求并逐跳校验重定向（防 SSRF 重定向绕过）。"""
+    current = url
+    for _ in range(max_redirects + 1):
+        err = validate(current) if validate is not None else _safe_url(
+            current, allow_loopback=allow_loopback
+        )
+        if err:
+            raise ValueError(err)
+        try:
+            _stream_cm = _http_client().stream(
+                method, current, follow_redirects=False, **kwargs
+            )
+        except TypeError:
+            # 兼容旧测试/自定义 mock 的 stream 签名不接受 follow_redirects
+            _stream_cm = _http_client().stream(method, current, **kwargs)
+        except AttributeError:
+            # 兼容旧测试/自定义 mock 没有 stream 方法：退化为普通请求（非流式）
+            resp = _safe_request(
+                method, current,
+                allow_loopback=allow_loopback,
+                max_redirects=max_redirects,
+                validate=validate,
+                **kwargs,
+            )
+            yield resp
+            return
+        with _stream_cm as resp:
+            resp_headers = getattr(resp, "headers", {}) or {}
+            location = resp_headers.get("location") if hasattr(resp_headers, "get") else None
+            if getattr(resp, "is_redirect", False) is True and location:
+                loc = str(location)
+                next_url = _safe_redirect_url(current, loc, allow_loopback=allow_loopback)
+                if next_url is None:
+                    raise ValueError("重定向目标被 SSRF 防护拦截")
+                current = next_url
+                continue
+            yield resp
+            return
+    raise ValueError("重定向次数过多")
 
 
 def fetch_url(url):
@@ -1990,7 +2024,7 @@ def fetch_url(url):
         return f"错误：{err}"
     try:
         # stream 边读边断：大响应不再全量下载进内存后才截断（防 GB 级内存峰值）
-        with _http_client().stream("GET", url, timeout=FETCH_URL_TIMEOUT) as resp:
+        with _safe_stream("GET", url, timeout=FETCH_URL_TIMEOUT) as resp:
             resp.raise_for_status()
             raw = b""
             truncated = False
@@ -2029,7 +2063,9 @@ def _load_webhooks():
     try:
         with open(WEBHOOK_CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            return {k: _decrypt_secret(v) for k, v in data.items()}
+        return {}
     except Exception:
         logging.exception("读取 webhook 配置失败")
         return {}
@@ -2199,21 +2235,27 @@ def subagent_run(tasks, parallel=2, context=""):
     results = [None] * len(tasks)
 
     def run(i, task):
-        try:
-            resp = client.client.chat.completions.create(
-                model=client.model,
-                messages=[
-                    {"role": "system", "content": base},
-                    {"role": "user", "content": str(task)},
-                ],
-                max_tokens=2048,
-                stream=False,
-                timeout=120.0,
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-            results[i] = (resp.choices[0].message.content or "").strip() or "（子代理无输出）"
-        except Exception as e:
-            results[i] = f"（子任务失败：{e}）"
+        last_err = None
+        for attempt in range(2):
+            try:
+                resp = client.client.chat.completions.create(
+                    model=client.model,
+                    messages=[
+                        {"role": "system", "content": base},
+                        {"role": "user", "content": str(task)},
+                    ],
+                    max_tokens=2048,
+                    stream=False,
+                    timeout=120.0,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                results[i] = (resp.choices[0].message.content or "").strip() or "（子代理无输出）"
+                return
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(1)
+        results[i] = f"（子任务失败：{last_err}）"
 
     import concurrent.futures as cf
 
@@ -2255,8 +2297,12 @@ def run_tests(path=None, framework="auto"):
     fw = str(framework or "auto").lower()
     if fw == "unittest":
         cmd = [sys.executable, "-m", "unittest", "discover", "-v"]
+        if target and os.path.isfile(target):
+            cmd = [sys.executable, "-m", "unittest", "-v", str(target)]
     elif fw == "pytest":
         cmd = [sys.executable, "-m", "pytest", "-q"]
+        if target:
+            cmd.append(str(target))
     else:
         cmd = [sys.executable, "-m", "pytest", "-q", str(target)]
         if not os.path.isfile(target):
@@ -2343,6 +2389,12 @@ def image_process(path, output, ops=""):
         return "错误：需要 Pillow（pip install pillow）"
     try:
         img = Image.open(p)
+        # 防 decompression bomb：先检查像素尺寸，拒绝超大图再进入解码/处理
+        try:
+            if img.width * img.height > 100_000_000:
+                return "错误：图片像素过大（超过 1 亿像素），请先压缩后再处理"
+        except Exception:
+            pass
         applied = 0
         quality = None
         for op in str(ops or "").split(";"):
@@ -2465,45 +2517,12 @@ def _db_conn(kind, name):
         cfg = conns.get(str(name or "default"))
         if not cfg or not isinstance(cfg, dict):
             return None, f"错误：未找到 {kind} 连接「{name}」（可用：{list(conns) or '无'}）"
+        cfg = dict(cfg)
+        if cfg.get("password"):
+            cfg["password"] = _decrypt_secret(cfg["password"])
         return cfg, ""
     except Exception as e:
         return None, f"错误：读取数据库配置失败: {e}"
-
-
-# 只读查询禁止的服务器端功能关键字（前缀白名单可被其绕过，读写服务器文件 / DoS）：
-# MySQL: SELECT ... INTO OUTFILE/DUMPFILE、LOAD_FILE、SLEEP
-# PostgreSQL: lo_export / pg_read_file / pg_write_file / pg_sleep
-_DB_FORBIDDEN_KEYWORDS = (
-    "INTO OUTFILE",
-    "INTO DUMPFILE",
-    "LOAD_FILE",
-    "LO_EXPORT",
-    "LO_IMPORT",
-    "PG_READ_FILE",
-    "PG_WRITE_FILE",
-    "PG_READ_BINARY_FILE",
-    "PG_SLEEP",
-    "SLEEP(",
-    "BENCHMARK(",
-    "PG_DATABASE_SIZE",
-    "DEFAULT_TABLESPACE",
-)
-
-
-def _readonly_stmt(sql):
-    stmt = str(sql or "").strip()
-    if not stmt:
-        return False
-    upper = stmt.upper()
-    if not upper.startswith(("SELECT", "SHOW", "DESC", "PRAGMA", "EXPLAIN")):
-        return False
-    # 分号隔离的附加语句（SELECT 1; DROP TABLE ...）：带内部分号的整句拒绝
-    if ";" in stmt.rstrip(";"):
-        return False
-    for kw in _DB_FORBIDDEN_KEYWORDS:
-        if kw in upper:
-            return False
-    return True
 
 
 def database_query_mysql(connection="default", sql="", max_rows=20):
@@ -2530,6 +2549,10 @@ def database_query_mysql(connection="default", sql="", max_rows=20):
         )
         try:
             cur = conn.cursor()
+            try:
+                cur.execute("SET SESSION max_execution_time=15000")
+            except Exception:
+                pass
             cur.execute(str(sql))
             cols = [d[0] for d in cur.description] if cur.description else []
             rows = cur.fetchmany(max(1, min(200, int(max_rows or 20))))
@@ -2617,7 +2640,7 @@ def read_csv(path, max_rows=100, delimiter=","):
         if delim == "\\t":
             delim = "\t"
         with open(p, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
-            rows = list(_csv.reader(f, delimiter=delim))[:limit]
+            rows = list(itertools.islice(_csv.reader(f, delimiter=delim), limit))
         if not rows:
             return "（空文件）"
         # 列宽截断：超宽单元格（minified JSON/长 URL）会撑爆上下文，单格限 100 字符
@@ -3128,6 +3151,8 @@ def send_email(to, subject, body):
     try:
         with open(EMAIL_CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        if isinstance(cfg, dict) and cfg.get("password"):
+            cfg["password"] = _decrypt_secret(cfg["password"])
         smtp_host = str(cfg.get("smtp_host", "")).strip()
         smtp_port = int(cfg.get("smtp_port", 465))
         user = str(cfg.get("user", "")).strip()
@@ -3236,87 +3261,6 @@ def pip_install(package):
 
 SEARCH_TIMEOUT = 8
 SEARCH_MAX_RESULTS = 5
-_SEARCH_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
-
-_HTTP_CLIENT = None
-_HTTP_CLIENT_LOCK = threading.Lock()
-
-
-def _shutdown_http_client():
-    """退出时关闭连接池（防止句柄滞留）。持锁：与后台工具线程的 get() 互斥。"""
-    global _HTTP_CLIENT
-    with _HTTP_CLIENT_LOCK:
-        if _HTTP_CLIENT is not None:
-            try:
-                _HTTP_CLIENT.close()
-            except Exception:
-                pass
-            _HTTP_CLIENT = None
-
-
-import atexit
-
-atexit.register(_shutdown_http_client)
-
-
-def _http_client():
-    """模块级复用 httpx.Client（线程安全）：联网工具不再每次新建连接池，
-    省掉每次调用的 TCP+TLS 握手（50-300ms/次）。"""
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is None:
-        with _HTTP_CLIENT_LOCK:
-            if _HTTP_CLIENT is None:
-                _HTTP_CLIENT = httpx.Client(
-                    follow_redirects=True,
-                    headers={"User-Agent": _SEARCH_UA},
-                    limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
-                    timeout=FETCH_URL_TIMEOUT,
-                )
-    return _HTTP_CLIENT
-
-_BING_RESULT_RE = re.compile(
-    r'<li class="b_algo".*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>'
-    r"(.*?)(?=<li class=\"b_algo\"|</ol>)",
-    re.S,
-)
-_DDG_RESULT_RE = re.compile(
-    r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
-    r".*?<a[^>]*class=\"result__snippet\"[^>]*>(.*?)</a>",
-    re.S,
-)
-
-
-def _strip_tags(html):
-    html = re.sub(r"<script.*?</script>", " ", html, flags=re.S)
-    html = re.sub(r"<style.*?</style>", " ", html, flags=re.S)
-    # 内联标签直接删除（不留空格），块级标签替换为空格分隔
-    html = re.sub(r"</?(?:b|strong|em|i|u|span|font|code)[^>]*>", "", html, flags=re.I)
-    html = re.sub(r"<[^>]+>", " ", html)
-    import html as _html
-
-    return _html.unescape(re.sub(r"\s+", " ", html)).strip()
-
-
-def _decode_ddg_url(link):
-    """DuckDuckGo 跳转链接（/l/?uddg=...）解码为真实 URL。"""
-    link = link.replace("&amp;", "&")
-    if "uddg=" in link:
-        m = re.search(r"[?&]uddg=([^&]+)", link)
-        if m:
-            try:
-                from urllib.parse import unquote
-
-                return unquote(m.group(1))
-            except Exception:
-                return link
-    if link.startswith("//"):
-        return "https:" + link
-    return link
-
-
 def _search_bing(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until=""):
     url = (
         f"https://www.bing.com/search?q={quote(query)}"
@@ -3374,11 +3318,6 @@ def _search_duckduckgo(query, num=SEARCH_MAX_RESULTS, since=""):
     return results
 
 
-_SO360_RESULT_RE = re.compile(
-    r'<h3[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S
-)
-
-
 def _search_so360(query, num=SEARCH_MAX_RESULTS):
     """360 搜索：国内可达的稳定源（结果多、反爬弱），链接可能为 /link 加密跳转。"""
     url = f"https://www.so.com/s?q={quote(query)}"
@@ -3418,48 +3357,33 @@ _SEARCH_ENGINES = (
 _SEARCH_HEALTH = {}  # name -> {"fails": int, "skip_until": float}
 _SEARCH_HEALTH_FAIL_LIMIT = 3
 _SEARCH_HEALTH_COOLDOWN = 600.0
+_SEARCH_HEALTH_LOCK = threading.Lock()
 
 
 def _search_healthy(name):
-    h = _SEARCH_HEALTH.get(name)
-    if not h:
-        return True
-    if h["fails"] >= _SEARCH_HEALTH_FAIL_LIMIT:
-        if time.time() >= h.get("skip_until", 0):
-            h["fails"] = 0  # 冷却结束，重新尝试
+    with _SEARCH_HEALTH_LOCK:
+        h = _SEARCH_HEALTH.get(name)
+        if not h:
             return True
-        return False
-    return True
+        if h["fails"] >= _SEARCH_HEALTH_FAIL_LIMIT:
+            if time.time() >= h.get("skip_until", 0):
+                h["fails"] = 0  # 冷却结束，重新尝试
+                return True
+            return False
+        return True
 
 
 def _search_report(name, ok):
-    h = _SEARCH_HEALTH.setdefault(name, {"fails": 0, "skip_until": 0.0})
-    if ok:
-        h["fails"] = 0
-    else:
-        h["fails"] += 1
-        if h["fails"] >= _SEARCH_HEALTH_FAIL_LIMIT:
-            h["skip_until"] = time.time() + _SEARCH_HEALTH_COOLDOWN
-            logger.warning("搜索源 %s 连续 %d 次失败，暂停 %d 分钟", name,
-                           _SEARCH_HEALTH_FAIL_LIMIT, _SEARCH_HEALTH_COOLDOWN // 60)
-
-
-def _search_dedup(results):
-    """按规范化 URL 去重（去尾部斜杠/fragment），保留首次出现。"""
-    seen, out = set(), []
-    for r in results:
-        key = str(r.get("url") or "").rstrip("/").split("#")[0]
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
-    return out
-
-
-def _search_safe(results):
-    """结果链接安全过滤：只保留 http(s) 公网链接（回环不放行：
-    搜索结果来自外部，是 SSRF 注入源，恶意站点可注入 localhost 链接）。"""
-    return [r for r in results if not _safe_url(r["url"], allow_loopback=False)]
+    with _SEARCH_HEALTH_LOCK:
+        h = _SEARCH_HEALTH.setdefault(name, {"fails": 0, "skip_until": 0.0})
+        if ok:
+            h["fails"] = 0
+        else:
+            h["fails"] += 1
+            if h["fails"] >= _SEARCH_HEALTH_FAIL_LIMIT:
+                h["skip_until"] = time.time() + _SEARCH_HEALTH_COOLDOWN
+                logger.warning("搜索源 %s 连续 %d 次失败，暂停 %d 分钟", name,
+                               _SEARCH_HEALTH_FAIL_LIMIT, _SEARCH_HEALTH_COOLDOWN // 60)
 
 
 def search_web(query, num=SEARCH_MAX_RESULTS, offset=0, since="", until="", site=""):
@@ -3710,9 +3634,10 @@ def call_api(url, method="GET", params=None, json_body=None, data=None,
     """
     if not url or not str(url).startswith(("http://", "https://")):
         return "错误：url 必须以 http:// 或 https:// 开头"
-    err = _safe_url(url)
-    if err and not _call_api_host_allowed(url):
-        return f"错误：{err}（如需访问本地/内网服务，可在配置 call_api_allowed_hosts 中加入该主机白名单）"
+    if not _call_api_host_allowed(url):
+        err = _safe_url(url, allow_loopback=False)
+        if err:
+            return f"错误：{err}（如需访问本地/内网服务，可在配置 call_api_allowed_hosts 中加入该主机白名单）"
     method = str(method or "GET").strip().upper()
     if method not in CALL_API_METHODS:
         return f"错误：method 仅支持 {'/'.join(CALL_API_METHODS)}"
@@ -3739,22 +3664,46 @@ def call_api(url, method="GET", params=None, json_body=None, data=None,
             kw["json"] = json_body
         if data is not None:
             kw["data"] = data
-        resp = _http_client().request(
-            method, url, headers=hdrs or None, timeout=timeout, **kw
-        )
-        body = resp.content
-        truncated = len(body) > CALL_API_MAX_BYTES
+        def _validate(u):
+            if _call_api_host_allowed(u):
+                return ""
+            return _safe_url(u, allow_loopback=False)
+
+        raw = b""
+        truncated = False
+        status_code = 0
+        content_type = ""
+        # 流式读取：大响应不再全量进内存，超过上限立即断开连接
+        with _safe_stream(
+            method, url, validate=_validate,
+            headers=hdrs or None, timeout=timeout, **kw
+        ) as resp:
+            resp.raise_for_status()
+            status_code = resp.status_code
+            content_type = (resp.headers or {}).get("content-type", "") if hasattr(resp.headers, "get") else ""
+            if hasattr(resp, "iter_bytes"):
+                for chunk in resp.iter_bytes(64 * 1024):
+                    raw += chunk
+                    if len(raw) >= CALL_API_MAX_BYTES:
+                        truncated = True
+                        break
+            else:
+                # 兼容旧测试/自定义 mock 的普通响应对象（无流式接口）
+                raw = getattr(resp, "content", b"") or b""
+                truncated = len(raw) > CALL_API_MAX_BYTES
+                raw = raw[:CALL_API_MAX_BYTES]
+        body = raw
         text = body[:CALL_API_MAX_BYTES].decode("utf-8", errors="replace")
         # JSON 美化输出（若可解析），便于阅读
         try:
-            if resp.headers.get("content-type", "").startswith("application/json"):
+            if content_type.startswith("application/json"):
                 import json as _json
                 text = _json.dumps(_json.loads(text), ensure_ascii=False, indent=2)
         except Exception:
             pass
-        head = f"HTTP {resp.status_code} · {method} {url.split('?')[0][:80]}"
+        head = f"HTTP {status_code} · {method} {url.split('?')[0][:80]}"
         if truncated:
-            head += f" · 响应已截断（>200KB，显示前 200KB）"
+            head += f" · 响应已截断（>{CALL_API_MAX_BYTES // 1024}KB，显示前 {CALL_API_MAX_BYTES // 1024}KB）"
         return f"{head}\n\n{text}" if text.strip() else head
     except Exception as e:
         return f"错误：API 调用失败（{type(e).__name__}: {str(e)[:120]}）"
@@ -3782,7 +3731,11 @@ def system_status():
     except Exception as e:
         lines.append(f"- CPU/内存：读取失败（{e}）")
     try:
-        base = permissions.WORKSPACE_DIR or os.getcwd()
+        base = (
+            permissions.WORKSPACE_DIR
+            if permissions.WORKSPACE_DIR and os.path.isdir(permissions.WORKSPACE_DIR)
+            else os.getcwd()
+        )
         du = shutil.disk_usage(base)
         lines.append(
             f"- 磁盘（工作区）：剩余 {du.free / 1024 ** 3:.1f}GB / 总 {du.total / 1024 ** 3:.1f}GB"
@@ -3994,24 +3947,6 @@ def run_command(command):
         return f"退出码 {proc.returncode}\n{out_data}"
     except Exception as e:
         return f"错误：{e}"
-
-
-def _kill_tree(proc):
-    """终止整个进程树：Windows 上 kill() 只杀直接子进程，pip/pytest/服务器
-    派生的孙进程会残留（继续占端口/CPU）。taskkill /T 递归，失败回退 kill()。"""
-    try:
-        if os.name == "nt" and proc.poll() is None:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True, timeout=5,
-            )
-            return
-    except Exception:
-        pass
-    try:
-        proc.kill()
-    except Exception:
-        pass
 
 
 # ===== 后台进程管理（服务器/长驻任务）=====
@@ -4999,8 +4934,13 @@ def notify_desktop(title="鲸语提醒", text=""):
         fd, ps_path = tempfile.mkstemp(suffix=".ps1")
         os.close(fd)
         try:
-            script = _NOTIFY_PS.replace("@TITLE@", "'" + str(title).replace("'", "''") + "'")
-            script = script.replace("@BODY@", "'" + body.replace("'", "''") + "'")
+            title_quoted = "'" + str(title).replace("'", "''") + "'"
+            body_quoted = "'" + body.replace("'", "''") + "'"
+            # 先替换标题为哨兵，再替换正文，最后回填标题：防止标题/正文互相包含对方占位符
+            title_sentinel = "__WHALETALK_TITLE__"
+            script = _NOTIFY_PS.replace("@TITLE@", title_sentinel)
+            script = script.replace("@BODY@", body_quoted)
+            script = script.replace(title_sentinel, title_quoted)
             with open(ps_path, "w", encoding="utf-8-sig") as f:
                 f.write(script)
             proc = subprocess.run(
@@ -5080,8 +5020,12 @@ def _win_clipboard_set(text):
                 if lock:
                     ctypes.memmove(lock, data, len(data))
                     kernel32.GlobalUnlock(h)
-                return bool(user32.SetClipboardData(CF_UNICODETEXT, h))
+                ok = bool(user32.SetClipboardData(CF_UNICODETEXT, h))
+                if not ok:
+                    kernel32.GlobalFree(h)  # 失败时系统未接管，释放句柄防泄漏
+                return ok
             except Exception:
+                kernel32.GlobalFree(h)
                 return False
         finally:
             user32.CloseClipboard()
@@ -5199,6 +5143,7 @@ def archive_files(paths, output):
     try:
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         count = 0
+        total_bytes = 0
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             for p in resolved:
                 if os.path.isdir(p):
@@ -5206,15 +5151,32 @@ def archive_files(paths, output):
                         dirs[:] = [d for d in dirs if d not in _ARCHIVE_SKIP_DIRS]
                         for fn in files:
                             full = os.path.join(root, fn)
+                            if count >= EXTRACT_MAX_ENTRIES:
+                                raise ValueError(f"文件数超过上限（{EXTRACT_MAX_ENTRIES}）")
+                            fsize = os.path.getsize(full)
+                            if total_bytes + fsize > EXTRACT_MAX_TOTAL_BYTES:
+                                raise ValueError("总大小超过打包上限")
                             zf.write(full, os.path.relpath(full, os.path.dirname(p)))
                             count += 1
+                            total_bytes += fsize
                 else:
+                    if count >= EXTRACT_MAX_ENTRIES:
+                        raise ValueError(f"文件数超过上限（{EXTRACT_MAX_ENTRIES}）")
+                    fsize = os.path.getsize(p)
+                    if total_bytes + fsize > EXTRACT_MAX_TOTAL_BYTES:
+                        raise ValueError("总大小超过打包上限")
                     zf.write(p, os.path.basename(p))
                     count += 1
+                    total_bytes += fsize
         size = os.path.getsize(out)
         permissions.audit("archive_files", out, f"{count} 个文件")
         return f"已打包 {count} 个文件到 {out}（{size / 1024:.1f} KB）"
     except Exception as e:
+        try:
+            if os.path.exists(out):
+                os.remove(out)
+        except OSError:
+            pass
         return f"错误：打包失败: {e}"
 
 
@@ -5239,11 +5201,20 @@ def extract_archive(path, dest_dir):
         count = 0
         base = os.path.normpath(dest)
         with zipfile.ZipFile(p) as zf:
-            for info in zf.infolist():
+            infos = zf.infolist()
+            if len(infos) > EXTRACT_MAX_ENTRIES:
+                return f"错误：压缩包条目数超过上限（{EXTRACT_MAX_ENTRIES}），已中止"
+            total_size = 0
+            for info in infos:
                 target = os.path.normpath(os.path.join(base, info.filename))
                 if not (target == base or target.startswith(base + os.sep)):
                     return f"错误：压缩包含越界条目，已中止：{info.filename}"
-            for info in zf.infolist():
+                if info.file_size > EXTRACT_MAX_SINGLE_BYTES:
+                    return f"错误：压缩包单文件超过大小上限：{info.filename}"
+                total_size += info.file_size
+                if total_size > EXTRACT_MAX_TOTAL_BYTES:
+                    return f"错误：压缩包总解压大小超过上限，已中止"
+            for info in infos:
                 zf.extract(info, dest)
                 count += 1
         permissions.audit("extract_archive", dest, f"{count} 个条目")
@@ -5281,7 +5252,8 @@ def batch_rename(directory, pattern, replacement, dry_run=False):
         if not renamed:
             return f"目录内没有包含「{pattern}」的文件名"
         note = "（预览，未实际重命名）" if dry_run else ""
-        permissions.audit("batch_rename", d, f"{len(renamed)} 个文件")
+        if not dry_run:
+            permissions.audit("batch_rename", d, f"{len(renamed)} 个文件")
         return f"共 {len(renamed)} 个文件{note}：\n" + "\n".join(renamed[:20])
     except Exception as e:
         return f"错误：批量重命名失败: {e}"
@@ -5315,7 +5287,7 @@ def image_understand(path, question=""):
         if is_url:
             try:
                 # stream 边读边断：URL 图片大小不可信，防恶意/超大图全量进内存
-                with _http_client().stream("GET", path, timeout=20) as resp:
+                with _safe_stream("GET", path, timeout=20) as resp:
                     resp.raise_for_status()
                     mime = (resp.headers.get("content-type") or "").split(";")[0] or "image/png"
                     img_buf = b""
@@ -5626,19 +5598,6 @@ def database_execute(db_type="sqlite", connection="default", sql="", backup=True
         return f"错误：数据库执行失败: {e}"
 
 
-def _db_preview_sql(stmt):
-    """把 UPDATE/DELETE 改写为等价的 SELECT（用于变更行数预览）。"""
-    m = re.match(r"(UPDATE|DELETE)\s+", stmt, re.I)
-    wm = re.search(r"\bWHERE\b", stmt, re.I)
-    if not m or not wm:
-        return None
-    if m.group(1).upper() == "UPDATE":
-        sm = re.search(r"\bSET\b", stmt, re.I)
-        table_part = stmt[m.end():sm.start()] if sm else stmt[m.end():wm.start()]
-        return "SELECT * FROM " + table_part + stmt[wm.start():]
-    return "SELECT * FROM " + stmt[m.end():wm.start()] + stmt[wm.start():]
-
-
 def _db_execute_sqlite(path, stmt, backup):
     import sqlite3
 
@@ -5699,6 +5658,10 @@ def _db_execute_mysql(connection, stmt, backup):
     )
     try:
         cur = conn.cursor()
+        try:
+            cur.execute("SET SESSION max_execution_time=15000")
+        except Exception:
+            pass
         preview = ""
         head = stmt.lstrip().upper()
         if head.startswith(("UPDATE", "DELETE")):
@@ -5713,7 +5676,8 @@ def _db_execute_mysql(connection, stmt, backup):
         affected = max(0, cur.rowcount)
         conn.commit()
         permissions.audit("database_execute", f"mysql:{connection}", f"{affected} 行变更")
-        return f"已执行（{affected} 行受影响）{preview}\nSQL：{stmt[:200]}"
+        backup_note = "\n⚠ 当前 MySQL 暂不支持自动备份，请自行确保数据安全" if backup else ""
+        return f"已执行（{affected} 行受影响）{preview}{backup_note}\nSQL：{stmt[:200]}"
     finally:
         conn.close()
 
@@ -5750,7 +5714,8 @@ def _db_execute_postgres(connection, stmt, backup):
         affected = max(0, cur.rowcount)
         conn.commit()
         permissions.audit("database_execute", f"postgres:{connection}", f"{affected} 行变更")
-        return f"已执行（{affected} 行受影响）{preview}\nSQL：{stmt[:200]}"
+        backup_note = "\n⚠ 当前 PostgreSQL 暂不支持自动备份，请自行确保数据安全" if backup else ""
+        return f"已执行（{affected} 行受影响）{preview}{backup_note}\nSQL：{stmt[:200]}"
     finally:
         conn.close()
 
@@ -5768,7 +5733,7 @@ def read_email(limit=10, since_days=3):
             imap = {}  # 兼容扁平键格式：imap_host / imap_port / imap_user / imap_password / imap_ssl
         host = str(imap.get("host") or cfg.get("imap_host") or "")
         user = str(imap.get("user") or cfg.get("imap_user") or "")
-        pwd = str(imap.get("password") or cfg.get("imap_password") or "")
+        pwd = _decrypt_secret(str(imap.get("password") or cfg.get("imap_password") or ""))
         if not (host and user and pwd):
             return "错误：imap 配置不完整（host/user/password 必填）"
         try:
@@ -6070,17 +6035,28 @@ def image_generate(prompt, path="", size="1024x1024"):
             with open(out, "wb") as f:
                 f.write(base64.b64decode(items[0]["b64_json"]))
         elif items[0].get("url"):
-            # URL 图片大小不可信：20MB 上限，防写满磁盘
-            with _http_client().stream("GET", items[0]["url"], timeout=60) as r:
-                total = 0
-                truncated = False
-                with open(out, "wb") as f:
-                    for chunk in r.iter_bytes(64 * 1024):
-                        total += len(chunk)
-                        if total > 20 * 1024 * 1024:
-                            truncated = True
-                            break
-                        f.write(chunk)
+            # URL 图片大小不可信：20MB 上限，防写满磁盘；返回地址也做 SSRF 校验
+            dl_url = str(items[0]["url"])
+            err = _safe_url(dl_url, allow_loopback=False)
+            if err:
+                return f"错误：图片接口返回了不安全的下载地址（{err}）"
+            try:
+                with _safe_stream("GET", dl_url, allow_loopback=False, timeout=60) as r:
+                    total = 0
+                    truncated = False
+                    with open(out, "wb") as f:
+                        for chunk in r.iter_bytes(64 * 1024):
+                            total += len(chunk)
+                            if total > 20 * 1024 * 1024:
+                                truncated = True
+                                break
+                            f.write(chunk)
+            except Exception:
+                try:
+                    os.remove(out)
+                except OSError:
+                    pass
+                raise
             if truncated:
                 try:
                     os.remove(out)
@@ -6182,50 +6158,6 @@ PDF_EXTRACT_MAX_OUTPUT = 60000   # pdf_extract 单次输出上限（防撑爆上
 DOCX_MAX_DEFAULT = 50000         # docx_read 默认输出上限
 
 
-def _table_to_md(rows):
-    """把 list[list] 转 Markdown 表格（含单元格截断与空行过滤）。"""
-    rows = [[str(c).strip() for c in r] for r in rows]
-    rows = [[c[:_TABLE_CELL_MAX] + ("…" if len(c) > _TABLE_CELL_MAX else "") for c in r] for r in rows]
-    if not rows:
-        return "（空表格）"
-    width = max(len(r) for r in rows)
-    rows = [r + [""] * (width - len(r)) for r in rows]
-    lines = ["| " + " | ".join(rows[0]) + " |", "| " + " | ".join("---" for _ in rows[0]) + " |"]
-    lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
-    return "\n".join(lines)
-
-
-def _parse_page_range(spec, total):
-    """页码范围解析：'1-5' / '3' / '1,3-4' / 'all' → 页码列表（1 起，去重保序）。"""
-    spec = str(spec or "all").strip().lower()
-    if spec in ("", "all"):
-        return list(range(1, total + 1))
-    out = []
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, _, b = part.partition("-")
-            try:
-                lo, hi = int(a), int(b)
-            except ValueError:
-                return None
-            if not (1 <= lo <= hi <= total):
-                return None
-            out.extend(range(lo, hi + 1))
-        else:
-            try:
-                n = int(part)
-            except ValueError:
-                return None
-            if not (1 <= n <= total):
-                return None
-            out.append(n)
-    seen = set()
-    return [n for n in out if not (n in seen or seen.add(n))]
-
-
 def pdf_extract(path, pages="all", mode="text"):
     """从 PDF 提取文本（按页）/ 表格（Markdown）/ 元数据；支持页码范围与扫描件提示。"""
     if not str(path or "").strip():
@@ -6267,21 +6199,28 @@ def pdf_extract(path, pages="all", mode="text"):
                     f"格式: {md.get('format') or '? '}",
                 ])
             out = [f"文件名: {os.path.basename(p)}", f"页数: {total}"]
+            out_len = sum(len(x) for x in out)
+            truncated_hint = "\n[输出较长已截断，可用 pages= 指定页码范围分段提取]"
             if m == "text":
                 for i in page_list:
                     page = doc.load_page(i - 1)
-                    out.append(f"\n--- 第{i}页 ---")
+                    seg = f"\n--- 第{i}页 ---\n"
                     text = page.get_text("text").strip()
                     if not text:
-                        out.append("（本页无文本层，疑似扫描件；可先用 web_screenshot/pdf 导出页面图片再用 ocr_image 识别）")
+                        seg += "（本页无文本层，疑似扫描件；可先用 web_screenshot/pdf 导出页面图片再用 ocr_image 识别）"
                     else:
-                        out.append(text)
+                        seg += text
+                    if out_len + len(seg) > PDF_EXTRACT_MAX_OUTPUT:
+                        out.append(truncated_hint)
+                        break
+                    out.append(seg)
+                    out_len += len(seg)
             else:  # table
                 if not hasattr(doc.load_page(0), "find_tables"):
                     return "错误：当前 PyMuPDF 版本过低，表格提取需要 PyMuPDF 1.23+（可升级：pip_install PyMuPDF --upgrade，或改用 mode=text）"
                 for i in page_list:
                     page = doc.load_page(i - 1)
-                    out.append(f"\n--- 第{i}页 表格 ---")
+                    seg_parts = [f"\n--- 第{i}页 表格 ---"]
                     try:
                         tables = page.find_tables()
                         found = False
@@ -6290,15 +6229,21 @@ def pdf_extract(path, pages="all", mode="text"):
                             if not data:
                                 continue
                             found = True
-                            out.append(f"表格 {ti}:")
-                            out.append(_table_to_md(data))
+                            seg_parts.append(f"表格 {ti}:")
+                            seg_parts.append(_table_to_md(data))
                         if not found:
-                            out.append("（本页未检测到表格）")
+                            seg_parts.append("（本页未检测到表格）")
                     except Exception:
-                        out.append("（表格提取失败，可改用 mode=text 提取文本）")
+                        seg_parts.append("（表格提取失败，可改用 mode=text 提取文本）")
+                    seg = "\n".join(seg_parts)
+                    if out_len + len(seg) > PDF_EXTRACT_MAX_OUTPUT:
+                        out.append(truncated_hint)
+                        break
+                    out.append(seg)
+                    out_len += len(seg)
             result = "\n".join(out)
             if len(result) > PDF_EXTRACT_MAX_OUTPUT:
-                result = result[:PDF_EXTRACT_MAX_OUTPUT] + "\n[输出较长已截断，可用 pages= 指定页码范围分段提取]"
+                result = result[:PDF_EXTRACT_MAX_OUTPUT] + truncated_hint
             return result
         finally:
             doc.close()
@@ -6307,76 +6252,7 @@ def pdf_extract(path, pages="all", mode="text"):
 
 
 # ---------- PDF 生成（reportlab，中文字体自动嵌入） ----------
-_PDF_FONT_NAME = None  # 已注册的中文字体名（模块级缓存，只注册一次）
-
-
-def _find_cjk_font():
-    for cand in (
-        "C:/Windows/Fonts/msyh.ttc",   # 微软雅黑
-        "C:/Windows/Fonts/msyh.ttf",
-        "C:/Windows/Fonts/simhei.ttf",  # 黑体
-        "C:/Windows/Fonts/simsun.ttc",  # 宋体
-    ):
-        if os.path.isfile(cand):
-            return cand
-    return None
-
-
-def _register_cjk_font():
-    """注册中文字体（TTC 需 subfontIndex；失败回退 Helvetica 防崩溃）。"""
-    global _PDF_FONT_NAME
-    if _PDF_FONT_NAME:
-        return _PDF_FONT_NAME
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-
-    path = _find_cjk_font()
-    if not path:
-        _PDF_FONT_NAME = "Helvetica"
-        return _PDF_FONT_NAME
-    try:
-        if path.lower().endswith(".ttc"):
-            pdfmetrics.registerFont(TTFont("WhaleTalkCJK", path, subfontIndex=0))
-        else:
-            pdfmetrics.registerFont(TTFont("WhaleTalkCJK", path))
-        _PDF_FONT_NAME = "WhaleTalkCJK"
-    except Exception:
-        logging.warning("中文字体注册失败（%s），回退 Helvetica", path)
-        _PDF_FONT_NAME = "Helvetica"
-    return _PDF_FONT_NAME
-
-
-def _md_inline_html(text):
-    """Markdown 行内语法 → reportlab Paragraph 支持的 HTML 子集。
-
-    注意：Paragraph 默认把换行符当空白（多行段落会被挤成一行），
-    行内转换后必须把 \n 转 <br/> 保留换行。
-    """
-    import html as _html
-
-    t = _html.escape(str(text or ""))
-    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.S)
-    t = re.sub(r"`([^`]+?)`", r"<font face='Courier'>\1</font>", t, flags=re.S)
-    t = t.replace("\n", "<br/>")
-    return t
-
-
-def _md_table_rows(block):
-    """Markdown 表格块 → list[list]（跳过分隔行）。"""
-    rows = []
-    for ln in str(block).split("\n"):
-        s = ln.strip()
-        if s.startswith("|"):
-            s = s[1:]
-        if s.endswith("|"):
-            s = s[:-1]
-        cells = [c.strip() for c in s.split("|")]
-        if cells and all(re.match(r"^:?-+:?$", c) for c in cells):
-            continue
-        rows.append([c[:200] for c in cells])
-    return rows
-
-
+# _find_cjk_font / _register_cjk_font 已移至 pdf_utils.py
 def pdf_create(content="", source_path="", output="", title=""):
     """把文本/Markdown 内容生成 PDF（中文字体嵌入；支持标题/列表/代码块/表格）。"""
     try:
@@ -6713,6 +6589,9 @@ def rss_fetch(action="list", url="", limit=10, since_hours=24):
         u = str(url).strip()
         if len(u) > 2048 or not u.startswith(("http://", "https://")):
             return "错误：url 必须是 http(s) 开头的 RSS 源地址"
+        err = _safe_url(u, allow_loopback=False)
+        if err:
+            return f"错误：{err}"
         sources = _load_rss_sources()
         if any(s.get("url") == u for s in sources):
             return "该源已订阅"
@@ -6735,6 +6614,11 @@ def rss_fetch(action="list", url="", limit=10, since_hours=24):
     except ImportError:
         return "未安装 feedparser，请先执行 pip_install feedparser 后重试"
     u = str(url).strip()
+    if not u.startswith(("http://", "https://")):
+        return "错误：url 必须是 http(s) 开头的 RSS 源地址"
+    err = _safe_url(u, allow_loopback=False)
+    if err:
+        return f"错误：{err}"
     # feedparser 6.x 的 parse() 不再支持 timeout 关键字（旧版支持）：
     # 统一用内部线程 + join 超时实现可靠超时，兼容所有版本
     box = {}
@@ -7162,6 +7046,8 @@ def webdav(action="list", remote_path="/", local_path=""):
     remote = str(remote_path or "/").strip()
     if not remote.startswith("/"):
         remote = "/" + remote
+    if ".." in remote.split("/") or any(ord(ch) < 32 for ch in remote):
+        return "错误：remote_path 非法（禁止 .. 与控制字符）"
     if act == "list":
         body = (
             '<?xml version="1.0"?><d:propfind xmlns:d="DAV:">'
@@ -7219,21 +7105,41 @@ def webdav(action="list", remote_path="/", local_path=""):
             out = permissions.resolve(local_path)
             if not out:
                 return "错误：本地路径无效"
-            try:
-                resp = _webdav_request(cfg, "GET", remote)
-            except Exception as e:
-                return f"错误：WebDAV 下载失败: {e}"
-            if resp.status_code != 200:
-                return f"错误：下载失败（HTTP {resp.status_code}）"
-            if len(resp.content) > WEBDAV_MAX_SIZE:
-                return f"错误：远端文件超过 {WEBDAV_MAX_SIZE // 1024 // 1024}MB 上限，请分段下载"
+            total = 0
             try:
                 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-                with open(out, "wb") as f:
-                    f.write(resp.content)
+                client = _http_client()
+                if hasattr(client, "stream"):
+                    with _safe_stream("GET", cfg["url"] + remote, timeout=30) as resp:
+                        if resp.status_code != 200:
+                            return f"错误：下载失败（HTTP {resp.status_code}）"
+                        with open(out, "wb") as f:
+                            for chunk in resp.iter_bytes(64 * 1024):
+                                total += len(chunk)
+                                if total > WEBDAV_MAX_SIZE:
+                                    try:
+                                        os.remove(out)
+                                    except OSError:
+                                        pass
+                                    return f"错误：远端文件超过 {WEBDAV_MAX_SIZE // 1024 // 1024}MB 上限，请分段下载"
+                                f.write(chunk)
+                else:
+                    resp = _webdav_request(cfg, "GET", remote)
+                    if resp.status_code != 200:
+                        return f"错误：下载失败（HTTP {resp.status_code}）"
+                    if len(resp.content) > WEBDAV_MAX_SIZE:
+                        return f"错误：远端文件超过 {WEBDAV_MAX_SIZE // 1024 // 1024}MB 上限，请分段下载"
+                    total = len(resp.content)
+                    with open(out, "wb") as f:
+                        f.write(resp.content)
             except Exception as e:
-                return f"错误：本地写入失败: {e}"
-            return f"已下载 {remote} → {out}（{len(resp.content)} 字节）"
+                try:
+                    if os.path.exists(out):
+                        os.remove(out)
+                except OSError:
+                    pass
+                return f"错误：WebDAV 下载失败: {e}"
+            return f"已下载 {remote} → {out}（{total} 字节）"
         # upload
         ok, reason = permissions.check_filesystem(local_path, write=False)
         if not ok:
@@ -7244,17 +7150,42 @@ def webdav(action="list", remote_path="/", local_path=""):
         try:
             if os.path.getsize(src) > WEBDAV_MAX_SIZE:
                 return f"错误：本地文件超过 {WEBDAV_MAX_SIZE // 1024 // 1024}MB 上限，请压缩后上传"
-            with open(src, "rb") as f:
-                data = f.read()
         except Exception as e:
-            return f"错误：读取本地文件失败: {e}"
+            return f"错误：读取本地文件信息失败: {e}"
+        total = 0
         try:
-            resp = _webdav_request(cfg, "PUT", remote, content=data)
+            client = _http_client()
+            if hasattr(client, "stream"):
+                def _chunks():
+                    nonlocal total
+                    with open(src, "rb") as f:
+                        while True:
+                            chunk = f.read(64 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            yield chunk
+                # 流式上传：大文件不再一次性读入内存
+                with _safe_stream(
+                    "PUT", cfg["url"] + remote,
+                    auth=(cfg["username"], cfg["password"]),
+                    timeout=30,
+                    content=_chunks(),
+                ) as resp:
+                    status_code = resp.status_code
+            else:
+                # 兼容旧测试/自定义 mock：无 stream 时退化为普通请求
+                with open(src, "rb") as f:
+                    data = f.read()
+                total = len(data)
+                resp = _webdav_request(cfg, "PUT", remote, content=data)
+                status_code = resp.status_code
         except Exception as e:
             return f"错误：WebDAV 上传失败: {e}"
-        if resp.status_code not in (200, 201, 204):
-            return f"错误：上传失败（HTTP {resp.status_code}）"
-        return f"已上传 {src} → {remote}（{len(data)} 字节）"
+        if status_code not in (200, 201, 204):
+            return f"错误：上传失败（HTTP {status_code}）"
+        permissions.audit("webdav_upload", remote, f"{total} 字节")
+        return f"已上传 {src} → {remote}（{total} 字节）"
     # delete
     try:
         resp = _webdav_request(cfg, "DELETE", remote)
@@ -7639,11 +7570,12 @@ def _prune_reasoning_for_send(messages):
 
 
 def _strictify_schema(schema):
-    """把 JSON Schema 转换为 strict 模式（Beta）要求：
-    - object 的全部属性补入 required
-    - object 必须 additionalProperties=false
-    - 递归处理嵌套 object / items / anyOf
-    strict 模式下模型输出 Function 调用时严格遵循 schema，减少参数格式错误。
+    """把 JSON Schema 转换为 strict 模式（Beta）兼容形式。
+
+    注意：不会再把「所有属性」自动加入 required，也不会把自由对象/map 强制
+    改成 additionalProperties=false——那会破坏 call_api.params / json_body、
+    create_plugin.workflows 等任意键对象，并让可选参数全部变成必填。
+    仅保留 schema 中显式声明的 required，并递归处理嵌套结构。
     """
     if not isinstance(schema, dict):
         return schema
@@ -7651,9 +7583,13 @@ def _strictify_schema(schema):
     if st.get("type") == "object":
         props = st.get("properties")
         if isinstance(props, dict):
-            st["required"] = list(props.keys())
             st["properties"] = {k: _strictify_schema(v) for k, v in props.items()}
-        st["additionalProperties"] = False
+            if isinstance(st.get("required"), list):
+                st["required"] = [r for r in st["required"] if r in props]
+            elif st.get("additionalProperties") is False:
+                # 仅当原 schema 明确是封闭结构时才补全 required（兼容 strict 语义）
+                st["required"] = list(props.keys())
+        # 不强制修改 additionalProperties：自由对象保持开放
     items = st.get("items")
     if isinstance(items, dict):
         st["items"] = _strictify_schema(items)
@@ -7821,7 +7757,7 @@ class DeepSeekClient:
                 kwargs["reasoning_effort"] = effort
         if seed is not None:
             kwargs["seed"] = seed
-        all_tools = TOOLS + (custom_tools or [])
+        all_tools = copy.deepcopy(TOOLS + (custom_tools or []))
         # 兜底：array 参数缺 items 会导致 API 400（missing field 'items'），
         # 内置/自定义/插件工具一律补齐，防御用户自定义 schema 遗漏
         _patch_array_items(all_tools)
@@ -8145,7 +8081,7 @@ class DeepSeekClient:
                 exec_results = {}
                 if parallel_tools:
                     futs = {
-                        tc["id"]: _TOOL_EXECUTOR.submit(execute_tool, tc)
+                        tc["id"]: _tool_executor_for(tc["name"]).submit(execute_tool, tc)
                         for tc in parallel_tools
                     }
                     pending = set(futs.values())
@@ -8344,9 +8280,13 @@ class DeepSeekClient:
             return f"工具参数解析失败: {e}，原始参数: {raw_args!r}"
         try:
             if method in ("GET",):
-                resp = _http_client().get(endpoint, params=args, timeout=timeout)
+                resp = _safe_request(
+                    "GET", endpoint, params=args, timeout=timeout
+                )
             else:
-                resp = _http_client().post(endpoint, json=args, timeout=timeout)
+                resp = _safe_request(
+                    "POST", endpoint, json=args, timeout=timeout
+                )
             resp.raise_for_status()
             out = resp.text
             if len(out) > max_chars:
@@ -8368,6 +8308,12 @@ class DeepSeekClient:
             getattr(self, "_beta_client", None) is None
             or getattr(self, "_beta_base", None) != base
         ):
+            old_beta = getattr(self, "_beta_client", None)
+            if old_beta is not None and getattr(self, "_beta_base", None) != base:
+                try:
+                    old_beta.close()
+                except Exception:
+                    pass
             self._beta_client = OpenAI(
                 api_key=self.api_key,
                 base_url=base,

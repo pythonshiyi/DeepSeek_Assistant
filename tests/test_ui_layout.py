@@ -135,15 +135,6 @@ class TestInputChatAlignment(unittest.TestCase):
         return max(m.LAYOUT["content_min"],
                    min(m.LAYOUT["content_max"], tw - m.LAYOUT["content_margin"]))
 
-    def test_layout_input_padx_matches_col(self):
-        for tw in (800, 1000, 1200, 1400):
-            cw = self._content_col_width(tw)
-            # _layout_input 内部逻辑：padx = (tw - cw)//2
-            padx = max(16, (tw - cw) // 2)
-            self.assertGreaterEqual(padx, 16)
-            # 输入区宽 = tw - 2*padx 应 ≈ cw（±1px 取整误差）
-            self.assertLessEqual(abs((tw - 2 * padx) - cw), 1)
-
     def test_layout_all_aligns_input(self):
         # 真实调用 _layout_input(1000) 后 input_wrap 的 padx 与聊天列一致
         try:

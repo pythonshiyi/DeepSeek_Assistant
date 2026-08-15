@@ -186,7 +186,15 @@ class TestSSRFGuard(unittest.TestCase):
 
     def test_fetch_url_blocks_private(self):
         out = dc.fetch_url("http://10.0.0.5:1234/")
-        self.assertIn("SSRF", out) or self.assertIn("阻止", out)
+        self.assertTrue("SSRF" in out or "阻止" in out, out)
+
+    def test_redirect_url_ssrf_checked(self):
+        self.assertIsNone(dc._safe_redirect_url(
+            "https://example.com", "http://127.0.0.1/x", allow_loopback=False
+        ))
+        self.assertIsNotNone(dc._safe_redirect_url(
+            "https://example.com", "https://example.com/next", allow_loopback=False
+        ))
 
 
 class TestArrayItemsSchema(unittest.TestCase):

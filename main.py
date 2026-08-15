@@ -21,7 +21,44 @@ from shared import (
     cron_match,
     PATH_RE,
     OCR_IMAGE_PS,
+    defer_until as _defer_until,
+    budget_thinking as _budget_thinking,
 )
+from uiutils import CappedList, MAX_BLOCKS, index_num as _index_num
+from persistence import atomic_json_write
+from layout import LAYOUT
+from themes import THEMES
+from deps import OPTIONAL_DEPS
+from config_defaults import (
+    DEFAULT_CONFIG,
+    DEFAULT_SYSTEM_PROMPT,
+    DIALOG_SYSTEM_PROMPT,
+    BUILTIN_TOOL_NAMES,
+    TASK_QUALITY_GUIDE,
+    UPDATE_URL,
+    MAX_CONTEXT_TOKENS,
+    SCENARIO_DEFAULT_THINKING,
+    DEFAULT_SHORTCUTS,
+    PLUGIN_MARKET_URL,
+)
+from roles import ROLES
+from templates import PLAYGROUND_TASKS, TASK_TEMPLATES
+from app_utils import (
+    as_bool as _as_bool,
+    is_empty_shell as _is_empty_shell,
+    delete_target as _delete_target,
+    write_clean_exit_flag,
+    apply_privacy_logging as _apply_privacy_logging,
+)
+from migration import migrate_legacy_data
+from render_utils import (
+    CODE_FENCE_RE,
+    stream_defer_needed as _stream_defer_needed,
+    tail_start_offset as _tail_start_offset,
+    stream_tail_split as _stream_tail_split,
+    split_code_blocks,
+)
+from ui_utils import destroy_menu as _destroy_menu
 
 from deepseek_client import (
     DeepSeekClient,
@@ -43,6 +80,15 @@ import exporters
 import permissions
 import crypto
 import plugins as plugins_mod
+import user_tools
+from user_tools import load_user_tools
+import profiles as profiles_mod
+from profiles import load_profiles, save_profiles
+import config_utils
+from config_utils import normalize_config, load_config, save_config
+import stores
+from session_utils import safe_sid as _safe_sid, session_id as _session_id_impl
+import dialogs
 from splash import SplashScreen
 from taskpanel import TaskPanel
 from processpanel import ProcessPanel
@@ -64,6 +110,7 @@ except Exception:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+config_utils.DEFAULT_CONFIG_PATH = CONFIG_PATH
 
 APP_NAME = "鲸语"
 APP_NAME_EN = "WhaleTalk"
@@ -76,7 +123,9 @@ SNAPSHOT_PATH = os.path.join(HISTORY_DIR, "session_latest.json")
 STATS_PATH = os.path.join(DATA_DIR, "stats.json")
 PROMPTS_PATH = os.path.join(DATA_DIR, "prompts.json")
 USER_TOOLS_PATH = os.path.join(DATA_DIR, "user_tools.json")
+user_tools.DEFAULT_USER_TOOLS_PATH = USER_TOOLS_PATH
 PROFILES_PATH = os.path.join(DATA_DIR, "profiles.json")
+profiles_mod.DEFAULT_PROFILES_PATH = PROFILES_PATH
 PERMISSIONS_PATH = os.path.join(DATA_DIR, "permissions.json")
 WORKSPACE_DIR = os.path.join(DATA_DIR, "workspace")
 DRAFT_PATH = os.path.join(DATA_DIR, "draft.json")
@@ -91,82 +140,10 @@ SAMPLE_PLUGINS_DIR = os.path.join(BASE_DIR, "sample_plugins")  # 内置示例插
 
 EVOLUTIONS_DIR = os.path.join(BASE_DIR, "evolutions")
 
-# 常驻行为指令（随 memory_text 注入，固定内容缓存友好）
-TASK_QUALITY_GUIDE = (
-    "[任务执行要求]\n"
-    "1. 需要调用工具的任务，先输出执行计划（做什么/用什么工具/预期结果），再开始执行。\n"
-    "2. 任务结束时执行自检：声明的产物是否都已创建？进程是否存活？代码/测试是否已运行验证？"
-    "有失败项自动补做，并在回复中明确说明完成情况。\n"
-    "3. 创建网页/服务后，用 start_process 启动并用 fetch_url 验证可访问。\n"
-    "4. 你有自我审查能力：分析自身代码必须用 project_info / read_project_file（这两个工具始终可用，"
-    "项目位于程序安装目录而非工作区）。审查产出是报告文档（用 create_doc 写入工作区 code-review/，"
-    "包含问题/替换代码/验证方式），供开发 AI 实施，不要直接修改代码。\n"
-    "5. 写文件/创建工程后，必须用 verify_files 或 list_dir 核验产物真实存在，"
-    "发现缺失立即修正，不得继续后续步骤。\n"
-    "6. 任务完成前，核验全部声明的产物文件；缺失则补建并重新验证。"
-)
 ARCHIVES_DIR = os.path.join(DATA_DIR, "archives")
 
 
-_EMPTY_SHELL_CACHE = {"checked": False, "value": False}
-
-
-def _is_empty_shell(path):
-    """判断目录是否为空壳（仅含空子目录、无任何文件）。
-
-    scandir + 栈遍历：第一层发现任何文件立即返回 False（对含大量文件的
-    DATA_DIR 从 O(全部条目) 降为 O(第一层)）；结果缓存避免迁移/崩溃检测双遍历。
-    """
-    if _EMPTY_SHELL_CACHE["checked"]:
-        return _EMPTY_SHELL_CACHE["value"]
-    empty = True
-    try:
-        stack = [path]
-        while stack:
-            d = stack.pop()
-            with os.scandir(d) as it:
-                for entry in it:
-                    try:
-                        if entry.is_file(follow_symlinks=False):
-                            empty = False
-                            break
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                    except OSError:
-                        continue
-            if not empty:
-                break
-    except Exception:
-        empty = False
-    _EMPTY_SHELL_CACHE.update(checked=True, value=empty)
-    return empty
-
-
-def migrate_legacy_data():
-    """首次运行新版本时，将旧数据目录（DeepSeek_Assistant）整体迁移到 WhaleTalk。
-
-    仅当旧目录存在时执行；若新目录已存在但只是空壳（模块加载刚创建的空结构、
-    不含任何文件），先移除空壳再迁移；新目录含真实数据或删除失败则不迁移
-    （不阻塞启动，新目录自动重建）。
-    """
-    try:
-        if not os.path.isdir(LEGACY_DATA_DIR):
-            return False
-        if os.path.exists(DATA_DIR):
-            if not _is_empty_shell(DATA_DIR):
-                return False
-            shutil.rmtree(DATA_DIR, ignore_errors=True)
-            if os.path.exists(DATA_DIR):
-                return False
-        os.makedirs(os.path.dirname(DATA_DIR), exist_ok=True)
-        os.rename(LEGACY_DATA_DIR, DATA_DIR)
-        return True
-    except Exception as e:
-        print(f"[鲸语] 旧数据目录迁移失败（不影响使用）: {e}")
-        return False
-
-
-migrate_legacy_data()
+migrate_legacy_data(LEGACY_DATA_DIR, DATA_DIR, _is_empty_shell)
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -202,126 +179,6 @@ _dc.PLUGIN_PATHS = {
 }
 
 
-def load_profiles(path=PROFILES_PATH):
-    """读取 Profile 列表，返回 {"profiles": {name: cfg}, "current": name}。
-
-    密文为 "dpapi:" 前缀（crypto.decrypt）；旧版明文自动兼容（无前缀原样返回）。
-    """
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            profiles = data.get("profiles") or {}
-            if isinstance(profiles, dict):
-                cleaned = {}
-                for name, p in profiles.items():
-                    if isinstance(p, dict) and name:
-                        cleaned[str(name)] = {
-                            "api_key": crypto.decrypt(str(p.get("api_key", "") or "")),
-                            "base_url": str(p.get("base_url", "") or ""),
-                            "model": str(p.get("model", "") or ""),
-                        }
-                return {"profiles": cleaned, "current": str(data.get("current") or "")}
-    except Exception:
-        logging.exception("读取 Profile 失败")
-    return {"profiles": {}, "current": ""}
-
-
-def save_profiles(data, path=PROFILES_PATH):
-    """保存 Profile 列表；api_key 一律经 DPAPI 加密，绝不明文落盘。
-
-    加密失败（CryptError）时整次保存失败（fail-closed），磁盘保持旧文件。
-    """
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        encrypted = {}
-        for name, p in (data.get("profiles") or {}).items():
-            encrypted[str(name)] = {
-                "api_key": crypto.encrypt(str(p.get("api_key", "") or "")),
-                "base_url": str(p.get("base_url", "") or ""),
-                "model": str(p.get("model", "") or ""),
-            }
-        out = {"profiles": encrypted, "current": str(data.get("current") or "")}
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
-    except Exception:
-        logging.exception("保存 Profile 失败（api_key 未落盘）")
-        return False
-
-
-def load_user_tools(path=None):
-    """读取用户自定义工具配置，返回 OpenAI function schema 列表。
-
-    按文件 mtime+size 缓存：_worker 每轮请求都会调用，避免反复读盘+JSON 解析。
-    """
-    if path is None:
-        path = USER_TOOLS_PATH
-    try:
-        st = os.stat(path)
-        key = (st.st_mtime, st.st_size)
-    except OSError:
-        return []
-    cached = _USER_TOOLS_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        tools = []
-        for t in data:
-            if not isinstance(t, dict):
-                continue
-            fn = t.get("function") if isinstance(t.get("function"), dict) else t
-            name = str(fn.get("name", "")).strip()
-            desc = str(fn.get("description", "")).strip()
-            endpoint = str(fn.get("endpoint", "")).strip()
-            if not (name and endpoint):
-                continue
-            params = fn.get("params")
-            if not isinstance(params, list):
-                raw_params = fn.get("parameters")
-                props = {}
-                if isinstance(raw_params, dict):
-                    props = raw_params.get("properties") or {}
-                params = [{"name": str(k)} for k in props if isinstance(props, dict)]
-            props = {}
-            required = []
-            if isinstance(params, list):
-                for p in params:
-                    if not isinstance(p, dict):
-                        continue
-                    pname = str(p.get("name", "")).strip()
-                    if not pname:
-                        continue
-                    props[pname] = {
-                        "type": "string",
-                        "description": str(p.get("description", "") or ""),
-                    }
-                    required.append(pname)
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": desc,
-                        "parameters": {"type": "object", "properties": props, "required": required},
-                        "endpoint": endpoint,
-                        "method": str(fn.get("method", "POST") or "POST"),
-                    },
-                }
-            )
-        _USER_TOOLS_CACHE[key] = tools
-        return tools
-    except Exception:
-        logging.exception("读取自定义工具失败")
-        return []
-
-
-_USER_TOOLS_CACHE = {}  # (mtime, size) -> tools 列表（load_user_tools 缓存）
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -334,314 +191,26 @@ logging.basicConfig(
         )
     ],
 )
-DEFAULT_SYSTEM_PROMPT = (
-    "你是一个强大的AI助手，具备以下核心能力：\n"
-    "1. 任务拆解：将复杂问题分解为可执行的子任务\n"
-    "2. 工具调用：识别并调用合适的工具/函数完成任务\n"
-    "3. 代码执行：编写、调试、优化代码\n"
-    "4. 错误恢复：遇到错误时自主修正并继续执行\n"
-    "5. 长上下文管理：在长达100万Token的上下文中保持任务状态一致性\n"
-    "请使用中文回答。"
-)
+# DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
+# 已移至 config_defaults.py
+VERSION = "2.13.0"
 
-# 纯对话模式人格：纯正向设定，不出现任何工具/任务/功能概念（避免暗示）
-DIALOG_SYSTEM_PROMPT = (
-    "你是一位博学、友善、富有文采的 AI 对话伙伴。\n"
-    "请以自然、真诚、温暖的方式与人交流：认真倾听、深入思考、坦诚回答。\n"
-    "写作时言之有物、表达优美；讨论时观点清晰、有理有据；闲聊时轻松亲切。\n"
-    "请使用中文回答。"
-)
-
-# 内建基础工具（始终默认启用）；行动层工具默认不启用，需用户开启
-BUILTIN_TOOL_NAMES = [
-    "get_date",
-    "ask_user",
-    "write_memory",
-    "read_memory",
-    "get_weather",
-    "run_python",
-    "read_file",
-    "fetch_url",
-    "search_web",
-    # v2 能力层：安全的基础工具默认启用（高危工具仅出现在工具设置对话框）
-    "list_schedules",
-    "cancel_schedule",
-    "notify_desktop",
-    "clipboard_set",
-    "knowledge_index",
-    "knowledge_search",
-    "task_checkpoint_save",
-    "task_checkpoint_load",
-    "run_workflow",
-    "usage_report",
-    "daily_brief",
-    "create_plugin",
-    # 公众号写作能力（安全：只产草稿不发布，发布权在用户；permissions 白名单已含 publish_draft）
-    "run_wechat_writer",
-    "publish_draft",
-]
-
-DEFAULT_CONFIG = {
-    "api_key": "",
-    "base_url": "https://api.deepseek.com",
-    "model": "deepseek-v4-flash",
-    "scenario": "通用",
-    "thinking": "high",
-    "max_tokens": 16384,
-    "seed": "",
-    "tools_enabled": True,
-    "enabled_tools": list(BUILTIN_TOOL_NAMES),
-    "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    "max_context_chars": 500000,
-    "max_context_tokens": 400000,
-    "min_kept_turns": 8,
-    "timeout": 120,
-    "restore_session": True,
-    "font_size": 10,
-    "theme": "light",
-    "md_render": True,
-    "custom_temperature": 1.0,
-    "custom_top_p": 1.0,
-    "privacy_mode": False,
-    "check_update": False,
-    "welcomed": False,
-    "max_tool_rounds": 10,
-    "monthly_budget": 0.0,
-    "block_on_budget": False,
-    "input_height": 4,
-    "input_height_px": 0,
-    "sidebar_width": 260,
-    "browser_headless": True,
-    "json_output": False,
-    "beta_api": False,
-    "peak_warning": True,
-    "fold_early_threshold": 0,
-    "current_profile": "",
-    "notify_on_done": False,
-    "ssrf_trusted": [],
-    "project_context": False,
-    "full_auto": False,
-    "active_dir": "",
-    "evolution_reminder_days": 7,
-    "suggestions_enabled": True,
-    "pure_chat": False,
-    # v2 能力层配置
-    "inbound_port": 0,        # Webhook 接收端端口（0=关闭）
-    "inbound_token": "",      # Webhook 接收端鉴权 token
-    "image_api_key": "",      # 图片生成 API Key
-    "image_base_url": "",     # 图片生成端点（默认 = base_url）
-    "image_model": "gpt-image-1",
-    "window_geometry": "",    # 窗口大小位置记忆（如 1280x820+100+50）
-    "minimize_to_tray": False,  # 关闭时最小化到系统托盘（需 pystray）
-    "autostart": False,       # 开机自启（注册表 Run 键）
-    "strict_tools": False,    # strict 工具模式（Beta）：模型严格遵循工具 JSON Schema
-    "update_url": "",         # 更新检查源（latest.json，如 https://example.com/latest.json）
-    "call_api_allowed_hosts": [],  # call_api 内网/回环白名单（精确主机名，建议 IP；如 ["127.0.0.1"]）
-}
-
-VERSION = "2.12.11"
-
-ROLES = {
-    "通用助手": {
-        "prompt": DEFAULT_SYSTEM_PROMPT,
-        "thinking": "high",
-        "desc": "默认全能助手，任务拆解/工具调用/长上下文管理",
-    },
-    "智能体": {
-        "prompt": (
-            "你是一位面向开发与创作任务的自主智能体。工作协议：\n"
-            "1) 目标先行：先理解任务目标与可验收的结果，主动澄清缺失的关键信息；\n"
-            "2) 规划执行：拆解步骤，为每一步挑选合适的工具（读/写/运行/检索/抓取），"
-            "按依赖顺序执行，能自动完成的不再询问；\n"
-            "3) 产物落地：代码与文档写入文件系统（write_file / write_code_project / create_doc），"
-            "服务与命令通过 run_command / start_process 运行；\n"
-            "4) 验证闭环：每次产出后主动验证——运行测试、抓取页面、检查文件，失败即定位修正；\n"
-            "5) 结果汇报：以结构化方式汇报完成项、验证证据（文件位置/测试输出/截图）、"
-            "遗留风险与下一步建议。\n"
-            "请使用中文，把「完成并交付可验证的产物」作为最高准则。"
-        ),
-        "thinking": "max",
-        "desc": "自主任务执行：规划-执行-验证闭环，交付可验证产物",
-    },
-    "翻译官": {
-        "prompt": (
-            "你是一位专业翻译。翻译时：1) 准确传达原意，不增删改；2) 目标语言地道自然；"
-            "3) 保留专有名词与格式；4) 代码/术语/缩写按领域惯例处理。请使用中文说明翻译取舍。"
-        ),
-        "thinking": "high",
-        "desc": "中英互译，保留原意与格式，翻译取舍说明",
-    },
-    "代码评审专家": {
-        "prompt": (
-            "你是一位资深代码评审专家。评审时按严重度输出：1) 潜在 bug；2) 安全问题；"
-            "3) 性能隐患；4) 可维护性建议。给出具体修复代码，并指出验证方式。使用中文。"
-        ),
-        "thinking": "max",
-        "desc": "代码评审：bug/安全/性能/可维护性 + 修复代码",
-    },
-    "面试官": {
-        "prompt": (
-            "你是一位严谨的面试官。模拟面试：1) 围绕目标岗位与简历逐层提问；"
-            "2) 追问回答中的技术要点与边界；3) 回答后给出评价与改进建议。使用中文。"
-        ),
-        "thinking": "high",
-        "desc": "模拟面试：逐层提问 + 追问 + 评价建议",
-    },
-    "写作润色师": {
-        "prompt": (
-            "你是一位资深写作顾问。润色时：1) 保持原意；2) 提升表达流畅度与文采；"
-            "3) 调整结构层次；4) 给出润色前后对比与修改说明。使用中文。"
-        ),
-        "thinking": "high",
-        "desc": "文章润色：前后对比 + 修改说明",
-    },
-    "心理咨询伙伴": {
-        "prompt": (
-            "你是一位温暖、专业的倾听者。交流时：1) 先共情理解，不急于评判；"
-            "2) 用开放式问题引导表达；3) 给出温和可行的建议；4) 涉及危机情况时建议寻求专业帮助。"
-        ),
-        "thinking": "high",
-        "desc": "温暖倾听与陪伴，开放式引导与温和建议",
-    },
-    "周报助手": {
-        "prompt": (
-            "你是一位职场周报助理。根据提供的要点生成结构化周报：本周完成 / 下周计划 / "
-            "风险与求助 / 成果数据。语言简洁专业，使用中文。"
-        ),
-        "thinking": "high",
-        "desc": "结构化周报：完成/计划/风险/数据",
-    },
-}
-
-PLAYGROUND_TASKS = {
-    "写周报并存盘": (
-        "请帮我写一篇本周工作周报（包含：本周完成、下周计划、风险与求助），"
-        "完成后用 create_doc 保存为 Markdown 到工作区，并告诉我文件位置。"
-    ),
-    "创建迷你网站": (
-        "请用 write_code_project 在工作目录创建一个小型网站（index.html + style.css + about.html），"
-        "然后用 start_process 启动本地服务器，用 fetch_url 验证页面可访问，"
-        "再用 web_screenshot 截图确认页面效果，最后给出访问地址、工程结构与验证结果。"
-    ),
-    "网页调研汇总": (
-        "请用 fetch_url 抓取 2 个关于 DeepSeek API 的官方网页，"
-        "汇总模型列表、价格与思考模式要点，输出结构化报告。"
-    ),
-    "数据分析计算": (
-        "请用 run_python 计算 1 到 100 的所有质数之和，"
-        "并解释算法思路与结果。"
-    ),
-    "代码审查修复": (
-        "请审查以下代码，指出问题并用 edit_file 修复：\n"
-        "```python\n"
-        "def fib(n):\n"
-        "    if n <= 1: return n\n"
-        "    return fib(n-1) + fib(n-1)\n"
-        "```\n"
-        "修复后用 run_python 验证 fib(10)。"
-    ),
-    "本地文件检索": (
-        "请用 search_local 在工作区检索包含『报告』的文件，"
-        "列出命中文件与行内容，并总结。"
-    ),
-    "生成测试报告": (
-        "请在工作区创建一个简单的 Python 模块与 pytest 测试文件，"
-        "用 run_command 运行 pytest，根据结果用 edit_file 修复后重跑，输出测试报告。"
-    ),
-    "公众号草稿": (
-        "请把下面的内容整理成一篇公众号文章草稿（标题 + 三段式正文），"
-        "用 publish_draft 存入草稿箱：\n"
-        "鲸语 WhaleTalk 是一款深度适配 DeepSeek 的桌面 AI 助手，"
-        "支持流式对话、智能体工具链与本地文件创作。"
-    ),
-    "生成本地文档": (
-        "请用 create_doc 生成一份《鲸语使用手册》Markdown 到工作区，"
-        "涵盖：对话技巧、智能体权限、文件创作、数据安全四个部分。"
-    ),
-    "翻译并存盘": (
-        "请把以下内容翻译成地道的英文，用 create_doc 保存为 translation.md 到工作区：\n"
-        "好的 AI 工具应该让用户专注思考，而不是专注配置。"
-    ),
-}
-
-TASK_TEMPLATES = {
-    "写代码并运行": (
-        "请完成以下编程任务。步骤：1) 分析需求；2) 编写代码；3) 调用 run_python "
-        "工具实际运行并验证结果；4) 根据运行结果修正；5) 给出最终代码与运行结论。\n\n任务："
-    ),
-    "网页调研": (
-        "请对以下主题进行调研。步骤：1) 分析主题；2) 通过 fetch_url 抓取 2-4 个相关网页；"
-        "3) 汇总关键信息；4) 输出结构化报告（含来源链接）。\n\n主题："
-    ),
-    "数据分析": (
-        "请处理以下数据分析任务。步骤：1) 明确分析目标；2) 若涉及数据请用 run_python "
-        "处理并输出结果；3) 给出结论与可视化建议。\n\n任务："
-    ),
-    "创建代码工程": (
-        "请创建以下代码工程。步骤：1) 分析需求与目录结构；2) 使用 write_code_project "
-        "在允许目录（如工作区）创建多文件工程；3) 用 run_command 运行验证（如 python main.py）；"
-        "4) 给出工程结构与运行结论。\n\n需求："
-    ),
-    "生成本地文档": (
-        "请生成以下文档。步骤：1) 分析内容；2) 使用 create_doc 在允许目录生成 .md 文档；"
-        "3) 总结文档结构与要点。\n\n内容："
-    ),
-    "执行项目测试": (
-        "请执行以下测试任务。步骤：1) 定位项目目录；2) 使用 run_command 运行 pytest；"
-        "3) 分析测试结果，失败则用 edit_file 修复后重跑；4) 输出测试报告。\n\n任务："
-    ),
-}
-
-# 更新源：默认指向 GitHub Releases（返回 {"tag_name": "v2.12.10", "html_url": ...}）。
-# 也兼容自定义 latest.json 格式 {"version": "...", "url": "..."}（见 check_for_update）；
-# config.json 的 update_url 优先于此处。
-UPDATE_URL = "https://api.github.com/repos/pythonshiyi/WhaleTalk/releases/latest"
+# ROLES 已移至 roles.py
+# PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
+# UPDATE_URL / MAX_CONTEXT_TOKENS / SCENARIO_DEFAULT_THINKING 已移至 config_defaults.py
 CLEAN_EXIT_FLAG = os.path.join(DATA_DIR, ".clean_exit")
 
-MAX_CONTEXT_TOKENS = 1_000_000
-SCENARIO_DEFAULT_THINKING = {"通用": "high", "编程": "max", "Agent": "max"}
-
 # ============ 布局定版规范（Layout Specification v1.0）============
-# 所有模块的默认尺寸、范围与档位在此统一定义，禁止散落魔法数字
-LAYOUT = {
-    "window_w": 1280,           # 默认窗口宽
-    "window_h": 820,            # 默认窗口高（16:10 内容比例）
-    "window_min_w": 880,        # 最小窗口宽（小于紧凑阈值：窄窗口自动让位给聊天区）
-    "window_min_h": 620,        # 最小窗口高
-    "menu_h": 34,               # 菜单栏高度
-    "status_h": 30,             # 状态栏高度
-    "sidebar_default": 260,     # 侧栏默认宽
-    "sidebar_min": 200,         # 侧栏最小宽
-    "sidebar_max": 420,         # 侧栏最大宽
-    "panel_default": 280,       # 设置面板默认宽
-    "panel_min": 240,           # 设置面板最小宽
-    "panel_max": 480,           # 设置面板最大宽
-    "panel_files_w": 460,       # 文件视图宽度
-    "content_min": 560,         # 聊天内容列最小宽
-    "content_max": 860,         # 聊天内容列最大宽
-    "content_margin": 120,      # 聊天列两侧总留白（聊天列 = tw - margin）
-    "compact_panel_w": 1000,    # 窗口 <此宽度收起右侧面板
-    "compact_sidebar_w": 1120,  # 窗口 <此宽度收起侧栏（窄窗口优先保聊天区）
-    "dialog_s": 420,            # 对话框窄档
-    "dialog_m": 520,            # 对话框中档
-    "dialog_l": 640,            # 对话框宽档
-    "dialog_h_s": 300,          # 对话框矮档
-    "dialog_h_m": 420,          # 对话框中档高
-    "dialog_h_l": 460,          # 对话框高档
-    "dialog_h_editor": 540,     # 编辑器类高度
-    "dialog_h_editor_l": 620,   # 大编辑器类高度
-}
+# LAYOUT 已移至 layout.py
 FLUSH_INTERVAL_MS = 40
 POLL_IDLE_MS = 500
 SNAPSHOT_INTERVAL_S = 2.0
 SEARCH_DEBOUNCE_MS = 200
 STREAM_IDLE_WARNING_S = 10
-MAX_BLOCKS = 8000
 PAGED_RENDER_THRESHOLD = 200   # blocks 超过该数量时全量渲染走分帧（防长会话一次性布局卡死）
 PAGED_RENDER_SIZE = 250        # 每帧渲染的 block 数
 PAGED_RENDER_MS = 25           # 帧间隔（事件循环得以处理输入/拖动/切换）
 MAX_SEARCH_MATCHES = 2000
-CODE_FENCE_RE = re.compile(r"^```\w*\s*$", re.MULTILINE)
 
 RECENT_PATH = os.path.join(DATA_DIR, "recent_outputs.json")
 
@@ -649,441 +218,7 @@ FONT_FAMILY = "Microsoft YaHei UI"
 MONO_FAMILY = "Consolas"
 PLACEHOLDER_TEXT = "输入问题，Enter 发送，Shift+Enter 换行"
 
-# 可选依赖清单（依赖状态对话框）：(导入名, 显示名, 影响功能, 安装命令)
-OPTIONAL_DEPS = [
-    ("PIL", "Pillow", "图片处理/应用内图片预览/OCR/图表/图标", "pip install pillow"),
-    ("pystray", "pystray", "系统托盘常驻", "pip install pystray"),
-    ("playwright", "playwright", "浏览器操作/网页截图", "pip install playwright && playwright install chromium"),
-    ("faster_whisper", "faster-whisper", "语音转文字", "pip install faster-whisper"),
-    ("fitz", "PyMuPDF", "PDF 提取", "pip install PyMuPDF"),
-    ("reportlab", "reportlab", "PDF 生成", "pip install reportlab"),
-    ("docx", "python-docx", "Word 读写", "pip install python-docx"),
-    ("pptx", "python-pptx", "PPT 读取", "pip install python-pptx"),
-    ("feedparser", "feedparser", "RSS 聚合/每日简报/公众号写作", "pip install feedparser"),
-    ("qrcode", "qrcode", "二维码生成", "pip install qrcode"),
-    ("pyzbar", "pyzbar", "二维码识别", "pip install pyzbar（另需系统 zbar）"),
-    ("diskcache", "diskcache", "KV 存储", "pip install diskcache"),
-    ("imageio_ffmpeg", "imageio-ffmpeg", "音视频处理（内置 ffmpeg）", "pip install imageio-ffmpeg"),
-    ("markdown", "markdown", "公众号写作 HTML 输出", "pip install markdown"),
-    ("win32com", "pywin32", "语音朗读/语音合成", "pip install pywin32"),
-    ("tkinterdnd2", "tkinterdnd2", "文件拖拽到输入框", "pip install tkinterdnd2"),
-    ("tiktoken", "tiktoken", "精确 token 估算（缺省回退字符估算）", "pip install tiktoken"),
-]
-
-
-class CappedList(list):
-    def __init__(self, items=(), maxlen=MAX_BLOCKS):
-        super().__init__(items)
-        self.maxlen = maxlen
-        self._trim()
-
-    def append(self, item):
-        super().append(item)
-        self._trim()
-
-    def _trim(self):
-        # 摊还 O(1)：超限时一次删掉超出的部分（del 头删为 O(n)，逐条删是 O(n²)）
-        if len(self) > self.maxlen:
-            del self[: len(self) - self.maxlen]
-
-    def extend(self, items):
-        super().extend(items)
-        self._trim()
-
-
-def _index_num(idx):
-    """把 Tk 索引 "line.char" 转成可比较的数值键 (line, char)，供 bisect 使用。"""
-    ln, _, ch = str(idx).partition(".")
-    try:
-        return (int(ln), int(ch or "0"))
-    except ValueError:
-        return (10**9, 0)
-
-
-def _stream_defer_needed(buf):
-    """流式 Markdown 渲染：缓冲含未闭合标记时暂缓整块（等标记闭合再渲染）。
-
-    覆盖：代码围栏 ```、粗体 **、行内代码 `、链接 [ ] ( )。
-    半角括号差值恰好为 1 才暂缓（多对不配对时视为普通文本，避免过度延迟）；
-    生成结束由 _finish(force=True) 强制兜底，内容永不丢失。
-    """
-    if buf.count("```") % 2 == 1:
-        return True
-    if buf.count("**") % 2 == 1:
-        return True
-    if buf.count("`") % 2 == 1:
-        return True
-    if abs(buf.count("[") - buf.count("]")) == 1:
-        return True
-    if abs(buf.count("(") - buf.count(")")) == 1:
-        return True
-    return False
-
-
-def _tail_start_offset(raw):
-    """最后一个未完块在 raw 中的起始偏移（块边界 = 空行 / 块起始行 / 表格分隔行）。"""
-    lines = raw.split("\n")
-    offsets = []
-    off = 0
-    for ln in lines:
-        offsets.append(off)
-        off += len(ln) + 1
-    for i in range(len(lines) - 1, -1, -1):
-        ln = lines[i]
-        if not ln.strip():
-            return offsets[i] + len(ln) + 1
-        if mdparse._starts_block(ln) or mdparse._is_table_sep(ln):
-            return offsets[i] + len(ln) + 1
-    return 0
-
-
-def _stream_tail_split(raw):
-    """把流式未渲染内容按段落边界切分，返回 (稳定部分, 尾部部分)。
-
-    尾部 = 仍在书写、尚未到达段落边界的最后一个块（未闭合的段落等），
-    它随流式逐帧整体重绘；稳定部分按完整 Markdown 渲染。段落只在
-    "空行 / 块起始行 / 表格分隔行"处断开，而不是按输出 chunk 断开——
-    修复"一句话被 40ms 输出块拆成多行"的分段问题。
-    """
-    if not raw:
-        return "", ""
-    if raw.endswith("\n\n"):
-        return raw, ""
-    blocks = mdparse.parse_blocks(raw)
-    if not blocks:
-        return "", raw
-    last = blocks[-1]
-    if last[0] != "plain" and raw.endswith("\n"):
-        # 标题/列表/引用/表格/围栏等块已整行结束 → 全部稳定
-        return raw, ""
-    start = _tail_start_offset(raw)
-    return raw[:start], raw[start:]
-
-
-def _destroy_menu(menu):
-    """安全销毁临时菜单（tk_popup 非阻塞返回后菜单仍在显示，必须等 Unmap 后销毁）。
-
-    递归销毁 cascade 子菜单：Tk 销毁父菜单不会自动销毁子菜单，
-    每次右键弹出「快速动作」子菜单后必须一并回收，否则 Tcl 菜单 widget 持续泄漏。
-    """
-    try:
-        end = menu.index("end")
-        if end is not None:
-            for i in range(end + 1):
-                try:
-                    sub = menu.entrycget(i, "menu")
-                except tk.TclError:
-                    sub = None
-                if sub:
-                    _destroy_menu(sub)
-    except tk.TclError:
-        pass
-    try:
-        menu.destroy()
-    except tk.TclError:
-        pass
-
-
-def _build_markdown(messages, usage_total, session_start, cfg):
-    """把消息快照构建为 Markdown 导出文本（纯函数，供后台线程导出）。
-
-    与 AssistantApp.build_markdown 等价，但接收快照参数而非访问会话状态。
-    """
-    lines = [
-        f"# {APP_NAME} {APP_NAME_EN} 会话记录",
-        "",
-        f"- 开始时间: {session_start:%Y-%m-%d %H:%M:%S}",
-        f"- 模型: {cfg.get('model', '')}",
-        f"- 场景: {cfg.get('scenario', '')} | 思考模式: {cfg.get('thinking', '')}",
-        f"- 累计 Token: 输入 {usage_total.get('prompt', 0)} / 输出 {usage_total.get('completion', 0)}",
-        "",
-        "---",
-    ]
-    for m in messages:
-        role = m.get("role")
-        if role == "system":
-            continue
-        if role == "user":
-            lines += ["", "## 用户", "", m.get("content") or ""]
-        elif role == "assistant":
-            if m.get("reasoning_content"):
-                lines += ["", "## 助手（思考过程）", "", "```text", m["reasoning_content"], "```"]
-            if m.get("content"):
-                lines += ["", "## 助手", "", m["content"]]
-            for tc in m.get("tool_calls") or ():
-                if isinstance(tc, dict):
-                    fn = tc.get("function") or {}
-                    lines += [
-                        "",
-                        f"## 工具调用: {fn.get('name')}",
-                        "",
-                        "```json",
-                        fn.get("arguments") or "",
-                        "```",
-                    ]
-        elif role == "tool":
-            lines += ["", f"> 工具结果: {m.get('content')}", ""]
-    return "\n".join(lines)
-
-THEMES = {
-    "light": {
-        "name": "浅色",
-        "bg": "#eef0f3",
-        "page": "#f5f6f8",
-        "panel": "#ffffff",
-        "surface": "#eef0f3",
-        "border": "#e3e5e9",
-        "chat_bg": "#ffffff",
-        "text": "#1d1f24",
-        "text_sec": "#8a9099",
-        "accent": "#3478f6",
-        "accent_hover": "#2f6ce0",
-        "accent_text": "#ffffff",
-        "bubble_user": "#3478f6",
-        "bubble_user_text": "#ffffff",
-        "bubble_assistant": "#ffffff",
-        "code_bg": "#f2f4f7",
-        "code_fg": "#24292f",
-        "input_bg": "#ffffff",
-        "input_fg": "#1d1f24",
-        "selection": "#bcd6ff",
-        "thinking": "#98a2b3",
-        "tool": "#af52de",
-        "error": "#ff3b30",
-        "warning": "#ff9500",
-        "success": "#34c759",
-        "disabled": "#c3c8cf",
-        # ---- 1.11.0 定版新增 token：悬停/提示/引用/时间戳 ----
-        "hover": "#e6ecf7",          # 列表/菜单悬停（带品牌蓝倾向）
-        "note": "#8a9099",           # 时间戳与系统提示文字
-        "mention": "#3478f6",        # 用户名提及/引用高亮
-        "quote_bg": "#f2f6fd",       # 引用块背景（品牌蓝极浅）
-        "input_placeholder": "#a6adb8",
-    },
-    "dark": {
-        "name": "纯黑",
-        "bg": "#000000",
-        "page": "#000000",
-        "panel": "#000000",
-        "surface": "#1c1c1c",
-        "border": "#3a3a3a",
-        "chat_bg": "#000000",
-        "text": "#f2f3f5",
-        "text_sec": "#a8adb5",
-        "accent": "#0a84ff",
-        "accent_hover": "#3d9bff",
-        "accent_text": "#ffffff",
-        "bubble_user": "#0a84ff",
-        "bubble_user_text": "#ffffff",
-        "bubble_assistant": "#000000",
-        "code_bg": "#161616",
-        "code_fg": "#d6dde6",
-        "input_bg": "#000000",
-        "input_fg": "#f2f3f5",
-        "selection": "#2058d8",
-        "thinking": "#8b93a1",
-        "tool": "#bf5af2",
-        "error": "#ff453a",
-        "warning": "#ff9f0a",
-        "success": "#30d158",
-        "disabled": "#4a4d55",
-        # ---- 1.11.0 定版新增 token ----
-        "hover": "#232323",
-        "note": "#8b93a1",
-        "mention": "#0a84ff",
-        "quote_bg": "#101418",
-        "input_placeholder": "#5a5f68",
-    },
-}
-
-
-def split_code_blocks(text):
-    segments = []
-    pos = 0
-    is_code = False
-    for match in CODE_FENCE_RE.finditer(text):
-        if match.start() > pos:
-            segments.append(("code" if is_code else "assistant", text[pos : match.start()]))
-        is_code = not is_code
-        pos = match.end()
-        if pos < len(text) and text[pos] in "\r\n":
-            pos += 1
-            if pos < len(text) and text[pos] == "\n":
-                pos += 1
-    if pos < len(text):
-        segments.append(("code" if is_code else "assistant", text[pos:]))
-    return segments
-
-
-def _as_bool(v, default=False):
-    """健壮布尔转换：手改配置写字符串 "false" 不再被误判为 True。"""
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "on"):
-        return True
-    if s in ("0", "false", "no", "off", ""):
-        return False
-    return default
-
-
-def normalize_config(cfg):
-    try:
-        cfg["max_tokens"] = int(cfg.get("max_tokens", 16384))
-    except (TypeError, ValueError):
-        cfg["max_tokens"] = 16384
-    cfg["max_tokens"] = max(1024, min(393216, cfg["max_tokens"]))  # V4 正式版最大输出 384K
-
-    seed = str(cfg.get("seed", "")).strip()
-    if seed:
-        try:
-            seed = str(int(seed))
-        except ValueError:
-            seed = ""
-    cfg["seed"] = seed
-
-    if cfg.get("thinking") not in THINKING_MODES:
-        cfg["thinking"] = "high"
-    if cfg.get("scenario") not in SCENARIOS:
-        cfg["scenario"] = "通用"
-
-    base_url = str(cfg.get("base_url", "")).strip()
-    if not (base_url.startswith("http://") or base_url.startswith("https://")):
-        base_url = DEFAULT_BASE_URL
-    cfg["base_url"] = base_url
-
-    cfg["model"] = str(cfg.get("model", "deepseek-v4-flash")).strip() or "deepseek-v4-flash"
-    # 支持任意 OpenAI 兼容模型名（Profile 自定义端点场景），不再强制回退内置列表
-    api_key = cfg.get("api_key")
-    cfg["api_key"] = "" if api_key is None else str(api_key).strip()
-    cfg["tools_enabled"] = _as_bool(cfg.get("tools_enabled", True), True)
-    cfg["restore_session"] = _as_bool(cfg.get("restore_session", True), True)
-    cfg["privacy_mode"] = _as_bool(cfg.get("privacy_mode", False))
-    cfg["check_update"] = _as_bool(cfg.get("check_update", False))
-    cfg["welcomed"] = _as_bool(cfg.get("welcomed", False))
-    cfg["browser_headless"] = _as_bool(cfg.get("browser_headless", True), True)
-    try:
-        cfg["custom_temperature"] = max(0.0, min(2.0, float(cfg.get("custom_temperature", 1.0))))
-    except (TypeError, ValueError):
-        cfg["custom_temperature"] = 1.0
-    try:
-        cfg["custom_top_p"] = max(0.0, min(1.0, float(cfg.get("custom_top_p", 1.0))))
-    except (TypeError, ValueError):
-        cfg["custom_top_p"] = 1.0
-    try:
-        cfg["max_tool_rounds"] = max(1, min(50, int(cfg.get("max_tool_rounds", 10))))
-    except (TypeError, ValueError):
-        cfg["max_tool_rounds"] = 10
-    try:
-        cfg["monthly_budget"] = max(0.0, float(cfg.get("monthly_budget", 0.0)))
-    except (TypeError, ValueError):
-        cfg["monthly_budget"] = 0.0
-    cfg["block_on_budget"] = _as_bool(cfg.get("block_on_budget", False))
-    try:
-        all_tool_names = [t["function"]["name"] for t in TOOLS]
-    except (KeyError, TypeError):
-        all_tool_names = []
-    try:
-        user_tool_names = [t["function"]["name"] for t in load_user_tools()]
-    except Exception:
-        user_tool_names = []
-    valid_tool_names = set(all_tool_names) | set(user_tool_names)
-    raw_tools = cfg.get("enabled_tools")
-    if isinstance(raw_tools, list):
-        cfg["enabled_tools"] = [n for n in raw_tools if n in valid_tool_names]
-        # 升级合并：新版本新增的安全基础工具自动启用（旧配置无感知升级）
-        for n in BUILTIN_TOOL_NAMES:
-            if n in valid_tool_names and n not in cfg["enabled_tools"]:
-                cfg["enabled_tools"].append(n)
-    else:
-        cfg["enabled_tools"] = list(BUILTIN_TOOL_NAMES)
-    cfg["system_prompt"] = str(cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT))
-    # call_api 内网白名单：用户显式放行的本地/内网服务主机（精确匹配，建议 IP）
-    try:
-        raw_allow = cfg.get("call_api_allowed_hosts") or []
-        if isinstance(raw_allow, list):
-            _dc.CALL_API_ALLOWED_HOSTS = [
-                str(h).strip() for h in raw_allow if str(h).strip()
-            ]
-    except Exception:
-        _dc.CALL_API_ALLOWED_HOSTS = []
-
-    try:
-        cfg["max_context_chars"] = max(10000, int(cfg.get("max_context_chars", 500000)))
-    except (TypeError, ValueError):
-        cfg["max_context_chars"] = 500000
-    try:
-        cfg["max_context_tokens"] = max(8000, min(900000, int(cfg.get("max_context_tokens", 400000))))
-    except (TypeError, ValueError):
-        cfg["max_context_tokens"] = 400000
-    try:
-        cfg["min_kept_turns"] = max(3, min(500, int(cfg.get("min_kept_turns", 8))))
-    except (TypeError, ValueError):
-        cfg["min_kept_turns"] = 8
-    try:
-        cfg["timeout"] = max(10, min(600, float(cfg.get("timeout", 120))))
-    except (TypeError, ValueError):
-        cfg["timeout"] = 120
-    try:
-        cfg["font_size"] = max(8, min(18, int(cfg.get("font_size", 10))))
-    except (TypeError, ValueError):
-        cfg["font_size"] = 10
-    try:
-        cfg["input_height"] = max(2, min(14, int(cfg.get("input_height", 4))))
-    except (TypeError, ValueError):
-        cfg["input_height"] = 4
-    try:
-        cfg["input_height_px"] = max(0, min(3000, int(cfg.get("input_height_px", 0))))
-    except (TypeError, ValueError):
-        cfg["input_height_px"] = 0
-    try:
-        cfg["sidebar_width"] = max(LAYOUT["sidebar_min"], min(LAYOUT["sidebar_max"], int(cfg.get("sidebar_width", LAYOUT["sidebar_default"]))))
-    except (TypeError, ValueError):
-        cfg["sidebar_width"] = LAYOUT["sidebar_default"]
-    if cfg.get("theme") not in THEMES:
-        cfg["theme"] = "light"
-    cfg["json_output"] = _as_bool(cfg.get("json_output", False))
-    cfg["beta_api"] = _as_bool(cfg.get("beta_api", False))
-    cfg["peak_warning"] = _as_bool(cfg.get("peak_warning", True), True)
-    cfg["full_auto"] = _as_bool(cfg.get("full_auto", False))
-    cfg["suggestions_enabled"] = _as_bool(cfg.get("suggestions_enabled", True), True)
-    cfg["pure_chat"] = _as_bool(cfg.get("pure_chat", False))
-    try:
-        cfg["evolution_reminder_days"] = max(0, min(90, int(cfg.get("evolution_reminder_days", 7))))
-    except (TypeError, ValueError):
-        cfg["evolution_reminder_days"] = 7
-    try:
-        cfg["fold_early_threshold"] = max(0, min(20000, int(cfg.get("fold_early_threshold", 0))))
-    except (TypeError, ValueError):
-        cfg["fold_early_threshold"] = 0
-    try:
-        cfg["inbound_port"] = max(0, min(65535, int(cfg.get("inbound_port", 0))))
-    except (TypeError, ValueError):
-        cfg["inbound_port"] = 0
-    cfg["inbound_token"] = str(cfg.get("inbound_token", "") or "").strip()
-    cfg["image_api_key"] = str(cfg.get("image_api_key", "") or "").strip()
-    cfg["image_base_url"] = str(cfg.get("image_base_url", "") or "").strip()
-    cfg["image_model"] = str(cfg.get("image_model", "gpt-image-1")).strip() or "gpt-image-1"
-    cfg["minimize_to_tray"] = _as_bool(cfg.get("minimize_to_tray", False))
-    cfg["autostart"] = _as_bool(cfg.get("autostart", False))
-    cfg["strict_tools"] = _as_bool(cfg.get("strict_tools", False))
-    cfg["update_url"] = str(cfg.get("update_url", "") or "").strip()
-    return cfg
-
-
-def load_config():
-    cfg = dict(DEFAULT_CONFIG)
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            cfg.update({k: data[k] for k in data if k in cfg})
-        except Exception as e:
-            logging.error("加载配置失败: %s", e)
-    cfg["api_key"] = crypto.decrypt(cfg.get("api_key", ""))
-    return normalize_config(cfg)
+# THEMES 已移至 themes.py
 
 
 def previous_run_crashed(flag_path=CLEAN_EXIT_FLAG):
@@ -1102,102 +237,6 @@ def previous_run_crashed(flag_path=CLEAN_EXIT_FLAG):
         write_clean_exit_flag(flag_path)
         return False
     return True
-
-
-def write_clean_exit_flag(flag_path=CLEAN_EXIT_FLAG):
-    try:
-        os.makedirs(os.path.dirname(flag_path) or ".", exist_ok=True)
-        with open(flag_path, "w", encoding="utf-8") as f:
-            f.write("ok")
-        return True
-    except Exception:
-        return False
-
-
-def save_config(cfg):
-    try:
-        data = dict(cfg)
-        try:
-            data["api_key"] = crypto.encrypt(cfg.get("api_key", ""))
-        except crypto.CryptError:
-            # 加密失败：从磁盘保留原密文，绝不写明文、绝不静默删除 api_key
-            old_key = None
-            try:
-                if os.path.exists(CONFIG_PATH):
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                        old_key = json.load(f).get("api_key")
-            except Exception:
-                pass
-            if old_key:
-                data["api_key"] = old_key
-            else:
-                data.pop("api_key", None)
-            logging.error("API Key 加密失败，已保留磁盘原密文，请检查系统环境")
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-    except Exception as e:
-        logging.error("保存配置失败: %s", e)
-
-
-def _delete_target(path, kind):
-    """删除文件或目录内容，返回删除的文件数（失败静默跳过）。"""
-    count = 0
-    try:
-        if kind == "file":
-            if os.path.exists(path):
-                os.remove(path)
-                count = 1
-        elif os.path.isdir(path):
-            for root, dirs, files in os.walk(path, topdown=False):
-                for f in files:
-                    try:
-                        os.remove(os.path.join(root, f))
-                        count += 1
-                    except Exception:
-                        pass
-                for d in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, d))
-                    except Exception:
-                        pass
-    except Exception:
-        logging.exception("清理失败: %s", path)
-    return count
-
-
-def _apply_privacy_logging(privacy):
-    """隐私模式：彻底移除文件日志（WARNING/ERROR 也不再落盘），关闭时恢复。"""
-    root = logging.getLogger()
-    fh = [
-        h for h in root.handlers
-        if isinstance(h, logging.handlers.RotatingFileHandler)
-    ]
-    if privacy:
-        for h in fh:
-            try:
-                h.close()
-            except Exception:
-                pass
-            root.removeHandler(h)
-    elif not fh:
-        try:
-            root.addHandler(
-                logging.handlers.RotatingFileHandler(
-                    os.path.join(LOG_DIR, "assistant.log"),
-                    maxBytes=10 * 1024 * 1024,
-                    backupCount=5,
-                    encoding="utf-8",
-                )
-            )
-        except Exception:
-            pass
 
 
 class AssistantApp:
@@ -1289,7 +328,7 @@ class AssistantApp:
         self._auto_ckpt_tools = []  # 本轮工具链（自动断点用，worker 线程追加）
         self._ui_queue = queue.Queue()
         self._poller_id = None
-        self._pending_send = None
+        self._pending_sends = []
         self._needs_compression = False
         self._resend_index = None
         self._search_open = False
@@ -1331,13 +370,14 @@ class AssistantApp:
         permissions.set_audit_enabled(not bool(self.cfg.get("privacy_mode", False)))
         permissions.set_full_auto(bool(self.cfg.get("full_auto", False)))
         if self.cfg.get("privacy_mode"):
-            _apply_privacy_logging(True)
+            _apply_privacy_logging(True, LOG_DIR)
         self._ctx_counts = None
         self._paged_render = None
         self._paged_render_after = None
         # 消息列表并发保护：worker（压缩/裁剪/流式追加）与主线程（快照/回填/重建）
         # 对 self.messages 的复合读写（del 切片 + 索引访问）必须互斥，防长度漂移
         self._messages_lock = threading.RLock()
+        self._client_lock = threading.Lock()
         self._snapshot_writing = False  # 快照后台写盘进行中标志（防并发写互相覆盖）
         self._pending_stats = {}
         self._last_stats_flush = 0.0
@@ -1455,30 +495,8 @@ class AssistantApp:
         self._input_handle()
         self._chat_area()
 
-        self.root.bind("<Control-n>", lambda e: (self.new_conversation(), "break"))
-        self.root.bind("<Control-N>", lambda e: (self.new_conversation(), "break"))
-        self.root.bind("<Control-f>", self.toggle_search)
-        self.root.bind("<Control-F>", self.toggle_search)
-        self.root.bind(
-            "<Control-e>", lambda e: (self.export_history(), "break")
-        )
-        self.root.bind(
-            "<Control-E>", lambda e: (self.export_history(), "break")
-        )
-        self.root.bind(
-            "<Control-Shift-s>", lambda e: (self.export_session_json(), "break")
-        )
-        self.root.bind(
-            "<Control-Shift-f>", lambda e: (self.open_global_search(), "break")
-        )
-        self.root.bind(
-            "<Control-Shift-q>", lambda e: (self._paste_clipboard_ask(), "break")
-        )
-        self.root.bind("<Control-Shift-Q>", lambda e: (self._paste_clipboard_ask(), "break"))
-        self.root.bind("<Control-w>", lambda e: (self.close_tab(), "break"))
-        self.root.bind("<Control-W>", lambda e: (self.close_tab(), "break"))
-        self.root.bind("<F1>", lambda e: (self.show_help(), "break"))
-        self.root.bind("<F5>", lambda e: (self.regenerate(), "break"))
+        # 可自定义快捷键：动作名 -> Tk 键序列，从 config.shortcuts 覆盖默认
+        self._apply_shortcuts()
         # 菜单 Alt 快捷键导航（Alt+F/E/V/T/A/S/H 打开对应菜单，正式桌面应用惯例）
         self._alt_menu_bindings = {"f": 0, "e": 1, "v": 2, "t": 3, "a": 4, "s": 5, "h": 6}
         for _k, _idx in self._alt_menu_bindings.items():
@@ -1490,13 +508,6 @@ class AssistantApp:
                 f"<Alt-{_k.upper()}>",
                 lambda e, i=_idx: self._open_menu_alt(i),
             )
-        self.root.bind("<Control-k>", lambda e: (self.show_command_palette(), "break"))
-        self.root.bind("<Control-K>", lambda e: (self.show_command_palette(), "break"))
-        self.root.bind("<F11>", lambda e: (self.toggle_fullscreen(), "break"))
-        self.root.bind("<Control-Shift-t>", lambda e: (self.show_tool_hub(), "break"))
-        self.root.bind("<Control-Shift-T>", lambda e: (self.show_tool_hub(), "break"))
-        self.root.bind("<Control-Shift-p>", lambda e: (self.show_plugin_hub(), "break"))
-        self.root.bind("<Control-Shift-P>", lambda e: (self.show_plugin_hub(), "break"))
         self.root.bind("<Configure>", self._on_root_configure)
         self.root.bind("<Map>", lambda e: self._apply_dark_titlebar())
         self.root.bind("<FocusIn>", lambda e: self._apply_dark_titlebar())
@@ -1652,6 +663,7 @@ class AssistantApp:
             sysm.add_command(label="🖼 从剪贴板图片提取文字 (OCR)…", command=self._ocr_clipboard)
             sysm.add_command(label="🧹 数据清理…", command=self.show_cleanup)
             sysm.add_command(label="⌨ 命令面板", accelerator="Ctrl+K", command=self.show_command_palette)
+            sysm.add_command(label="⌨ 快捷键自定义…", command=self.show_shortcuts_dialog)
             tm.add_cascade(label="系统", menu=sysm)
 
         def _automation_menu(am):
@@ -1669,6 +681,7 @@ class AssistantApp:
 
         def _view_menu(vm):
             vm.add_command(label="切换主题", command=self.toggle_theme)
+            vm.add_command(label="自定义主题…", command=self.show_custom_theme_dialog)
             vm.add_command(label="增大字号", accelerator="Ctrl++", command=lambda: self._step_font(1))
             vm.add_command(label="减小字号", accelerator="Ctrl+-", command=lambda: self._step_font(-1))
             vm.add_checkbutton(label="Markdown 渲染", variable=self.md_var, command=self.toggle_md_render)
@@ -1830,7 +843,13 @@ class AssistantApp:
                 hwnd = self.root.winfo_id()
             if not hwnd:
                 return
-            dark = self.cfg.get("theme") == "dark"
+            # 自定义主题也按背景亮度自动选择深色标题栏
+            try:
+                bg_hex = self._theme().get("bg", "#000000").lstrip("#")
+                lum = (int(bg_hex[0:2], 16) * 299 + int(bg_hex[2:4], 16) * 587 + int(bg_hex[4:6], 16) * 114) / 1000
+                dark = lum < 128
+            except Exception:
+                dark = self.cfg.get("theme") == "dark"
             value = ctypes.c_int(1 if dark else 0)
             ok = False
             for attr in (20, 19):
@@ -1922,7 +941,7 @@ class AssistantApp:
     def _on_privacy_toggle(self):
         self.cfg["privacy_mode"] = bool(self.privacy_var.get())
         permissions.set_audit_enabled(not self.cfg["privacy_mode"])
-        _apply_privacy_logging(self.cfg["privacy_mode"])
+        _apply_privacy_logging(self.cfg["privacy_mode"], LOG_DIR)
         # 开启时 logging.disable(INFO) 全局抑制；关闭必须恢复，否则本次运行 INFO 日志永久丢失
         if self.cfg["privacy_mode"]:
             logging.disable(logging.INFO)
@@ -1933,56 +952,8 @@ class AssistantApp:
         self._flash_status("已开启隐私模式" if self.cfg["privacy_mode"] else "已关闭隐私模式")
 
     def _show_welcome(self):
-        if self.cfg.get("api_key"):
-            self.cfg["welcomed"] = True
-            save_config(self.cfg)
-            return
-        t = self._theme()
-        dialog, body, footer = self._dialog_shell(
-            f"欢迎使用 {APP_NAME} {APP_NAME_EN}", 560, 440,
-            subtitle="为 DeepSeek V4 深度优化的桌面 AI 工作台",
-        )
-        dialog.resizable(False, False)
-        dialog.grab_set()
-        for line in (
-            "· 流式输出思考过程与回答，支持 1M 长上下文与缓存优化",
-            "· 100+ Agent 工具：文档/代码/浏览器/数据/媒体/公众号写作",
-            "· 产物面板：生成的文件一键打开，无需翻找目录",
-            "· 多会话、上下文自动压缩、用量统计与预算控制",
-            "· 提示词库、消息收藏、分支对话、深色主题",
-        ):
-            self._lbl(body, "✓ " + line, bg="panel", font=(FONT_FAMILY, 9)).pack(
-                anchor="w", pady=1
-            )
-        self._lbl(
-            body, "第一步：配置 API Key（可在 https://platform.deepseek.com 申请）",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-        ).pack(anchor="w", pady=(18, 4))
-        row = tk.Frame(body, bg=t["panel"])
-        row.pack(fill="x")
-        self._restyle.append((row, "panel"))
-        self.welcome_key_var = tk.StringVar()
-        entry = ttk.Entry(row, textvariable=self.welcome_key_var, show="*")
-        entry.pack(side="left", fill="x", expand=True)
-        self._mk_button(
-            row, "获取 Key", lambda: webbrowser.open("https://platform.deepseek.com"), fsz=9
-        ).pack(side="left", padx=(8, 0))
-
-        def done():
-            key = self.welcome_key_var.get().strip()
-            if key:
-                self.cfg["api_key"] = key
-                self.key_var.set(key)
-            self.cfg["welcomed"] = True
-            save_config(self.cfg)
-            dialog.destroy()
-
-        self._footer_btn(footer, "开始使用", done, primary=True)
-        self._footer_btn(
-            footer,
-            "先体验试玩任务",
-            lambda: (done(), self.after(300, lambda: self._run_playground("写周报并存盘"))),
-        )
+        """欢迎页：首次启动配置 API Key / 体验试玩任务。"""
+        dialogs.show_welcome(self)
 
     def check_for_update(self, manual=True):
         url = str(self.cfg.get("update_url") or "").strip() or UPDATE_URL
@@ -2008,7 +979,11 @@ class AssistantApp:
                 if latest:
                     self._ui_queue.put((
                         "update",
-                        (latest, str(data.get("url") or data.get("html_url") or "")),
+                        (
+                            latest,
+                            str(data.get("url") or data.get("html_url") or ""),
+                            data,
+                        ),
                     ))
             except Exception as e:
                 logging.warning("检查更新失败: %s", e)
@@ -2084,57 +1059,133 @@ class AssistantApp:
             pass
         save_config(self.cfg)
 
+    def _shortcut_bindings(self):
+        """合并后的快捷键映射：配置覆盖默认。"""
+        merged = dict(DEFAULT_SHORTCUTS)
+        for k, v in (self.cfg.get("shortcuts") or {}).items():
+            if str(v or "").strip():
+                merged[str(k)] = str(v).strip()
+        return merged
+
+    def _apply_shortcuts(self):
+        """按当前配置绑定根窗口快捷键（先解绑旧绑定，支持运行时重绑）。"""
+        for seq in getattr(self, "_bound_shortcut_seqs", []):
+            try:
+                self.root.unbind(seq)
+            except tk.TclError:
+                pass
+        self._bound_shortcut_seqs = []
+        actions = {
+            "new_conversation": lambda e: (self.new_conversation(), "break"),
+            "toggle_search": lambda e: (self.toggle_search(), "break"),
+            "export_history": lambda e: (self.export_history(), "break"),
+            "export_session_json": lambda e: (self.export_session_json(), "break"),
+            "open_global_search": lambda e: (self.open_global_search(), "break"),
+            "paste_clipboard_ask": lambda e: (self._paste_clipboard_ask(), "break"),
+            "close_tab": lambda e: (self.close_tab(), "break"),
+            "show_help": lambda e: (self.show_help(), "break"),
+            "regenerate": lambda e: (self.regenerate(), "break"),
+            "show_command_palette": lambda e: (self.show_command_palette(), "break"),
+            "toggle_fullscreen": lambda e: (self.toggle_fullscreen(), "break"),
+            "show_tool_hub": lambda e: (self.show_tool_hub(), "break"),
+            "show_plugin_hub": lambda e: (self.show_plugin_hub(), "break"),
+        }
+        for action, seq in self._shortcut_bindings().items():
+            handler = actions.get(action)
+            if not handler or not seq:
+                continue
+            # 字母快捷键同时绑定大小写，避免 CapsLock/Shift 导致事件不触发
+            seqs = [seq]
+            m = re.match(r"^(.*<)([A-Za-z])(>)$", seq)
+            if m:
+                prefix, _letter, suffix = m.groups()
+                seqs = [f"{prefix}{c}{suffix}" for c in (_letter.lower(), _letter.upper())]
+            for s in seqs:
+                try:
+                    self.root.bind(s, handler)
+                    self._bound_shortcut_seqs.append(s)
+                except tk.TclError:
+                    logging.warning("无效快捷键 %s: %s", action, s)
+
+    def show_shortcuts_dialog(self):
+        """快捷键自定义：查看/修改根窗口快捷键并即时生效。"""
+        t = self._theme()
+        dialog = tk.Toplevel(self.root, bg=t["panel"])
+        dialog.title("快捷键自定义")
+        dialog.geometry(self._center_geometry(560, 420))
+        dialog.transient(self.root)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        self._lbl(dialog, "快捷键自定义", role="label_accent", bg="panel",
+                  font=(FONT_FAMILY, 13, "bold")).pack(anchor="w", padx=18, pady=(14, 2))
+        self._lbl(dialog, "修改后立即生效；格式如 <Control-n>、<F5>、<Control-Shift-t>",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", padx=18)
+        wrap = tk.Frame(dialog, bg=t["panel"])
+        wrap.pack(fill="both", expand=True, padx=18, pady=8)
+        self._restyle.append((wrap, "panel"))
+        labels = {
+            "new_conversation": "新会话",
+            "toggle_search": "查找对话内容",
+            "export_history": "导出历史",
+            "export_session_json": "导出会话 JSON",
+            "open_global_search": "全局搜索",
+            "paste_clipboard_ask": "粘贴剪贴板提问",
+            "close_tab": "关闭会话",
+            "show_help": "帮助",
+            "regenerate": "重新生成",
+            "show_command_palette": "命令面板",
+            "toggle_fullscreen": "全屏",
+            "show_tool_hub": "工具中心",
+            "show_plugin_hub": "插件中心",
+        }
+        entries = {}
+        current = self._shortcut_bindings()
+        for i, (action, label) in enumerate(labels.items()):
+            row = tk.Frame(wrap, bg=t["panel"])
+            row.pack(fill="x", pady=2)
+            self._restyle.append((row, "panel"))
+            self._lbl(row, label, bg="panel", font=(FONT_FAMILY, 9), width=18).pack(side="left")
+            var = tk.StringVar(value=current.get(action, ""))
+            ent = ttk.Entry(row, textvariable=var, width=24)
+            ent.pack(side="left", padx=(6, 0))
+            entries[action] = var
+
+        def save():
+            new_shortcuts = {}
+            for action, var in entries.items():
+                seq = var.get().strip()
+                if not seq:
+                    new_shortcuts[action] = ""
+                    continue
+                if not (seq.startswith("<") and seq.endswith(">")):
+                    messagebox.showwarning("格式错误", f"{action} 的快捷键必须是 Tk 序列，如 <Control-n>。")
+                    return
+                new_shortcuts[action] = seq
+            self.cfg["shortcuts"] = new_shortcuts
+            save_config(self.cfg)
+            self._apply_shortcuts()
+            dialog.destroy()
+            self._flash_status("快捷键已更新并即时生效")
+
+        def reset():
+            self.cfg["shortcuts"] = {}
+            save_config(self.cfg)
+            self._apply_shortcuts()
+            dialog.destroy()
+            self._flash_status("快捷键已恢复默认")
+
+        bar = tk.Frame(dialog, bg=t["panel"])
+        bar.pack(fill="x", padx=18, pady=(4, 12))
+        self._restyle.append((bar, "panel"))
+        self._mk_button(bar, "恢复默认", reset, fsz=9).pack(side="left")
+        self._mk_button(bar, "保存", save, kind="primary", fsz=9).pack(side="right")
+
     def show_about(self):
         """关于对话框：品牌信息 + 能力一览（正式版品牌视觉）。"""
-        dialog, body, footer = self._dialog_shell(
-            f"关于 {APP_NAME} {APP_NAME_EN}", 460, 420, subtitle="深海蓝鲸 · 专业桌面 AI 工作台"
-        )
-        self._lbl(body, f"🐋 {APP_NAME} {APP_NAME_EN}", role="label_accent", bg="panel",
-                  font=(FONT_FAMILY, 18, "bold")).pack(anchor="w", pady=(0, 2))
-        self._lbl(body, f"版本 {VERSION} · 基于 DeepSeek V4 API", role="label_sec", bg="panel",
-                  font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(0, 14))
-        for line in (
-            "· 流式思考与回答、1M 长上下文、缓存命中优化",
-            "· 100+ Agent 工具：文档/代码/浏览器/数据/媒体/云盘/公众号写作",
-            "· 产物面板与产物条：生成的文件一键直达",
-            "· 会话快照、用量统计、预算控制、隐私模式",
-            "· 自我进化：AI 可感知自身代码并提出改进提案",
-        ):
-            self._lbl(body, "✓ " + line, bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=1)
-        self._lbl(
-            body, f"\n{APP_NAME} 是独立产品，与 DeepSeek 官方无任何关联。",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-        ).pack(anchor="w")
-        self._footer_btn(footer, "关闭", dialog.destroy)
+        dialogs.show_about(self)
 
     def show_help(self):
         """帮助对话框：常用操作速查（正式版排版）。"""
-        t = self._theme()
-        dialog, body, footer = self._dialog_shell(
-            "使用说明", 520, 460, subtitle="常用操作速查 · F1 随时打开"
-        )
-        rows = [
-            ("发送消息", "Enter 发送 · Shift+Enter 换行 · Ctrl+Enter 快速发送"),
-            ("新会话 / 关闭", "Ctrl+N 新建 · Ctrl+W 关闭 · 双击会话名重命名"),
-            ("对话搜索", "Ctrl+F 会话内搜索 · Ctrl+Shift+F 全局搜索"),
-            ("导出历史", "Ctrl+E 导出 MD/TXT/HTML/JSONL"),
-            ("命令面板", "Ctrl+K 唤起全部常用操作"),
-            ("重新生成", "F5 重新生成最后回复"),
-            ("编辑重发", "聊天区右键消息 → 编辑此消息"),
-            ("消息操作", "右键消息：复制/收藏/固定/分叉/引用/朗读/快速动作"),
-            ("产物查看", "右侧面板「📂 文件」Tab + 输入框上方产物条"),
-            ("生成中打断", "直接发送新消息即可打断并继续"),
-            ("设置面板", "左栏「⚙ 设置」按钮收起/展开右侧面板"),
-            ("主题与字号", "菜单 视图 → 切换主题 / 增大/减小字号"),
-        ]
-        for k, v in rows:
-            row = tk.Frame(body, bg=t["panel"])
-            row.pack(fill="x", pady=2)
-            self._restyle.append((row, "panel"))
-            self._lbl(row, k, role="label_accent", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-                      width=12, anchor="w").pack(side="left")
-            self._lbl(row, v, bg="panel", font=(FONT_FAMILY, 9), anchor="w").pack(side="left")
-        self._footer_btn(footer, "关闭", dialog.destroy)
+        dialogs.show_help(self)
 
     PROMPT_KEYWORDS = {
         "中译英": ["翻译", "translate", "英文"],
@@ -2309,7 +1360,7 @@ class AssistantApp:
 
     def _sidebar(self):
         t = self._theme()
-        sw = int(self.cfg.get("sidebar_width", 224) or 224)
+        sw = int(self.cfg.get("sidebar_width", LAYOUT["sidebar_default"]) or LAYOUT["sidebar_default"])
         frame = tk.Frame(self.root, bg=t["page"], width=sw)
         frame.pack(side="left", fill="y")
         frame.pack_propagate(False)
@@ -2429,7 +1480,7 @@ class AssistantApp:
         try:
             self._width_drag_base = int(self.sidebar_frame.winfo_width())
         except (tk.TclError, TypeError, ValueError):
-            self._width_drag_base = int(self.cfg.get("sidebar_width", 224) or 224)
+            self._width_drag_base = int(self.cfg.get("sidebar_width", LAYOUT["sidebar_default"]) or LAYOUT["sidebar_default"])
         return "break"
 
     def _on_width_drag(self, event):
@@ -2446,14 +1497,14 @@ class AssistantApp:
             w = int(self.sidebar_frame.winfo_width())
         except (tk.TclError, TypeError, ValueError):
             w = 224
-        self.cfg["sidebar_width"] = max(160, min(480, w))
+        self.cfg["sidebar_width"] = max(LAYOUT["sidebar_min"], min(LAYOUT["sidebar_max"], w))
         save_config(self.cfg)
         return "break"
 
     def _reset_sidebar_width(self, _event=None):
         """双击分隔条：恢复默认宽度并持久化。"""
-        self._set_sidebar_width(224)
-        self.cfg["sidebar_width"] = 224
+        self._set_sidebar_width(LAYOUT["sidebar_default"])
+        self.cfg["sidebar_width"] = LAYOUT["sidebar_default"]
         save_config(self.cfg)
         return "break"
 
@@ -3506,15 +2557,70 @@ class AssistantApp:
         self.context_bar.pack(side="right", padx=(4, 2), pady=8)
 
     def _theme(self):
-        return THEMES.get(self.cfg.get("theme", "light"), THEMES["light"])
+        themes = dict(THEMES)
+        themes.update(self.cfg.get("custom_themes") or {})
+        return themes.get(self.cfg.get("theme", "light"), THEMES["light"])
+
+    def _theme_names(self):
+        """可用主题名：内置 + 用户自定义（自定义不覆盖内置）。"""
+        return list(THEMES.keys()) + [
+            k for k in (self.cfg.get("custom_themes") or {}) if k not in THEMES
+        ]
 
     def theme_color(self, key):
         return self._theme().get(key, THEMES["light"].get(key, "#000000"))
 
     def toggle_theme(self):
-        self.cfg["theme"] = "dark" if self.cfg.get("theme") == "light" else "light"
+        if self.cfg.get("theme") in ("light", "dark"):
+            self.cfg["theme"] = "dark" if self.cfg.get("theme") == "light" else "light"
+        else:
+            self.cfg["theme"] = "light"
         self.apply_theme()
         save_config(self.cfg)
+
+    def show_custom_theme_dialog(self):
+        """自定义主题：输入名称与主要颜色 token，保存到配置并立即应用。"""
+        name = simpledialog.askstring(
+            "自定义主题", "主题名称（英文/数字，如 mydark）：", parent=self.root
+        )
+        if not name:
+            return
+        name = str(name).strip()
+        if not name:
+            return
+        if name in THEMES:
+            messagebox.showwarning("自定义主题", f"「{name}」是内置主题名，请换一个名称。")
+            return
+        base = dict(THEMES["dark" if self.cfg.get("theme") == "dark" else "light"])
+        fields = [
+            "bg", "page", "panel", "surface", "border", "text", "text_sec",
+            "accent", "accent_hover", "accent_text", "bubble_user", "bubble_user_text",
+            "bubble_assistant", "code_bg", "code_fg", "input_bg", "input_fg",
+            "selection", "thinking", "tool", "error", "warning", "success",
+            "disabled", "hover", "note", "mention", "quote_bg", "input_placeholder",
+        ]
+        for key in fields:
+            cur = base.get(key, "")
+            val = simpledialog.askstring(
+                f"自定义主题 · {name}",
+                f"{key}（当前 {cur}）\n输入颜色，格式 #RRGGBB：",
+                initialvalue=cur,
+                parent=self.root,
+            )
+            if val is None:
+                return
+            val = str(val).strip()
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", val):
+                messagebox.showerror("颜色格式错误", f"{key} 必须是 #RRGGBB 格式（如 #3478f6）。")
+                return
+            base[key] = val
+        custom = dict(self.cfg.get("custom_themes") or {})
+        custom[name] = base
+        self.cfg["custom_themes"] = custom
+        self.cfg["theme"] = name
+        save_config(self.cfg)
+        self.apply_theme()
+        self._flash_status(f"已创建并应用自定义主题「{name}」")
 
     def apply_theme(self):
         t = self._theme()
@@ -5029,6 +4135,8 @@ class AssistantApp:
         进程内缓存 + 标记脏位：只改内存，由 _flush_recent 统一落盘，
         避免每个工具结果在主线程做 2 读 1 写文件 IO（Agent 一轮几十次）。
         """
+        if self.cfg.get("privacy_mode"):
+            return
         try:
             recent = self._recent_cache
             for mm in PATH_RE.finditer(text or ""):
@@ -5108,6 +4216,9 @@ class AssistantApp:
 
     def _flush_recent(self):
         """把最近产物缓存一次性写盘（_finish/退出时调用）。"""
+        if self.cfg.get("privacy_mode"):
+            self._recent_dirty = False
+            return
         if not getattr(self, "_recent_dirty", False):
             return
         try:
@@ -5118,53 +4229,19 @@ class AssistantApp:
 
     @staticmethod
     def _load_recent():
-        try:
-            if os.path.exists(RECENT_PATH):
-                with open(RECENT_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    return [str(x) for x in data if str(x).strip()]
-        except Exception:
-            logging.exception("读取最近产物失败")
-        return []
+        return stores.load_recent(RECENT_PATH)
 
     @staticmethod
     def _atomic_json_write(path, data, indent=1, compact=False):
         """原子写 JSON（唯一临时文件 + os.replace），失败返回 False。
 
-        compact=True 使用紧凑分隔符（快照/会话等大文件体积减半，读写更快）。
-        唯一临时文件（mkstemp）防止并发写同一路径互相截断。
+        实现已移至 persistence.atomic_json_write，此处保留兼容入口。
         """
-        try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            import tempfile
-
-            fd, tmp = tempfile.mkstemp(
-                dir=os.path.dirname(path) or ".",
-                prefix=os.path.basename(path) + ".",
-                suffix=".tmp",
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    if compact:
-                        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-                    else:
-                        json.dump(data, f, ensure_ascii=False, indent=indent)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            os.replace(tmp, path)
-            return True
-        except Exception:
-            logging.exception("原子写 JSON 失败: %s", path)
-            return False
+        return atomic_json_write(path, data, indent=indent, compact=compact)
 
     @staticmethod
     def _save_recent(recent):
-        return AssistantApp._atomic_json_write(RECENT_PATH, recent)
+        return stores.save_recent(RECENT_PATH, recent)
 
     def _process_output(self, name, line):
         """进程输出回调（reader 线程）→ 队列转主线程。"""
@@ -5184,13 +4261,16 @@ class AssistantApp:
         return self.proc_panel
 
     def _stop_named_process(self, name):
-        try:
-            from deepseek_client import stop_process
+        def _worker():
+            try:
+                from deepseek_client import stop_process
 
-            result = stop_process(name)
-            self._flash_status(str(result)[:60])
-        except Exception:
-            pass
+                result = stop_process(name)
+            except Exception as e:
+                result = f"错误：{e}"
+            self._ui_queue.put(("flash", str(result)[:60]))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _proc_panel_append(self, name, line):
         panel = self._ensure_proc_panel()
@@ -5232,301 +4312,19 @@ class AssistantApp:
                 messagebox.showerror("还原失败", str(e))
 
     def show_recent_outputs(self):
-        t = self._theme()
-        # 用进程内缓存（_record_recent_output 只改内存，_finish 才 flush）：
-        # 读磁盘会让刚完成的工具产物看不到
-        recent = list(self._recent_cache)
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title(f"最近产物（{len(recent)} 条，AI 创建/修改的文件）")
-        dialog.geometry("640x420")
-        dialog.transient(self.root)
-        listbox = tk.Listbox(
-            dialog, width=80, bg=t["input_bg"], fg=t["input_fg"],
-            selectbackground=t["selection"], selectforeground=t["accent_text"],
-            relief="flat", highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], exportselection=False,
-        )
-        listbox.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        for p in recent:
-            listbox.insert("end", p)
-        if not recent:
-            listbox.insert("end", "（暂无产物，AI 执行写文件类工具后自动记录）")
-
-        def open_selected():
-            sel = listbox.curselection()
-            if not sel or not recent:
-                return
-            self._open_path(recent[sel[0]])
-
-        def open_folder():
-            sel = listbox.curselection()
-            if not sel or not recent:
-                return
-            p = recent[sel[0]]
-            target = os.path.dirname(p) if os.path.isfile(p) else p
-            try:
-                os.startfile(target)
-            except Exception:
-                self._flash_status(f"无法打开目录：{target}")
-
-        def copy_path():
-            sel = listbox.curselection()
-            if not sel or not recent:
-                return
-            self.root.clipboard_clear()
-            self.root.clipboard_append(recent[sel[0]])
-            self._flash_status("已复制路径")
-
-        def remove_selected():
-            sel = listbox.curselection()
-            if not sel or not recent:
-                return
-            recent.pop(sel[0])
-            # 同步内存缓存（对话框基于缓存渲染，直接写盘会与缓存不一致）
-            self._recent_cache = recent
-            self._save_recent(recent)
-            self._recent_dirty = False
-            listbox.delete(sel[0])
-
-        def restore_selected():
-            sel = listbox.curselection()
-            if not sel or not recent:
-                return
-            self._restore_bak(recent[sel[0]])
-
-        listbox.bind("<Double-1>", lambda e: open_selected())
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=12, pady=(8, 12))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "打开", open_selected, kind="primary", fsz=9).pack(side="left")
-        self._mk_button(bar, "打开所在文件夹", open_folder, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "还原 .bak", restore_selected, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "复制路径", copy_path, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "从列表移除", remove_selected, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
+        """最近产物：查看 AI 创建/修改的文件。"""
+        dialogs.show_recent_outputs(self)
 
     def choose_working_dir(self):
         """工作目录选择：指定 AI 执行任务的"家"（自动加入权限允许目录）。"""
-        t = self._theme()
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title("工作目录（AI 执行任务的默认位置）")
-        dialog.geometry("560x420")
-        dialog.transient(self.root)
-        body = tk.Frame(dialog, bg=t["panel"])
-        body.pack(fill="both", expand=True, padx=16, pady=(12, 0))
-        self._restyle.append((body, "panel"))
-        self._lbl(
-            body, f"当前：{self._get_active_dir()}",
-            role="label_accent", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-        ).pack(anchor="w", pady=(0, 8))
-        self._lbl(
-            body, "AI 的所有文件操作/项目创建默认在此目录下进行，新任务会自动创建独立子目录。",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-        ).pack(anchor="w", pady=(0, 10))
-
-        row = tk.Frame(body, bg=t["panel"])
-        row.pack(fill="x", pady=(0, 6))
-        self._restyle.append((row, "panel"))
-        dir_var = tk.StringVar(value=self._get_active_dir())
-        ttk.Entry(row, textvariable=dir_var).pack(side="left", fill="x", expand=True)
-        self._mk_button(
-            row, "浏览…",
-            lambda: dir_var.set(filedialog.askdirectory(initialdir=dir_var.get() or WORKSPACE_DIR) or dir_var.get()),
-            fsz=9,
-        ).pack(side="left", padx=(6, 0))
-
-        self._lbl(
-            body, "常用目录：", role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-        ).pack(anchor="w", pady=(4, 2))
-        common = [WORKSPACE_DIR]
-        d = permissions.get_data()
-        for p in d["filesystem"].get("allowed_dirs", []):
-            if os.path.isdir(p) and p not in common:
-                common.append(p)
-        listbox = tk.Listbox(
-            body, height=6, bg=t["input_bg"], fg=t["input_fg"],
-            selectbackground=t["selection"], selectforeground=t["accent_text"],
-            relief="flat", highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], exportselection=False,
-        )
-        listbox.pack(fill="both", expand=True)
-        for p in common:
-            listbox.insert("end", p)
-
-        def pick_common(_e=None):
-            sel = listbox.curselection()
-            if sel:
-                dir_var.set(common[sel[0]])
-
-        listbox.bind("<<ListboxSelect>>", pick_common)
-
-        def mk_subdir():
-            name = simpledialog.askstring(
-                "新建子目录", "输入子目录名（在当前目录下创建）:", parent=dialog
-            )
-            if not name:
-                return
-            name = re.sub(r'[\\/:*?"<>|]', "_", name.strip())[:60]
-            if not name:
-                return
-            target = os.path.join(dir_var.get() or WORKSPACE_DIR, name)
-            try:
-                os.makedirs(target, exist_ok=True)
-                dir_var.set(target)
-                self._flash_status(f"已创建子目录：{target}")
-            except Exception as e:
-                messagebox.showerror("创建失败", str(e))
-
-        def apply():
-            ok, info = self._set_active_dir(dir_var.get())
-            if not ok:
-                messagebox.showerror("设置失败", info)
-                return
-            self._flash_status(f"工作目录已切换：{info}")
-            dialog.destroy()
-
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=16, pady=(12, 14))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "新建子目录", mk_subdir, fsz=9).pack(side="left")
-        self._mk_button(bar, "设为工作目录", apply, kind="primary", fsz=9).pack(side="right")
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right", padx=(0, 8))
+        dialogs.choose_working_dir(self, WORKSPACE_DIR)
 
     def show_workspace_tree(self):
         """工作区文件树：浏览 AI 产物，双击文件注入输入框，右键复制路径。"""
-        t = self._theme()
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title("工作区文件树")
-        dialog.geometry("560x480")
-        dialog.transient(self.root)
-        tree = ttk.Treeview(dialog, columns=("size",), show="tree headings")
-        tree.heading("size", text="大小")
-        tree.column("size", width=90, anchor="e")
-        tree.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        paths = {}
-
-        def add_item(parent, text, full, values=()):
-            iid = tree.insert(parent, "end", text=text, values=values)
-            paths[iid] = full
-            return iid
-
-        populated = set()
-
-        def populate(parent, path):
-            if path in populated:
-                return
-            populated.add(path)
-            try:
-                entries = sorted(os.listdir(path))
-            except Exception:
-                return
-            # 清除占位符后重建该目录子项
-            for cid in tree.get_children(parent):
-                tree.delete(cid)
-            for e in entries:
-                full = os.path.join(path, e)
-                if os.path.isdir(full):
-                    iid = add_item(parent, e + os.sep, full)
-                    try:
-                        # 懒加载占位：展开该节点时才遍历子目录（大工作区不冻结 UI）
-                        tree.insert(iid, "end", text="…")
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        size = os.path.getsize(full)
-                        size_txt = f"{size / 1024:.1f}KB" if size >= 1024 else f"{size}B"
-                    except OSError:
-                        size_txt = ""
-                    add_item(parent, e, full, (size_txt,))
-
-        def on_tree_open(_event):
-            # 用 focus() 而非 selection()：点击展开箭头时节点往往尚未被选中，
-            # 用选中项判断会导致子目录懒加载失效
-            iid = tree.focus()
-            if not iid:
-                return
-            full = paths.get(iid)
-            if full and os.path.isdir(full):
-                populate(iid, full)
-
-        tree.bind("<<TreeviewOpen>>", on_tree_open)
-
-        root_iid = add_item("", "", WORKSPACE_DIR)
-        tree.item(root_iid, text=f"工作区：{WORKSPACE_DIR}", open=True)
-        populate(root_iid, WORKSPACE_DIR)  # 只遍历根目录一层，子目录按需懒加载
-
-        def inject_file():
-            sel = tree.selection()
-            if not sel:
-                return
-            full = paths.get(sel[0])
-            if not full or not os.path.isfile(full):
-                return
-            try:
-                with open(full, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read(8000)
-                if len(content) >= 8000:
-                    content += "\n[文件较大，已截断前 8000 字符]"
-            except Exception as e:
-                content = f"读取失败: {e}"
-            self._clear_placeholder()
-            self.input_text.delete("1.0", "end")
-            self.input_text.insert(
-                "1.0", f"[文件] {os.path.basename(full)}:\n{content}\n\n"
-            )
-            self.input_text.focus_set()
-            dialog.destroy()
-            self._flash_status(f"已注入 {os.path.basename(full)}")
-
-        def copy_path():
-            sel = tree.selection()
-            if not sel:
-                return
-            full = paths.get(sel[0])
-            if full:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(full)
-                self._flash_status("已复制路径")
-
-        def open_selected():
-            sel = tree.selection()
-            if not sel:
-                return
-            full = paths.get(sel[0])
-            if full:
-                self._open_path(full)
-
-        def open_folder():
-            sel = tree.selection()
-            if not sel:
-                return
-            full = paths.get(sel[0])
-            if not full:
-                return
-            target = os.path.dirname(full) if os.path.isfile(full) else full
-            try:
-                os.startfile(target)
-            except Exception:
-                self._flash_status(f"无法打开目录：{target}")
-
-        tree.bind("<Double-1>", lambda e: inject_file())
-        tree.bind("<Button-3>", lambda e: copy_path())
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=12, pady=(8, 12))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "注入选中文件", inject_file, kind="primary", fsz=9).pack(side="left")
-        self._mk_button(bar, "打开", open_selected, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "打开所在文件夹", open_folder, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "复制路径", copy_path, fsz=9).pack(side="left", padx=(6, 0))
-        hint = self._lbl(
-            bar, "双击注入对话 · 右键复制路径", role="label_sec", bg="panel",
-            font=(FONT_FAMILY, 9),
-        )
-        hint.pack(side="right")
+        dialogs.show_workspace_tree(self, WORKSPACE_DIR)
 
     def show_cleanup(self):
-        t = self._theme()
+        """数据清理：勾选要清理的数据（操作不可恢复）。"""
         targets = [
             ("历史会话（sessions/）", SESSIONS_DIR, "dir"),
             ("最近会话快照", SNAPSHOT_PATH, "file"),
@@ -5542,50 +4340,7 @@ class AssistantApp:
             ("长期记忆", MEMORY_PATH, "file"),
             ("失败模式库", FAILURES_PATH, "file"),
         ]
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title("数据清理")
-        dialog.geometry("420x460")
-        dialog.transient(self.root)
-        body = tk.Frame(dialog, bg=t["panel"])
-        body.pack(fill="both", expand=True, padx=16, pady=(12, 0))
-        self._restyle.append((body, "panel"))
-        self._lbl(
-            body, "勾选要清理的数据（操作不可恢复）：",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-        ).pack(anchor="w", pady=(0, 6))
-        vars_ = {}
-        for name, _p, _k in targets:
-            v = tk.BooleanVar(value=False)
-            vars_[name] = v
-            ttk.Checkbutton(body, text=name, variable=v).pack(anchor="w", pady=1)
-
-        def select_all():
-            all_on = all(v.get() for v in vars_.values())
-            for v in vars_.values():
-                v.set(not all_on)
-
-        def run_cleanup():
-            chosen = [t for t in targets if vars_[t[0]].get()]
-            if not chosen:
-                messagebox.showinfo("提示", "请至少选择一项。")
-                return
-            if not messagebox.askyesno(
-                "确认清理", f"将删除 {len(chosen)} 类数据，此操作不可恢复。确定？"
-            ):
-                return
-            done = []
-            for name, path, kind in chosen:
-                n = _delete_target(path, kind)
-                done.append(f"· {name}：删除 {n} 个文件")
-            self._flash_status("数据清理完成")
-            messagebox.showinfo("清理完成", "\n".join(done))
-
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=16, pady=(12, 14))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "全选/取消", select_all, fsz=9).pack(side="left")
-        self._mk_button(bar, "清理", run_cleanup, kind="danger", fsz=9).pack(side="left", padx=(8, 0))
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
+        dialogs.show_cleanup(self, targets, _delete_target)
 
     EVOLUTION_AUDIT_TASKS = {
         "全面审查": "全面代码审查",
@@ -5609,110 +4364,11 @@ class AssistantApp:
 
     def show_feature_suggestions(self):
         """功能建议：鲸语基于对自身的完整理解，提出新功能与升级方向（产出 MD 文档）。"""
-        t = self._theme()
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title("功能建议（鲸语基于自我认知提出升级方向）")
-        dialog.geometry("460x280")
-        dialog.transient(self.root)
-        body = tk.Frame(dialog, bg=t["panel"])
-        body.pack(fill="both", expand=True, padx=18, pady=(14, 0))
-        self._restyle.append((body, "panel"))
-        self._lbl(
-            body, "🧬 让鲸语基于对自身代码与能力的理解，提出新功能建议",
-            role="label_accent", bg="panel", font=(FONT_FAMILY, 10, "bold"),
-        ).pack(anchor="w", pady=(0, 8))
-        self._lbl(
-            body,
-            "鲸语将：分析自身架构与现有能力 → 结合用户场景与 DeepSeek 能力特性 "
-            "→ 提出 6-10 个功能建议/升级方向（名称/价值/实现思路/复杂度/优先级）"
-            "→ 写入工作区 code-review/ 建议文档。",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-            wraplength=400, justify="left",
-        ).pack(anchor="w", pady=(0, 12))
-
-        def run():
-            prompt = (
-                "请基于对鲸语自身的完整理解，提出新的功能添加与升级建议（不是审查 bug）。\n"
-                "1. 用 project_info 了解项目全貌。\n"
-                "2. 用 read_project_file 阅读关键模块（main.py 可分页、deepseek_client.py、"
-                "permissions.py、tokens.py、processpanel.py、taskpanel.py 等），理解现有能力。\n"
-                "3. 结合：用户实际使用场景（对话/智能体/办公/创作/自我进化）、"
-                "DeepSeek V4 的能力特性（1M 上下文、思考模式、工具调用、缓存计费、峰谷定价）、"
-                "以及业界 AI 助手产品趋势。\n"
-                "4. 提出 6-10 个功能建议或升级方向，每个必须包含：\n"
-                "   - 建议名称与一句话描述\n"
-                "   - 价值（解决什么痛点 / 带来什么收益）\n"
-                "   - 实现思路（涉及哪些模块、大致怎么做）\n"
-                "   - 复杂度（低/中/高）与优先级（高/中/低）\n"
-                "5. 用 create_doc 在工作区 code-review/ 生成《鲸语功能建议_日期时间.md》。\n"
-                "6. 回复中给出文档路径与 Top 3 建议摘要。"
-            )
-            self.send(text=prompt)
-            dialog.destroy()
-
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=18, pady=(12, 14))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "开始分析", run, kind="primary").pack(side="right")
-        self._mk_button(bar, "取消", dialog.destroy).pack(side="right", padx=(0, 8))
+        dialogs.show_feature_suggestions(self)
 
     def show_evolution_audit(self):
         """管理员主动发起：让鲸语自我审查并提交进化提案。"""
-        t = self._theme()
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title("发起自我审查（鲸语分析自身代码并提交改进提案）")
-        dialog.geometry("440x320")
-        dialog.transient(self.root)
-        body = tk.Frame(dialog, bg=t["panel"])
-        body.pack(fill="both", expand=True, padx=18, pady=(14, 0))
-        self._restyle.append((body, "panel"))
-        self._lbl(
-            body, "选择审查重点：", role="label_sec", bg="panel",
-            font=(FONT_FAMILY, 10, "bold"),
-        ).pack(anchor="w", pady=(0, 8))
-        focus_var = tk.StringVar(value="全面审查")
-        for key in self.EVOLUTION_AUDIT_TASKS:
-            ttk.Radiobutton(
-                body, text=f"🔍 {key}", value=key, variable=focus_var,
-            ).pack(anchor="w", pady=2)
-        self._lbl(
-            body,
-            "鲸语将：分析项目结构 → 阅读关键模块 → 定位具体问题 → "
-            "在工作区 code-review/ 生成完整审查报告 MD（现状代码 / 替换代码 / 验证方式），"
-            "供开发 AI 实施。",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-            wraplength=380, justify="left",
-        ).pack(anchor="w", pady=(10, 0))
-
-        def run():
-            focus = focus_var.get()
-            label = self.EVOLUTION_AUDIT_TASKS.get(focus, "全面代码审查")
-            prompt = (
-                f"请对鲸语自身进行一次{label}，产出审查报告文档（不是修改代码）。\n"
-                "重要：鲸语项目位于程序安装目录（不是工作区 Documents\\WhaleTalk\\workspace，"
-                "工作区是空的）。你必须使用专用工具：\n"
-                "1. 用 project_info 了解项目结构与规模。\n"
-                "2. 用 read_project_file 阅读关键模块（main.py、deepseek_client.py、"
-                "permissions.py、tokens.py、stats.py、crypto.py、processpanel.py、"
-                "taskpanel.py、exporters.py 等）。\n"
-                "3. 禁止使用 list_dir / read_file / search_local 等工作区工具分析自身代码。\n"
-                f"4. 找出{label}方面的具体问题（至少 3 个，按严重度排序，引用具体代码位置与原因）。\n"
-                "5. 用 create_doc 在工作区 code-review 子目录生成《鲸语代码审查报告_日期时间.md》，"
-                "报告必须包含：\n"
-                "   - 问题总览表（严重度 / 文件 / 位置 / 问题 / 是否建议修复）\n"
-                "   - 每个核心问题的【现状代码 / 替换代码 / 验证方式】（替换代码必须是完整可直接使用的补丁）\n"
-                "   - 低危观察项清单\n"
-                "   - 给实施 AI 的步骤清单与风险回滚说明\n"
-                "6. 完成后在回复中给出报告完整路径与核心问题摘要。"
-            )
-            self.send(text=prompt)
-            dialog.destroy()
-
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=18, pady=(12, 14))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "开始审查", run, kind="primary").pack(side="right")
-        self._mk_button(bar, "取消", dialog.destroy).pack(side="right", padx=(0, 8))
+        dialogs.show_evolution_audit(self)
 
     def _last_evolution_time(self):
         """最近一次进化提案的创建时间（秒），无提案返回 None。"""
@@ -5771,133 +4427,8 @@ class AssistantApp:
         return items
 
     def show_evolutions(self):
-        t = self._theme()
-        items = self.list_evolutions()
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title(f"自我进化提案（{len(items)} 个待处理）")
-        dialog.geometry("640x460")
-        dialog.transient(self.root)
-        left = tk.Frame(dialog, bg=t["panel"])
-        left.pack(side="left", fill="y", padx=(12, 6), pady=12)
-        self._restyle.append((left, "panel"))
-        listbox = tk.Listbox(
-            left, width=26, bg=t["input_bg"], fg=t["input_fg"],
-            selectbackground=t["selection"], selectforeground=t["accent_text"],
-            relief="flat", highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], exportselection=False,
-        )
-        listbox.pack(fill="both", expand=True)
-        for it in items:
-            listbox.insert("end", it["name"])
-        if not items:
-            listbox.insert("end", "（暂无提案）")
-
-        right = tk.Frame(dialog, bg=t["panel"])
-        right.pack(side="left", fill="both", expand=True, padx=(6, 12), pady=12)
-        self._restyle.append((right, "panel"))
-        viewer = tk.Text(
-            right, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
-            relief="flat", highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], padx=10, pady=8,
-        )
-        viewer.pack(fill="both", expand=True)
-
-        def show_item(idx):
-            it = items[idx]
-            md = os.path.join(it["dir"], "EVOLUTION.md")
-            text = ""
-            if os.path.exists(md):
-                try:
-                    with open(md, "r", encoding="utf-8", errors="replace") as f:
-                        text = f.read(4000)
-                except Exception:
-                    pass
-            text += "\n\n── 修改文件 ──\n" + "\n".join("· " + f for f in it["files"])
-            viewer.delete("1.0", "end")
-            viewer.insert("1.0", text)
-
-        def select_item(_e=None):
-            sel = listbox.curselection()
-            if sel and sel[0] < len(items):
-                show_item(sel[0])
-
-        listbox.bind("<<ListboxSelect>>", select_item)
-
-        def view_diff():
-            sel = listbox.curselection()
-            if not sel or sel[0] >= len(items):
-                return
-            self._show_evolution_diff(items[sel[0]])
-
-        def apply_item():
-            sel = listbox.curselection()
-            if not sel or sel[0] >= len(items):
-                return
-            self._apply_evolution(items[sel[0]]["name"])
-            dialog.destroy()
-            self.show_evolutions()
-
-        def ignore_item():
-            sel = listbox.curselection()
-            if not sel or sel[0] >= len(items):
-                return
-            name = items[sel[0]]["name"]
-            if messagebox.askyesno("忽略提案", f"确认忽略并删除提案「{name}」？"):
-                try:
-                    shutil.rmtree(items[sel[0]]["dir"], ignore_errors=True)
-                except Exception:
-                    pass
-                dialog.destroy()
-                self.show_evolutions()
-
-        def verify_item():
-            """提案自检：对提案目录内的 .py 文件做语法编译检查（不应用，只验证）。"""
-            sel = listbox.curselection()
-            if not sel or sel[0] >= len(items):
-                return
-            it = items[sel[0]]
-            py_files = [
-                os.path.join(it["dir"], rel)
-                for rel in it["files"]
-                if rel.endswith(".py")
-            ]
-            if not py_files:
-                messagebox.showinfo("提案自检", "该提案没有 Python 文件可检查")
-                return
-            errors = []
-            ok_n = 0
-            for f in py_files:
-                try:
-                    with open(f, "r", encoding="utf-8") as fh:
-                        source = fh.read()
-                    compile(source, f, "exec")
-                    ok_n += 1
-                except SyntaxError as e:
-                    errors.append(f"语法错误 {os.path.basename(f)}：{e}")
-                except Exception as e:
-                    errors.append(f"读取失败 {os.path.basename(f)}：{e}")
-            if errors:
-                messagebox.showwarning(
-                    "提案自检未通过",
-                    f"{len(py_files)} 个文件中 {len(errors)} 个存在问题：\n\n" + "\n".join(errors),
-                )
-            else:
-                messagebox.showinfo(
-                    "提案自检通过",
-                    f"✅ {ok_n}/{len(py_files)} 个 Python 文件语法检查全部通过，可安全采纳。",
-                )
-
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=12, pady=(0, 12))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "查看差异", view_diff, fsz=9).pack(side="left")
-        self._mk_button(bar, "提案自检", verify_item, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "采纳（应用到项目）", apply_item, kind="primary", fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "忽略", ignore_item, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
-        if items:
-            listbox.selection_set(0)
-            show_item(0)
+        """自我进化提案：查看/差异/自检/采纳/忽略。"""
+        dialogs.show_evolutions(self)
 
     def _show_evolution_diff(self, item):
         import difflib
@@ -5946,22 +4477,50 @@ class AssistantApp:
         ):
             return
         applied = []
-        for root, _dirs, files in os.walk(src):
-            for f in files:
-                if f == "EVOLUTION.md":
-                    continue
-                rel = os.path.relpath(os.path.join(root, f), src)
-                if not rel.endswith((".py", ".md", ".json", ".txt", ".bat", ".html")):
-                    continue
-                target = os.path.join(BASE_DIR, rel)
+        backed_up = []  # (target, bak_path or None)
+        rollback_needed = False
+        try:
+            for root, _dirs, files in os.walk(src):
+                for f in files:
+                    if f == "EVOLUTION.md":
+                        continue
+                    rel = os.path.relpath(os.path.join(root, f), src)
+                    if not rel.endswith((".py", ".md", ".json", ".txt", ".bat", ".html")):
+                        continue
+                    target = os.path.join(BASE_DIR, rel)
+                    bak = target + ".evobak"
+                    try:
+                        if os.path.exists(target):
+                            shutil.copy2(target, bak)
+                            backed_up.append((target, bak))
+                        else:
+                            backed_up.append((target, None))
+                        os.makedirs(os.path.dirname(target) or BASE_DIR, exist_ok=True)
+                        shutil.copy2(os.path.join(root, f), target)
+                        applied.append(rel)
+                    except Exception as e:
+                        rollback_needed = True
+                        messagebox.showerror("采纳失败", f"{rel}: {e}")
+                        break
+                if rollback_needed:
+                    break
+        except Exception as e:
+            rollback_needed = True
+            messagebox.showerror("采纳异常", str(e))
+
+        if rollback_needed:
+            # 回滚：已备份的还原，未备份的新增文件删除，避免“部分采纳”的混合状态
+            for target, bak in reversed(backed_up):
                 try:
-                    if os.path.exists(target):
-                        shutil.copy2(target, target + ".evobak")
-                    os.makedirs(os.path.dirname(target) or BASE_DIR, exist_ok=True)
-                    shutil.copy2(os.path.join(root, f), target)
-                    applied.append(rel)
-                except Exception as e:
-                    messagebox.showerror("采纳失败", f"{rel}: {e}")
+                    if bak and os.path.exists(bak):
+                        shutil.copy2(bak, target)
+                    elif os.path.exists(target):
+                        os.remove(target)
+                except Exception:
+                    logging.exception("回滚进化提案文件失败: %s", target)
+            messagebox.showerror("采纳失败", "已回滚本次全部改动，项目保持原状。")
+            return
+
         try:
             os.rename(src, src + "_applied")
         except Exception:
@@ -6259,14 +4818,14 @@ class AssistantApp:
         hits = []
         for mm in PATH_RE.finditer(text or ""):
             p = mm.group(0).rstrip("。.,;: \t")
-            if os.path.isfile(p):
+            if os.path.isfile(p) and permissions.check_filesystem(p, write=False)[0]:
                 hits.append(p)
         for mm in re.finditer(
             r"[\w\-\u4e00-\u9fff]+\.(?:md|py|txt|json|html|css|js|ts|yaml|yml|toml|ini|csv)",
             text or "",
         ):
             cand = os.path.join(base, mm.group(0))
-            if os.path.isfile(cand) and cand not in hits:
+            if os.path.isfile(cand) and cand not in hits and permissions.check_filesystem(cand, write=False)[0]:
                 hits.append(cand)
         if not hits:
             return ""
@@ -6299,38 +4858,22 @@ class AssistantApp:
 
     @staticmethod
     def _load_patterns():
-        try:
-            if os.path.exists(PATTERNS_PATH):
-                with open(PATTERNS_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            logging.exception("读取成功模式失败")
-        return []
+        return stores.load_patterns(PATTERNS_PATH)
 
     @staticmethod
     def _save_patterns(pats):
-        return AssistantApp._atomic_json_write(PATTERNS_PATH, pats)
+        return stores.save_patterns(PATTERNS_PATH, pats)
 
     # ===== 失败模式库：工具失败自动积累，注入上下文供 AI 规避已知坑 =====
     FAILURES_MAX = 50
 
     @staticmethod
     def _load_failures():
-        try:
-            if os.path.exists(FAILURES_PATH):
-                with open(FAILURES_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            logging.exception("读取失败模式失败")
-        return []
+        return stores.load_failures(FAILURES_PATH)
 
     @staticmethod
     def _save_failures(items):
-        return AssistantApp._atomic_json_write(FAILURES_PATH, items, indent=1)
+        return stores.save_failures(FAILURES_PATH, items)
 
     @staticmethod
     def _append_failures(new_items):
@@ -6338,45 +4881,17 @@ class AssistantApp:
 
         纯静态方法（不依赖实例）：_finish 统计循环结束后在主线程调用。
         """
-        if not new_items:
-            return
-        try:
-            items = AssistantApp._load_failures()
-            for it in new_items:
-                key = (str(it.get("tool") or ""), str(it.get("error") or "")[:50])
-                replaced = False
-                for old in items:
-                    if (str(old.get("tool") or ""), str(old.get("error") or "")[:50]) == key:
-                        old["ts"] = it["ts"]
-                        replaced = True
-                        break
-                if not replaced:
-                    items.append(it)
-            if len(items) > AssistantApp.FAILURES_MAX:
-                del items[: len(items) - AssistantApp.FAILURES_MAX]
-            AssistantApp._save_failures(items)
-        except Exception:
-            logging.exception("记录失败模式失败")
+        stores.append_failures(FAILURES_PATH, new_items, AssistantApp.FAILURES_MAX)
 
     @staticmethod
     def _failure_patterns_text():
         """已知失败模式注入（最近 3 条，固定格式缓存友好）。"""
-        try:
-            items = AssistantApp._load_failures()
-            if not items:
-                return ""
-            lines = ["[已知失败模式] 以下工具调用曾失败（遇到同类情况请规避或改用其他方式）："]
-            for it in items[-3:]:
-                tool = str(it.get("tool") or "?")
-                err = str(it.get("error") or "")[:100]
-                if err:
-                    lines.append(f"- {tool}：{err}")
-            return "\n".join(lines) if len(lines) > 1 else ""
-        except Exception:
-            return ""
+        return stores.failure_patterns_text(FAILURES_PATH)
 
     def _record_success_pattern(self):
         """任务全部成功时记录工具链模式（上限 10 条）。"""
+        if self.cfg.get("privacy_mode"):
+            return
         try:
             chain = []
             for b in self.blocks:
@@ -6553,28 +5068,15 @@ class AssistantApp:
         return os.path.join(self._get_active_dir(), ".whaletalk", "tasklog.json")
 
     def _load_tasklog(self):
-        try:
-            p = self._tasklog_path()
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    data.setdefault("tasks", [])
-                    return data
-        except Exception:
-            logging.exception("读取项目任务记录失败")
-        return {"tasks": []}
+        return stores.load_tasklog(self._tasklog_path())
 
     def _save_tasklog(self, data):
-        try:
-            p = self._tasklog_path()
-            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-            self._atomic_json_write(p, data, indent=2)
-        except Exception:
-            logging.exception("保存项目任务记录失败")
+        stores.save_tasklog(self._tasklog_path(), data)
 
     def _record_tasklog(self):
         """任务完成时把摘要追加到当前工作目录的 tasklog（上限 20 条，跨会话交接）。"""
+        if self.cfg.get("privacy_mode"):
+            return
         try:
             chain = []
             artifacts = []
@@ -6659,44 +5161,8 @@ class AssistantApp:
             logging.exception("自动经验复盘写入失败")
 
     def show_tasklog(self):
-        t = self._theme()
-        data = self._load_tasklog()
-        tasks = data.get("tasks") or []
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title(f"项目任务记录（{os.path.basename(self._get_active_dir())}，{len(tasks)} 条）")
-        dialog.geometry("600x420")
-        dialog.transient(self.root)
-        text = tk.Text(
-            dialog, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
-            relief="flat", highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], padx=12, pady=10,
-        )
-        text.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        for task in reversed(tasks):
-            chain = " → ".join(task.get("chain", []))
-            arts = "、".join(task.get("artifacts", []))
-            text.insert(
-                "end",
-                f"【{task.get('ts', '')}】{task.get('title', '任务')}\n"
-                f"工具链：{chain}\n"
-                + (f"产物：{arts}\n" if arts else "")
-                + "\n",
-            )
-        if not tasks:
-            text.insert("1.0", "（暂无任务记录，AI 在本目录执行过任务后自动记录）")
-        text.configure(state="disabled")
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=12, pady=(8, 12))
-        self._restyle.append((bar, "panel"))
-
-        def clear():
-            if messagebox.askyesno("清空任务记录", "确认清空当前项目的任务记录？"):
-                self._save_tasklog({"tasks": []})
-                dialog.destroy()
-                self.show_tasklog()
-
-        self._mk_button(bar, "清空", clear, fsz=9).pack(side="left")
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
+        """项目任务记录：查看当前工作目录的任务历史。"""
+        dialogs.show_tasklog(self)
 
     @staticmethod
     def _format_memory_fact(f):
@@ -6826,48 +5292,21 @@ class AssistantApp:
 
     @staticmethod
     def _load_memory():
-        try:
-            if os.path.exists(MEMORY_PATH):
-                with open(MEMORY_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    data.setdefault("enabled", False)
-                    data.setdefault("facts", [])
-                    return data
-        except Exception:
-            logging.exception("读取长期记忆失败")
-        return {"enabled": False, "facts": []}
+        return stores.load_memory(MEMORY_PATH)
 
     @staticmethod
     def _save_memory(data):
-        return AssistantApp._atomic_json_write(MEMORY_PATH, data, indent=2)
+        return stores.save_memory(MEMORY_PATH, data)
 
     @staticmethod
     def _defer_until(now):
-        """高峰错峰顺延目标时刻：最近空闲时段开始（12:00 / 18:00；已过则次日 0:00）。
-
-        仅在高峰时段调用：9-12 高峰 → 12:00；14-18 高峰 → 18:00；
-        若对应空闲开始时刻已过（极端情况）→ 次日 0:00。
-        """
-        h = now.hour
-        defer_h = 12 if h < 14 else 18
-        ts = now.replace(hour=defer_h, minute=0, second=0, microsecond=0).timestamp()
-        if ts <= now.timestamp():
-            ts = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        return ts
+        """高峰错峰顺延目标时刻（兼容入口，实现见 shared.defer_until）。"""
+        return _defer_until(now)
 
     @staticmethod
     def _budget_thinking(budget, cost, thinking):
-        """预算感知思考降档：接近月度预算 80% 时，auto/max 档自动降为 high。
-
-        返回 (effective_thinking, near_budget)。用户显式选择的 low/medium/high
-        档位不干预（尊重手动选择）；仅对智能路由与最高档做降级。
-        """
-        if budget > 0 and cost >= budget * 0.8:
-            if thinking in ("auto", "max"):
-                return "high", True
-            return thinking, True
-        return thinking, False
+        """预算感知思考降档（兼容入口，实现见 shared.budget_thinking）。"""
+        return _budget_thinking(budget, cost, thinking)
 
     def _budget_thinking_hint(self, near_budget):
         """预算降档提示（worker 线程经 UI 队列投递）。"""
@@ -7134,7 +5573,21 @@ class AssistantApp:
                             self.end_headers()
                             self.wfile.write(b"forbidden")
                             return
-                        app._ui_queue.put(("timer_task", str(data["text"]).strip()))
+                        text = str(data["text"]).strip()
+                        if len(text) > 20000:
+                            self.send_response(413)
+                            self.end_headers()
+                            self.wfile.write(b"text too long")
+                            return
+                        now = time.time()
+                        last = getattr(app, "_inbound_last_task", 0.0)
+                        if now - last < 2.0:  # 简单频率限制：同一接收端 2 秒内只接受 1 条
+                            self.send_response(429)
+                            self.end_headers()
+                            self.wfile.write(b"rate limited")
+                            return
+                        app._inbound_last_task = now
+                        app._ui_queue.put(("timer_task", text))
                         self.send_response(200)
                         self.end_headers()
                         self.wfile.write(b"ok")
@@ -7204,18 +5657,10 @@ class AssistantApp:
             logging.exception("定时任务分发失败")
 
     def _load_schedules(self):
-        try:
-            if os.path.exists(SCHEDULES_PATH):
-                with open(SCHEDULES_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            logging.exception("读取定时任务失败")
-        return []
+        return stores.load_schedules(SCHEDULES_PATH)
 
     def _save_schedules(self, schedules):
-        return self._atomic_json_write(SCHEDULES_PATH, schedules, indent=2)
+        return stores.save_schedules(SCHEDULES_PATH, schedules)
 
     def import_session_file(self):
         """导入会话（JSON 数组 / JSONL / 本程序导出的 JSON），创建为新会话。"""
@@ -7562,18 +6007,30 @@ class AssistantApp:
             img_vars[key] = var
 
         def save():
+            def _enc_secret(v):
+                v = str(v or "").strip()
+                if not v or v.startswith("dpapi:"):
+                    return v
+                try:
+                    return crypto.encrypt(v)
+                except crypto.CryptError:
+                    logging.error("外部服务敏感字段加密失败，保留原值（建议检查系统 DPAPI）")
+                    return v
+
             try:
                 wh_out = {}
                 for name, var in wh.items():
                     url = var.get().strip()
                     if url:
-                        wh_out[name] = url
+                        wh_out[name] = _enc_secret(url)
                 self._atomic_json_write(_dc.WEBHOOK_CONFIG_FILE, wh_out)
                 db_out = {}
                 for kind, (conn_var, fields) in dbs.items():
                     conns = {}
                     cfg = {k: v.get().strip() for k, v in fields.items()}
                     if cfg.get("host") and cfg.get("user"):
+                        if cfg.get("password"):
+                            cfg["password"] = _enc_secret(cfg["password"])
                         conns[conn_var.get().strip() or "default"] = cfg
                     if conns:
                         db_out[kind] = conns
@@ -7582,11 +6039,15 @@ class AssistantApp:
                 for key, var in mail_vars.items():
                     v = var.get().strip()
                     if v:
+                        if key in ("password",):
+                            v = _enc_secret(v)
                         mail_out[key] = v
                 imap_out = {}
                 for key, var in imap_vars.items():
                     v = var.get().strip()
                     if v:
+                        if key in ("password", "imap_password"):
+                            v = _enc_secret(v)
                         imap_out[key] = v
                 if imap_out:
                     mail_out["imap"] = imap_out
@@ -7820,38 +6281,7 @@ class AssistantApp:
 
     def show_checkpoint(self):
         """任务检查点：查看未完成任务进度 / 清除。"""
-        t = self._theme()
-        dialog, body, footer = self._dialog_shell(
-            "任务检查点（断点续跑）", 560, 360,
-            subtitle="长任务进度持久化：崩溃/重启后可从断点继续",
-            minsize=(440, 260),
-        )
-        viewer = tk.Text(
-            body, height=10, bg=t["input_bg"], fg=t["input_fg"], relief="flat",
-            highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], font=(MONO_FAMILY, 9), padx=8, pady=6,
-        )
-        viewer.pack(fill="both", expand=True)
-        try:
-            out = _dc.task_checkpoint_load()
-        except Exception:
-            out = "错误：读取检查点失败"
-        viewer.insert("1.0", out)
-
-        def clear_cp():
-            if not messagebox.askyesno("清除检查点", "确认清除任务检查点？"):
-                return
-            try:
-                if _dc.CHECKPOINT_FILE and os.path.exists(_dc.CHECKPOINT_FILE):
-                    os.remove(_dc.CHECKPOINT_FILE)
-                viewer.delete("1.0", "end")
-                viewer.insert("1.0", "检查点已清除")
-                self._flash_status("任务检查点已清除")
-            except Exception as e:
-                messagebox.showerror("清除失败", str(e))
-
-        self._footer_btn(footer, "关闭", dialog.destroy)
-        self._footer_btn(footer, "清除检查点", clear_cp)
+        dialogs.show_checkpoint(self)
 
     def _on_knowledge_done(self, out):
         """知识库重建完成（主线程）：更新管理面板状态与结果。"""
@@ -7981,7 +6411,7 @@ class AssistantApp:
     def _refresh_user_tools_cache(self):
         """自定义工具缓存失效（插件安装/卸载/停用后调用，mtime 兜底外的主动清除）。"""
         try:
-            _USER_TOOLS_CACHE.clear()
+            user_tools.clear_cache()
         except Exception:
             pass
 
@@ -8043,58 +6473,7 @@ class AssistantApp:
 
     def _show_plugin_guide(self, plugin):
         """安装后引导：使用方式 + 快速试用（让用户 30 秒感知插件价值）。"""
-        meta = plugin.get("meta") or {}
-        c = plugin.get("contents") or {}
-        tools = c.get("tools") or []
-        skills = c.get("skills") or []
-        wf = c.get("workflows") or {}
-        sc = c.get("scenario")
-        dialog, body, footer = self._dialog_shell(
-            f"✅ 插件已安装：{meta.get('icon', '🧩')} {meta.get('name', '')}",
-            540, 300,
-            subtitle="使用方式与快速试用",
-        )
-        lines = []
-        if tools:
-            lines.append(f"🔧 {len(tools)} 个工具：AI 会按需自动调用（与内置工具一起参与任务）")
-        if skills:
-            lines.append(f"⚡ {len(skills)} 个技能：输入框「⚡ 指令」菜单选择，或点下方按钮直接试用")
-        if wf:
-            lines.append(f"🔁 {len(wf)} 个流程：AI 自动 / 定时任务 / 「流程管理」手动运行")
-        if sc:
-            lines.append("🎭 含场景配置：可一键应用思考档/提示词/推荐工具")
-        if not lines:
-            lines.append("（该插件不含可交互能力）")
-        for ln in lines:
-            self._lbl(body, ln, bg="panel", font=(FONT_FAMILY, 9), wraplength=480,
-                      justify="left").pack(anchor="w", pady=2)
-        self._lbl(body, "插件管理：🛠 工具菜单 → 🧩 插件中心 → 我的插件（停用/卸载/导出分享）",
-                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(8, 0))
-        if skills:
-            s0 = skills[0]
-            self._footer_btn(footer, "关闭", dialog.destroy)
-            self._footer_btn(
-                footer, f"试用技能：{s0.get('name', '')}",
-                lambda s=s0: (self._insert_plugin_skill(s), dialog.destroy()),
-                primary=True,
-            )
-        elif wf:
-            w0 = next(iter(wf))
-            self._footer_btn(footer, "关闭", dialog.destroy)
-            self._footer_btn(
-                footer, f"运行流程：{w0}",
-                lambda n=w0: (dialog.destroy(), self._flash_status(f"🚀 正在运行流程「{n}」…"), _dc.run_workflow(n)),
-                primary=True,
-            )
-        elif sc:
-            self._footer_btn(footer, "关闭", dialog.destroy)
-            self._footer_btn(
-                footer, "应用场景配置",
-                lambda: (self._apply_plugin_scenario(sc), dialog.destroy()),
-                primary=True,
-            )
-        else:
-            self._footer_btn(footer, "关闭", dialog.destroy)
+        dialogs.show_plugin_guide(self, plugin)
 
     def _insert_plugin_skill(self, skill):
         """把技能模板插入输入框（试用入口）。"""
@@ -8211,6 +6590,7 @@ class AssistantApp:
         nb.pack(fill="both", expand=True, padx=14, pady=(4, 10))
         self._hub_installed_tab(nb)
         self._hub_gallery_tab(nb)
+        self._hub_market_tab(nb)
         self._hub_workshop_tab(nb)
         self._hub = dialog
         return dialog
@@ -8376,6 +6756,7 @@ class AssistantApp:
             return
         want = not p.get("enabled", True)
         if want:
+            p["enabled"] = True
             res = plugins_mod.apply_plugin(p, self._plugin_paths())
             if not res.get("ok"):
                 messagebox.showerror("启用失败", str(res.get("error") or "未知错误"))
@@ -8517,6 +6898,172 @@ class AssistantApp:
         self._lbl(bar, "示例插件：理解插件能力的最佳起点 · 双击安装",
                   role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="right")
 
+    def _hub_market_tab(self, nb):
+        """在线插件市场：从远程索引浏览/下载安装插件。"""
+        t = self._theme()
+        body = tk.Frame(nb, bg=t["panel"])
+        nb.add(body, text="市场")
+        self._lbl(
+            body,
+            "在线插件市场：浏览社区插件，一键下载安装（默认 GitHub 源，可在配置 plugin_market_url 覆盖）",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        left = tk.Frame(body, bg=t["panel"])
+        left.pack(side="left", fill="y", padx=(8, 8))
+        self._restyle.append((left, "panel"))
+        left_wrap = tk.Frame(left, bg=t["panel"])
+        left_wrap.pack(fill="both", expand=True)
+        self._restyle.append((left_wrap, "panel"))
+        listbox = tk.Listbox(
+            left_wrap, width=36, bg=t["input_bg"], fg=t["input_fg"],
+            selectbackground=t["selection"], selectforeground=t["accent_text"],
+            relief="flat", highlightthickness=1, highlightbackground=t["border"],
+            highlightcolor=t["accent"], exportselection=False,
+        )
+        lb_sb = tk.Scrollbar(left_wrap, orient="vertical", command=listbox.yview,
+                             relief="flat", bd=0)
+        listbox.configure(yscrollcommand=lb_sb.set)
+        lb_sb.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+
+        right = tk.Frame(body, bg=t["panel"])
+        right.pack(side="left", fill="both", expand=True, padx=(8, 8))
+        self._restyle.append((right, "panel"))
+        viewer = tk.Text(
+            right, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
+            relief="flat", highlightthickness=1, highlightbackground=t["border"],
+            highlightcolor=t["accent"], padx=12, pady=10,
+        )
+        view_sb = tk.Scrollbar(right, orient="vertical", command=viewer.yview,
+                               relief="flat", bd=0)
+        viewer.configure(yscrollcommand=view_sb.set)
+        view_sb.pack(side="right", fill="y")
+        viewer.pack(side="left", fill="both", expand=True)
+
+        state = {"entries": []}
+
+        def show_item(idx):
+            entries = state["entries"]
+            if idx >= len(entries):
+                return
+            e = entries[idx]
+            viewer.configure(state="normal")
+            viewer.delete("1.0", "end")
+            sha = str(e.get("sha256") or "").strip()
+            viewer.insert("1.0",
+                f"{e.get('icon', '🧩')} {e.get('name', '')} v{e.get('version', '?')}\n"
+                f"作者：{e.get('author', '未知')}\n\n"
+                f"{e.get('description', '（无描述）')}\n\n"
+                f"下载：{e.get('url', '')}\n"
+                + (f"SHA-256：{sha}\n" if sha else "")
+            )
+            viewer.configure(state="disabled")
+
+        def render(entries):
+            state["entries"] = entries
+            listbox.delete(0, "end")
+            installed_names = {p["meta"]["name"] for p in plugins_mod.list_plugins(PLUGINS_DIR)}
+            for e in entries:
+                name = str(e.get("name") or "")
+                mark = "✅" if name in installed_names else "⬇"
+                listbox.insert(
+                    "end",
+                    f"{mark} {e.get('icon', '🧩')} {name} v{e.get('version', '?')} — {str(e.get('summary') or e.get('description') or '')[:32]}",
+                )
+            if not entries:
+                listbox.insert("end", "（市场为空或索引格式不符）")
+            if entries:
+                listbox.selection_set(0)
+                show_item(0)
+
+        listbox.bind("<<ListboxSelect>>",
+                     lambda e: (show_item(listbox.curselection()[0])
+                                if listbox.curselection() else None))
+
+        def refresh():
+            listbox.delete(0, "end")
+            listbox.insert("end", "（正在加载市场…）")
+            viewer.configure(state="normal")
+            viewer.delete("1.0", "end")
+            viewer.configure(state="disabled")
+            url = str(self.cfg.get("plugin_market_url") or "").strip() or PLUGIN_MARKET_URL
+            if not url:
+                self._flash_status("未配置插件市场地址（plugin_market_url）")
+                return
+
+            def worker():
+                try:
+                    resp = _dc._http_client().get(url, timeout=15)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        entries = data.get("plugins") or data.get("items") or []
+                    else:
+                        entries = data or []
+                    entries = [e for e in entries if isinstance(e, dict) and e.get("url")]
+                    self._ui_queue.put(("plugin_market", (True, entries)))
+                except Exception as e:
+                    self._ui_queue.put(("plugin_market", (False, str(e))))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def install_selected():
+            sel = listbox.curselection()
+            if not sel or sel[0] >= len(state["entries"]):
+                return
+            entry = state["entries"][sel[0]]
+            name = str(entry.get("name") or "")
+            installed_names = {p["meta"]["name"] for p in plugins_mod.list_plugins(PLUGINS_DIR)}
+            if name in installed_names:
+                messagebox.showinfo("已安装", f"插件「{name}」已安装，可在「我的插件」中查看/停用/卸载。")
+                return
+            if not messagebox.askyesno(
+                "安装市场插件",
+                f"确认下载并安装「{name}」v{entry.get('version', '?')}？\n{entry.get('description', '')}",
+            ):
+                return
+
+            def worker():
+                try:
+                    import hashlib
+                    import tempfile
+                    from urllib.parse import urlparse
+
+                    url = str(entry.get("url") or "")
+                    resp = _dc._http_client().get(url, timeout=60)
+                    resp.raise_for_status()
+                    fn = os.path.basename(urlparse(url).path) or "plugin.wtplugin"
+                    tmp = os.path.join(tempfile.gettempdir(), f"wtplugin_{int(time.time())}_{fn}")
+                    with open(tmp, "wb") as f:
+                        f.write(resp.content)
+                    sha = str(entry.get("sha256") or "").strip().lower()
+                    if sha:
+                        h = hashlib.sha256()
+                        with open(tmp, "rb") as f:
+                            for chunk in iter(lambda: f.read(64 * 1024), b""):
+                                h.update(chunk)
+                        if h.hexdigest() != sha:
+                            os.remove(tmp)
+                            raise ValueError("SHA-256 校验失败，文件可能被篡改或下载不完整")
+                    self._ui_queue.put(("plugin_market_downloaded", (True, tmp, entry)))
+                except Exception as e:
+                    self._ui_queue.put(("plugin_market_downloaded", (False, str(e), entry)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        listbox.bind("<Double-1>", lambda e: install_selected())
+        bar = tk.Frame(body, bg=t["panel"])
+        bar.pack(fill="x", side="bottom", padx=8, pady=(6, 8))
+        self._restyle.append((bar, "panel"))
+        self._mk_button(bar, "刷新", refresh, fsz=9).pack(side="left")
+        self._mk_button(bar, "安装选中", install_selected, kind="primary", fsz=9).pack(side="left", padx=(6, 0))
+        self._lbl(bar, "在线插件来自社区索引，安装前请核对作者与 SHA-256",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="right")
+        refresh()
+        self._hub_market_render = render
+        self._hub_market_refresh = refresh
+
     def _hub_workshop_tab(self, nb):
         """插件工坊：说需求，AI 造插件。"""
         t = self._theme()
@@ -8602,13 +7149,19 @@ class AssistantApp:
     def _hub_save_all(self):
         """工具中心统一保存：触发工具设置与权限面板的保存回调。"""
         saved = 0
+        errors = []
         for fn in getattr(self, "_hub_saves", []) or []:
             try:
                 fn()
                 saved += 1
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(str(e))
         self._hub_saves = []
+        if errors:
+            messagebox.showerror(
+                "部分保存失败",
+                "以下面板保存时出错：\n" + "\n".join(errors[:5]),
+            )
         self._flash_status(f"✅ 工具中心更改已保存（{saved} 个面板）")
 
     def _hub_tools_overview(self, nb):
@@ -8767,70 +7320,18 @@ class AssistantApp:
 
     def show_dependencies(self):
         """依赖状态：可选能力清单与安装指引。"""
-        t = self._theme()
-        rows = self._dependency_status()
-        n_ok = sum(1 for _, ok, _, _ in rows if ok)
-        dialog, body, footer = self._dialog_shell(
-            "依赖状态", 580, 500,
-            subtitle=f"可选能力：{n_ok}/{len(rows)} 已安装（缺失项给出安装命令；所有缺失功能均自动降级提示）",
-        )
-        canvas, inner = self._scroll_panel(body)
-        for name, ok, use, hint in rows:
-            row = tk.Frame(inner, bg=t["panel"])
-            row.pack(fill="x", pady=2)
-            self._restyle.append((row, "panel"))
-            mark = "✅" if ok else "⚠ "
-            fg = t["success"] if ok else t["warning"]
-            self._lbl(row, f"{mark} {name}", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-                      fg=fg, width=17, anchor="w").pack(side="left")
-            self._lbl(row, use, role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-                      anchor="w").pack(side="left", padx=(6, 0))
-            if not ok:
-                self._lbl(row, hint, role="label_sec", bg="panel", font=(MONO_FAMILY, 8),
-                          anchor="e").pack(side="right")
-        self._footer_btn(footer, "关闭", dialog.destroy)
+        dialogs.show_dependencies(self)
 
     def show_failures(self):
         """失败模式库：查看 AI 工具曾失败的原因（供分析/规避）。"""
-        t = self._theme()
-        items = self._load_failures()
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title(f"失败模式库（{len(items)} 条 · 自动积累工具失败原因）")
-        dialog.geometry("560x400")
-        dialog.transient(self.root)
-        text = tk.Text(
-            dialog, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
-            relief="flat", highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], padx=12, pady=10,
-        )
-        text.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        for r in reversed(items[-200:]):
-            text.insert(
-                "end",
-                f"🔧 {r.get('tool', '?')} · [{r.get('ts', '')}]\n"
-                f"参数: {r.get('args', '')}\n错误: {r.get('error', '')}\n\n",
-            )
-        if not items:
-            text.insert("1.0", "（暂无失败记录，AI 工具执行失败时自动积累）")
-        text.configure(state="disabled")
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=12, pady=(8, 12))
-        self._restyle.append((bar, "panel"))
-
-        def clear():
-            if messagebox.askyesno("清空失败模式", "确认清空全部失败记录？"):
-                self._save_failures([])
-                dialog.destroy()
-                self.show_failures()
-
-        self._mk_button(bar, "清空", clear, fsz=9).pack(side="left")
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
+        dialogs.show_failures(self)
 
     def copy_share_text(self):
         """把当前对话复制为可分享的 Markdown 文本。"""
-        if len(self.messages) <= 1:
-            messagebox.showinfo("提示", "暂无对话可分享。")
-            return
+        with self._messages_lock:
+            if len(self.messages) <= 1:
+                messagebox.showinfo("提示", "暂无对话可分享。")
+                return
         self.root.clipboard_clear()
         self.root.clipboard_append(self.build_markdown())
         self._flash_status("已复制对话分享文本（Markdown）")
@@ -9232,104 +7733,8 @@ class AssistantApp:
         return save_perms
 
     def show_fim_dialog(self):
-        cfg = self.save_widgets_to_config()
-        if not cfg["api_key"]:
-            messagebox.showwarning("未配置 API Key", "请先填写 DeepSeek API Key。")
-            return
-        t = self._theme()
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title("FIM 代码补全（Beta）")
-        dialog.geometry("700x540")
-        dialog.transient(self.root)
-        body = tk.Frame(dialog, bg=t["panel"])
-        body.pack(fill="both", expand=True, padx=14, pady=(12, 0))
-        self._restyle.append((body, "panel"))
-        self._lbl(
-            body, "前缀（已有代码，模型从此继续补全中间内容）",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-        ).pack(anchor="w")
-        prefix_text = tk.Text(
-            body, height=8, wrap="none", bg=t["input_bg"], fg=t["input_fg"],
-            insertbackground=t["input_fg"], relief="flat", highlightthickness=1,
-            highlightbackground=t["border"], highlightcolor=t["accent"],
-            font=(MONO_FAMILY, 9), padx=8, pady=6,
-        )
-        prefix_text.pack(fill="x", pady=(2, 6))
-        self._lbl(
-            body, "后缀（可选，补全内容位于前缀与后缀之间）",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-        ).pack(anchor="w")
-        suffix_text = tk.Text(
-            body, height=4, wrap="none", bg=t["input_bg"], fg=t["input_fg"],
-            insertbackground=t["input_fg"], relief="flat", highlightthickness=1,
-            highlightbackground=t["border"], highlightcolor=t["accent"],
-            font=(MONO_FAMILY, 9), padx=8, pady=6,
-        )
-        suffix_text.pack(fill="x", pady=(2, 6))
-        self._lbl(
-            body, "补全结果", role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-        ).pack(anchor="w")
-        result_text = tk.Text(
-            body, height=9, wrap="word", bg=t["input_bg"], fg=t["input_fg"],
-            insertbackground=t["input_fg"], relief="flat", highlightthickness=1,
-            highlightbackground=t["border"], highlightcolor=t["accent"],
-            font=(MONO_FAMILY, 9), padx=8, pady=6,
-        )
-        result_text.pack(fill="both", expand=True, pady=(2, 6))
-        status_lbl = self._lbl(
-            body, "FIM 需要 Beta 端点，未开启时自动使用 /beta", role="label_sec",
-            bg="panel", font=(FONT_FAMILY, 9),
-        )
-        status_lbl.pack(anchor="w")
-        bar = tk.Frame(dialog, bg=t["panel"])
-        bar.pack(fill="x", padx=14, pady=(8, 12))
-        self._restyle.append((bar, "panel"))
-
-        def run_fim():
-            prefix = prefix_text.get("1.0", "end").strip()
-            if not prefix:
-                messagebox.showinfo("提示", "请输入前缀。")
-                return
-            suffix = suffix_text.get("1.0", "end").strip()
-            status_lbl.configure(text="正在调用 FIM 补全…")
-            result_text.delete("1.0", "end")
-
-            # worker 线程禁止直接碰 Tk（after/configure 都不是线程安全的），
-            # 结果经 UI 队列回主线程 _drain_ui_queue 处理
-            self._fim_widgets = (result_text, status_lbl, t)
-            self._capture_client_params()
-
-            def worker():
-                try:
-                    client = self.ensure_client()
-                    result = client.fim_complete(prefix, suffix)
-                    self._ui_queue.put(("fim_done", (True, result)))
-                except Exception as e:
-                    self._ui_queue.put(("fim_done", (False, str(e))))
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        dialog.bind(
-            "<Destroy>",
-            lambda e: setattr(self, "_fim_widgets", None)
-            if e.widget is dialog
-            else None,
-        )
-
-        def insert_result():
-            result = result_text.get("1.0", "end").strip()
-            if not result:
-                return
-            self._clear_placeholder()
-            self.input_text.delete("1.0", "end")
-            self.input_text.insert("1.0", result)
-            self.input_text.focus_set()
-            dialog.destroy()
-            self._flash_status("已插入补全结果")
-
-        self._mk_button(bar, "补全", run_fim, kind="primary", fsz=9).pack(side="left")
-        self._mk_button(bar, "插入输入框", insert_result, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
+        """FIM 代码补全（Beta）对话框。"""
+        dialogs.show_fim_dialog(self)
 
     def _write_user_tools(self, items):
         try:
@@ -9345,39 +7750,41 @@ class AssistantApp:
         在 send / 继续生成 / FIM / 纪要等线程启动前调用，worker 线程内的
         ensure_client 一律使用这里捕获的快照，避免偶发 TclError/崩溃。
         """
-        self._client_key = self.key_var.get().strip()
-        self._client_model = self.model_combo.get().strip() or "deepseek-v4-flash"
-        # v2 能力层：图片生成配置（工具线程读取）
-        _dc.IMAGE_GEN_KEY = self.cfg.get("image_api_key", "") or self._client_key
-        _dc.IMAGE_GEN_BASE = self.cfg.get("image_base_url", "") or self.cfg.get("base_url", "")
-        _dc.IMAGE_GEN_MODEL = self.cfg.get("image_model", "gpt-image-1")
-        # run_workflow 回调（线程安全：只投递 UI 队列）
-        _dc.set_send_callback(lambda text: self._ui_queue.put(("timer_task", text)))
-        _dc.set_busy_provider(lambda: self.busy)
+        with self._client_lock:
+            self._client_key = self.key_var.get().strip()
+            self._client_model = self.model_combo.get().strip() or "deepseek-v4-flash"
+            # v2 能力层：图片生成配置（工具线程读取）
+            _dc.IMAGE_GEN_KEY = self.cfg.get("image_api_key", "") or self._client_key
+            _dc.IMAGE_GEN_BASE = self.cfg.get("image_base_url", "") or self.cfg.get("base_url", "")
+            _dc.IMAGE_GEN_MODEL = self.cfg.get("image_model", "gpt-image-1")
+            # run_workflow 回调（线程安全：只投递 UI 队列）
+            _dc.set_send_callback(lambda text: self._ui_queue.put(("timer_task", text)))
+            _dc.set_busy_provider(lambda: self.busy)
 
     def ensure_client(self):
-        key = getattr(self, "_client_key", None)
-        if key is None:
-            key = self.key_var.get().strip()
-        base_url = self.cfg["base_url"].strip() or DEFAULT_BASE_URL
-        if self.cfg.get("beta_api") and not base_url.endswith("/beta"):
-            base_url = base_url.rstrip("/") + "/beta"
-        model = getattr(self, "_client_model", None)
-        if model is None:
-            model = self.model_combo.get().strip() or "deepseek-v4-flash"
-        timeout = self.cfg.get("timeout", 120)
-        if (
-            self.client is None
-            or self.client.api_key != key
-            or self.client.base_url != base_url
-            or self.client.model != model
-            or self.client.timeout != timeout
-        ):
-            self.client = DeepSeekClient(
-                api_key=key, base_url=base_url, model=model, timeout=timeout
-            )
-            _dc.set_active_client(self.client)
-        return self.client
+        with self._client_lock:
+            key = getattr(self, "_client_key", None)
+            if key is None:
+                key = self.key_var.get().strip()
+            base_url = self.cfg["base_url"].strip() or DEFAULT_BASE_URL
+            if self.cfg.get("beta_api") and not base_url.endswith("/beta"):
+                base_url = base_url.rstrip("/") + "/beta"
+            model = getattr(self, "_client_model", None)
+            if model is None:
+                model = self.model_combo.get().strip() or "deepseek-v4-flash"
+            timeout = self.cfg.get("timeout", 120)
+            if (
+                self.client is None
+                or self.client.api_key != key
+                or self.client.base_url != base_url
+                or self.client.model != model
+                or self.client.timeout != timeout
+            ):
+                self.client = DeepSeekClient(
+                    api_key=key, base_url=base_url, model=model, timeout=timeout
+                )
+                _dc.set_active_client(self.client)
+            return self.client
 
     def _ensure_follow(self):
         """智能跟随滚动：_follow_bottom 为 True（用户未手动滚动/已滚回底部）
@@ -9497,22 +7904,19 @@ class AssistantApp:
 
     def _safe_sid(self, sid):
         """净化会话 ID：仅允许 [0-9a-zA-Z_-]，杜绝快照/会话文件中的恶意 id 逃逸 SESSIONS_DIR。"""
-        return re.sub(r"[^0-9a-zA-Z_-]", "", str(sid or ""))
+        return _safe_sid(sid)
 
     def _session_id(self, session):
-        if not session.get("id"):
-            import uuid
+        return _session_id_impl(session)
 
-            session["id"] = uuid.uuid4().hex[:12]
-        return self._safe_sid(session["id"])
-
-    def save_session_to_file(self, session):
+    def save_session_to_file(self, session, wait=False):
         """把会话完整写入 SESSIONS_DIR/<id>.json（懒加载的数据源）。
 
         消息列表先在主线程浅拷贝快照（防后台线程写盘期间被 worker 追加），
         序列化 + 写盘移入后台线程，切会话不再冻结 UI。
+        wait=True 时同步写盘（退出路径使用，保证数据落盘后再销毁窗口）。
         """
-        if session.get("ephemeral"):
+        if self.cfg.get("privacy_mode") or session.get("ephemeral"):
             return
         if not session.get("messages"):
             return
@@ -9532,9 +7936,12 @@ class AssistantApp:
                 "ephemeral": bool(session.get("ephemeral")),
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
             }
-            threading.Thread(
-                target=self._write_session_async, args=(sid, data), daemon=True
-            ).start()
+            if wait:
+                self._write_session_async(sid, data)
+            else:
+                threading.Thread(
+                    target=self._write_session_async, args=(sid, data), daemon=True
+                ).start()
         except Exception:
             logging.exception("保存会话文件失败")
 
@@ -9644,108 +8051,8 @@ class AssistantApp:
         return session
 
     def show_history_sessions(self):
-        t = self._theme()
-        state = {"items": []}
-        dialog, body, footer = self._dialog_shell(
-            "历史会话库", 580, 460,
-            subtitle="所有会话按需落盘，点击载入完整消息；Ctrl/Shift 多选可批量删除",
-        )
-        listbox = tk.Listbox(
-            body,
-            width=66,
-            selectmode="extended",
-            bg=t["input_bg"],
-            fg=t["input_fg"],
-            selectbackground=t["selection"],
-            selectforeground=t["accent_text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=t["border"],
-            highlightcolor=t["accent"],
-            exportselection=False,
-        )
-        listbox.pack(fill="both", expand=True)
-        listbox.insert("end", "正在加载历史会话…")
-        hint = self._lbl(
-            body,
-            "提示：Ctrl/Shift 或鼠标框选可多选，支持批量删除",
-            role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-        )
-        hint.pack(anchor="w", pady=(4, 0))
-
-        def reload():
-            listbox.delete(0, "end")
-            listbox.insert("end", "正在加载历史会话…")
-
-            def worker():
-                try:
-                    state["items"] = self.list_saved_sessions()
-                except Exception:
-                    state["items"] = []
-                    logging.exception("扫描历史会话失败")
-                self._ui_queue.put(("history_loaded", (dialog, listbox, state)))
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        def load_selected():
-            items = state["items"]
-            sel = listbox.curselection()
-            if not sel or not items:
-                return
-            if len(sel) > 1:
-                messagebox.showinfo("提示", "载入仅支持单选，请只选择一个会话。")
-                return
-            it = items[sel[0]]
-            if self._current.get("id") == it["id"]:
-                messagebox.showinfo("提示", "该会话已在当前列表中。")
-                return
-            if self.busy:
-                messagebox.showinfo("提示", "请先停止当前生成。")
-                return
-            if self.load_session_from_file(it["id"]):
-                dialog.destroy()
-
-        def toggle_select_all():
-            items = state["items"]
-            if not items:
-                return
-            if listbox.curselection() and len(listbox.curselection()) == len(items):
-                listbox.selection_clear(0, "end")
-            else:
-                listbox.selection_set(0, "end")
-
-        def delete_selected():
-            items = state["items"]
-            sel = listbox.curselection()
-            if not sel or not items:
-                return
-            if len(sel) == 1:
-                it = items[sel[0]]
-                if not messagebox.askyesno(
-                    "删除历史会话", f"确认删除会话「{it['name']}」？"
-                ):
-                    return
-            else:
-                if not messagebox.askyesno(
-                    "批量删除",
-                    f"确认删除选中的 {len(sel)} 个历史会话？此操作不可恢复。",
-                ):
-                    return
-            deleted = 0
-            for idx in reversed(sel):
-                it = items[idx]
-                if self.delete_session_file(it["id"]):
-                    deleted += 1
-            self._flash_status(f"已删除 {deleted} 个历史会话")
-            reload()
-
-        listbox.bind("<Double-1>", lambda e: load_selected())
-        self._footer_btn(footer, "关闭", dialog.destroy)
-        self._footer_btn(footer, "批量删除", delete_selected)
-        self._footer_btn(footer, "全选/取消", toggle_select_all)
-        self._footer_btn(footer, "载入选中", load_selected, primary=True)
-
-        reload()
+        """历史会话库：查看/载入/批量删除历史会话。"""
+        dialogs.show_history_sessions(self)
 
     def _show_history_loaded(self, dialog, listbox, state):
         try:
@@ -9769,6 +8076,8 @@ class AssistantApp:
         每轮都写会让长会话操作期间的主线程反复卡顿。10s 空闲窗口内多次
         触发只写一次；退出（on_close）时必定立即写，数据不丢。
         """
+        if self.cfg.get("privacy_mode") or self._current.get("ephemeral"):
+            return
         if getattr(self, "_snapshot_after", None) is not None:
             try:
                 self.root.after_cancel(self._snapshot_after)
@@ -9780,6 +8089,9 @@ class AssistantApp:
 
     def _save_snapshot_now(self):
         self._snapshot_after = None
+        if self.cfg.get("privacy_mode") or self._current.get("ephemeral"):
+            self._snapshot_dirty = False
+            return
         try:
             # 无实际变更（仅进入空闲而未发送/未完成）时跳过双文件序列化写盘
             if not getattr(self, "_snapshot_dirty", True):
@@ -9878,7 +8190,7 @@ class AssistantApp:
         self.usage_total = {"prompt": 0, "completion": 0, "cache_hit": 0, "cache_miss": 0}
         self._ctx_counts = None  # 新会话重新计数
         self.last_usage = None
-        self._pending_send = None
+        self._pending_sends = []
         self._needs_compression = False
         self._round_aborted = False
         self._resend_index = None
@@ -9959,7 +8271,7 @@ class AssistantApp:
             self._flash_status("输入为空，未发送")
             return
         if self.busy:
-            self._pending_send = text
+            self._pending_sends.append(text)
             self.input_text.delete("1.0", "end")
             if self.stop_event:
                 self.stop_event.set()
@@ -10188,6 +8500,7 @@ class AssistantApp:
             self._stream_start = self.chat_text.index("end-1c")
             self._stream_block_start = len(self.blocks)
         self._agent_tool_count = 0
+        self._auto_ckpt_tools = []  # 每轮开始重置，避免跨轮次无限累积
         self._last_stream_activity = time.monotonic()
         self._stream_begin = time.monotonic()
         self._thinking_received = False
@@ -10266,156 +8579,194 @@ class AssistantApp:
         try:
             while True:
                 kind, payload = self._ui_queue.get_nowait()
-                if kind == "reasoning":
-                    self._pending["thinking"] += payload
-                    self._thinking_received = True
-                    self._last_stream_activity = time.monotonic()
-                elif kind == "content":
-                    self._pending["content"] += payload
-                    self._last_stream_activity = time.monotonic()
-                elif kind == "tool":
-                    self._pending_tools.append(payload)
-                    self._agent_tool_count += 1
-                    self._last_stream_activity = time.monotonic()
-                    if self.busy:
-                        try:
-                            tname = payload[0]
-                            tres = payload[2]
-                        except Exception:
-                            tname, tres = "工具", ""
-                        self.status_label.configure(
-                            text=f"⚙ 正在执行「{tname}」（第 {self._agent_tool_count} 个）…"
-                        )
-                        if str(tres).startswith(_dc.TOOL_RESULT_FAIL_PREFIXES):
-                            self._flash_status(f"⚠ 工具「{tname}」执行失败，AI 正在修正…", 4000)
-                        if self.task_panel is not None:
-                            self.task_panel.add_tool(tname, tres)
-                elif kind == "tool_dur":
-                    self._pending_tool_durations.append(payload)
-                elif kind == "loop_guard":
-                    name, repeats = payload
-                    note = (
-                        f"[工具循环防护] 检测到 {name} 连续重复调用 {repeats} 次，"
-                        "已终止工具循环，请检查 Agent 行为。\n"
-                    )
-                    self._show_note(note)
-                elif kind == "ask":
-                    prompt, ev, box = payload
-                    self._show_ask_dialog(prompt, ev, box)
-                elif kind == "whitelist_req":
-                    action_type, value, ev, box = payload
-                    self._show_whitelist_dialog(action_type, value, ev, box)
-                elif kind == "usage":
-                    self._apply_usage(payload)
-                elif kind == "remap_idx":
-                    self._remap_blocks_after_compress(payload)
-                elif kind == "begin":
-                    self._begin_assistant(bool(payload))
-                elif kind == "error":
-                    self._show_error(payload)
-                elif kind == "balance":
-                    self._show_balance(payload)
-                elif kind == "info":
-                    self._show_note(payload)
-                elif kind == "truncated":
-                    # 截断/中断原因（_push_truncated 已置 _round_aborted；此处补充可见提示）
-                    if payload:
-                        self._show_note(f"⚠ {payload}。本轮生成未正常完成，可重新发送或继续生成。")
-                elif kind == "round_error":
-                    self._round_aborted = True
-                elif kind == "balance_done":
-                    self.btn_balance.configure(state="normal")
-                elif kind == "update":
-                    self._handle_update_result(payload)
-                elif kind == "update_downloaded":
-                    ok, detail = payload
-                    if ok:
-                        if messagebox.askyesno(
-                            "下载完成",
-                            f"新版安装包已下载：\n{detail}\n\n"
-                            "关闭鲸语后运行该文件即可完成更新。\n打开所在文件夹？",
-                        ):
-                            try:
-                                os.startfile(os.path.dirname(detail))
-                            except Exception:
-                                pass
-                    else:
-                        messagebox.showerror(
-                            "下载失败", f"更新包下载失败：{detail}\n可前往官网手动下载。"
-                        )
-                elif kind == "search_all_done":
-                    self._show_search_results(payload)
-                elif kind == "history_loaded":
-                    self._show_history_loaded(*payload)
-                elif kind == "knowledge_done":
-                    self._on_knowledge_done(payload)
-                elif kind == "summary_done":
-                    self._on_summary_done(payload)
-                elif kind == "export_done":
-                    self._show_export_done(payload)
-                elif kind == "approval_req":
-                    self._show_approval_dialog(*payload)
-                elif kind == "plan_req":
-                    self._show_plan_dialog(*payload)
-                elif kind == "ocr":
-                    self._ocr_result(payload)
-                elif kind == "timer_task":
-                    self.send(text=payload, silent=True)
-                elif kind == "schedule_notify":
-                    self._flash_status(f"⏰ {payload}", 6000)
-                    # Webhook 推送是同步 HTTP（最长 10s），放后台线程防主线程卡顿
-                    def _push():
-                        try:
-                            import deepseek_client as _dc2
-                            _dc2.send_webhook_notify(payload)
-                        except Exception:
-                            pass
-
-                    threading.Thread(target=_push, daemon=True).start()
-                elif kind == "proc_out":
-                    self._proc_panel_append(*payload)
-                elif kind == "tray":
-                    try:
-                        if payload == "show":
-                            self.root.deiconify()
-                            self.root.lift()
-                            self.root.focus_force()
-                        elif payload == "hide":
-                            self.root.withdraw()
-                        elif payload == "quit":
-                            self._quit_from_tray = True
-                            self.on_close()
-                    except tk.TclError:
-                        pass
-                elif kind == "fim_done":
-                    ok, res = payload
-                    w = getattr(self, "_fim_widgets", None)
-                    if w is not None:
-                        rt, sl, th = w
-                        try:
-                            if rt.winfo_exists():
-                                rt.delete("1.0", "end")
-                                if ok:
-                                    rt.insert("1.0", res)
-                                sl.configure(
-                                    text=("完成（最大补全 4K）" if ok else f"失败: {res}"),
-                                    fg=th["error"] if not ok else th["text_sec"],
-                                )
-                        except tk.TclError:
-                            pass
-                elif kind == "finish":
-                    try:
-                        self._finish()
-                    except Exception:
-                        # _finish 中途异常（如渲染索引错误）也不能让 busy 卡死：
-                        # 否则发送/停止/切换全部被 busy 守卫拦截，只能重启
-                        logging.exception("生成结束处理异常")
-                        try:
-                            self._set_busy(False)
-                        except Exception:
-                            pass
+                try:
+                    self._handle_queue_item(kind, payload)
+                except Exception:
+                    # 单个坏消息不能中断整个 drain：否则后续 finish/流式内容
+                    # 永远无人消费，busy 恒为 True，界面假死只能重启
+                    logging.exception("处理 UI 队列消息失败: %s", kind)
         except queue.Empty:
             pass
+
+    def _handle_queue_item(self, kind, payload):
+        if kind == "reasoning":
+            self._pending["thinking"] += payload
+            self._thinking_received = True
+            self._last_stream_activity = time.monotonic()
+        elif kind == "content":
+            self._pending["content"] += payload
+            self._last_stream_activity = time.monotonic()
+        elif kind == "tool":
+            self._pending_tools.append(payload)
+            self._agent_tool_count += 1
+            self._last_stream_activity = time.monotonic()
+            if self.busy:
+                try:
+                    tname = payload[0]
+                    tres = payload[2]
+                except Exception:
+                    tname, tres = "工具", ""
+                self.status_label.configure(
+                    text=f"⚙ 正在执行「{tname}」（第 {self._agent_tool_count} 个）…"
+                )
+                if str(tres).startswith(_dc.TOOL_RESULT_FAIL_PREFIXES):
+                    self._flash_status(f"⚠ 工具「{tname}」执行失败，AI 正在修正…", 4000)
+                if self.task_panel is not None:
+                    self.task_panel.add_tool(tname, tres)
+        elif kind == "tool_dur":
+            self._pending_tool_durations.append(payload)
+        elif kind == "loop_guard":
+            name, repeats = payload
+            note = (
+                f"[工具循环防护] 检测到 {name} 连续重复调用 {repeats} 次，"
+                "已终止工具循环，请检查 Agent 行为。\n"
+            )
+            self._show_note(note)
+        elif kind == "ask":
+            prompt, ev, box = payload
+            self._show_ask_dialog(prompt, ev, box)
+        elif kind == "whitelist_req":
+            action_type, value, ev, box = payload
+            self._show_whitelist_dialog(action_type, value, ev, box)
+        elif kind == "usage":
+            self._apply_usage(payload)
+        elif kind == "remap_idx":
+            self._remap_blocks_after_compress(payload)
+        elif kind == "begin":
+            self._begin_assistant(bool(payload))
+        elif kind == "error":
+            self._show_error(payload)
+        elif kind == "balance":
+            self._show_balance(payload)
+        elif kind == "flash":
+            self._flash_status(payload)
+        elif kind == "info":
+            self._show_note(payload)
+        elif kind == "truncated":
+            # 截断/中断原因（_push_truncated 已置 _round_aborted；此处补充可见提示）
+            if payload:
+                self._show_note(f"⚠ {payload}。本轮生成未正常完成，可重新发送或继续生成。")
+        elif kind == "round_error":
+            self._round_aborted = True
+        elif kind == "balance_done":
+            self.btn_balance.configure(state="normal")
+        elif kind == "update":
+            self._handle_update_result(payload)
+        elif kind == "update_downloaded":
+            ok, detail = payload
+            if ok:
+                if messagebox.askyesno(
+                    "下载完成",
+                    f"新版安装包已下载：\n{detail}\n\n"
+                    "关闭鲸语后运行该文件即可完成更新。\n打开所在文件夹？",
+                ):
+                    try:
+                        os.startfile(os.path.dirname(detail))
+                    except Exception:
+                        pass
+            else:
+                messagebox.showerror(
+                    "下载失败", f"更新包下载失败：{detail}\n可前往官网手动下载。"
+                )
+        elif kind == "plugin_market":
+            ok, data = payload
+            if ok:
+                if hasattr(self, "_hub_market_render"):
+                    self._hub_market_render(data)
+                else:
+                    self._flash_status("插件市场已加载")
+            else:
+                self._flash_status(f"插件市场加载失败：{data}", 5000)
+        elif kind == "plugin_market_downloaded":
+            ok, detail, entry = payload
+            if ok:
+                try:
+                    if self._install_plugin_file(detail):
+                        self._flash_status(f"✅ 市场插件「{entry.get('name', '')}」已安装")
+                finally:
+                    try:
+                        os.remove(detail)
+                    except OSError:
+                        pass
+                self._hub_refresh_installed()
+                if hasattr(self, "_hub_market_refresh"):
+                    try:
+                        self._hub_market_refresh()
+                    except Exception:
+                        pass
+            else:
+                messagebox.showerror("插件下载失败", str(detail))
+        elif kind == "search_all_done":
+            self._show_search_results(payload)
+        elif kind == "history_loaded":
+            self._show_history_loaded(*payload)
+        elif kind == "knowledge_done":
+            self._on_knowledge_done(payload)
+        elif kind == "summary_done":
+            self._on_summary_done(payload)
+        elif kind == "export_done":
+            self._show_export_done(payload)
+        elif kind == "approval_req":
+            self._show_approval_dialog(*payload)
+        elif kind == "plan_req":
+            self._show_plan_dialog(*payload)
+        elif kind == "ocr":
+            self._ocr_result(payload)
+        elif kind == "timer_task":
+            self.send(text=payload, silent=True)
+        elif kind == "schedule_notify":
+            self._flash_status(f"⏰ {payload}", 6000)
+            # Webhook 推送是同步 HTTP（最长 10s），放后台线程防主线程卡顿
+            def _push():
+                try:
+                    import deepseek_client as _dc2
+                    _dc2.send_webhook_notify(payload)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_push, daemon=True).start()
+        elif kind == "proc_out":
+            self._proc_panel_append(*payload)
+        elif kind == "tray":
+            try:
+                if payload == "show":
+                    self.root.deiconify()
+                    self.root.lift()
+                    self.root.focus_force()
+                elif payload == "hide":
+                    self.root.withdraw()
+                elif payload == "quit":
+                    self._quit_from_tray = True
+                    self.on_close()
+            except tk.TclError:
+                pass
+        elif kind == "fim_done":
+            ok, res = payload
+            w = getattr(self, "_fim_widgets", None)
+            if w is not None:
+                rt, sl, th = w
+                try:
+                    if rt.winfo_exists():
+                        rt.delete("1.0", "end")
+                        if ok:
+                            rt.insert("1.0", res)
+                        sl.configure(
+                            text=("完成（最大补全 4K）" if ok else f"失败: {res}"),
+                            fg=th["error"] if not ok else th["text_sec"],
+                        )
+                except tk.TclError:
+                    pass
+        elif kind == "finish":
+            try:
+                self._finish()
+            except Exception:
+                # _finish 中途异常（如渲染索引错误）也不能让 busy 卡死：
+                # 否则发送/停止/切换全部被 busy 守卫拦截，只能重启
+                logging.exception("生成结束处理异常")
+                try:
+                    self._set_busy(False)
+                except Exception:
+                    pass
 
     def _poll_ui(self):
         try:
@@ -10753,7 +9104,7 @@ class AssistantApp:
                 if blk[0] == "content" and len(blk) > 2 and blk[2] is None:
                     self.blocks[i] = (blk[0], blk[1], msg_idx)
         # 打断重发场景：send() 已提示「已打断当前生成，结束后自动发送」，不再重复
-        if self.stop_event and self.stop_event.is_set() and not self._pending_send:
+        if self.stop_event and self.stop_event.is_set() and not self._pending_sends:
             self._append("\n[已停止生成]\n", "error")
             self.blocks.append(("error", "\n[已停止生成]\n"))
         self._append("\n")
@@ -10902,10 +9253,11 @@ class AssistantApp:
         self._update_context_bar()
         self._flush_stats()
         self._maybe_save_snapshot()
-        if self._pending_send:
-            text = self._pending_send
-            self._pending_send = None
-            self.send(text=text)
+        if self._pending_sends:
+            pending = list(self._pending_sends)
+            self._pending_sends = []
+            for text in pending:
+                self.send(text=text)
 
     def _insert_content(self, text, payload, tag, msg_idx, last_code_blocks, pos):
         pos = text.index(pos)
@@ -11304,7 +9656,9 @@ class AssistantApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _handle_update_result(self, payload):
-        latest, url = payload
+        latest = payload[0]
+        url = payload[1]
+        meta = payload[2] if len(payload) > 2 else {}
 
         def parse(v):
             try:
@@ -11332,7 +9686,11 @@ class AssistantApp:
                     threading.Thread(target=do_backup, daemon=True).start()
                     if url.lower().endswith((".exe", ".zip", ".7z", ".msi")):
                         # 直链安装包：应用内下载到下载目录（进度可见）
-                        self._download_update(latest, url)
+                        self._download_update(
+                            latest, url,
+                            sha256=str(meta.get("sha256") or "").strip().lower(),
+                            signature=str(meta.get("signature") or "").strip(),
+                        )
                     else:
                         webbrowser.open(url)
             else:
@@ -11340,8 +9698,12 @@ class AssistantApp:
         else:
             self._show_note(f"[更新] 当前已是最新版本 {VERSION}。")
 
-    def _download_update(self, version, url):
-        """下载新版安装包到用户下载目录（后台线程，完成经队列提示）。"""
+    def _download_update(self, version, url, sha256="", signature=""):
+        """下载新版安装包到用户下载目录（后台线程，完成经队列提示）。
+
+        下载后若更新源提供 sha256 则强制校验（防篡改/不完整下载）；
+        signature 字段与 update_public_key 配置存在时，额外尝试 Ed25519/RSA 签名校验。
+        """
         self._flash_status(f"正在下载 v{version} 安装包…")
         try:
             from urllib.parse import urlparse
@@ -11364,6 +9726,18 @@ class AssistantApp:
                             if total > 2 * 1024 * 1024 * 1024:
                                 raise RuntimeError("安装包超过 2GB，已放弃")
                             f.write(chunk)
+                # 哈希/签名校验：防止下载被篡改或不完整
+                if sha256:
+                    import hashlib
+                    h = hashlib.sha256()
+                    with open(path, "rb") as f:
+                        for chunk in iter(lambda: f.read(64 * 1024), b""):
+                            h.update(chunk)
+                    if h.hexdigest() != sha256:
+                        os.remove(path)
+                        raise ValueError("SHA-256 校验失败，安装包可能被篡改或下载不完整")
+                if signature and self.cfg.get("update_public_key"):
+                    self._verify_update_signature(path, signature, self.cfg["update_public_key"])
                 self._ui_queue.put(("update_downloaded", (True, path)))
             except Exception as e:
                 logging.exception("更新包下载失败")
@@ -11371,109 +9745,37 @@ class AssistantApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _verify_update_signature(self, path, signature_b64, public_key_pem):
+        """校验更新包签名（Ed25519 或 RSA-SHA256）；失败抛异常并删除文件。"""
+        import base64
+        try:
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ed25519, padding
+
+            pub = serialization.load_pem_public_key(str(public_key_pem).encode())
+            with open(path, "rb") as f:
+                data = f.read()
+            sig = base64.b64decode(str(signature_b64).strip())
+            if isinstance(pub, ed25519.Ed25519PublicKey):
+                pub.verify(sig, data)
+            else:
+                pub.verify(sig, data, padding.PKCS1v15(), hashes.SHA256())
+        except ImportError:
+            os.remove(path)
+            raise ValueError("已配置更新签名公钥，但缺少 cryptography 库，无法校验签名")
+        except Exception as e:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise ValueError(f"更新包签名校验失败: {e}")
+
     def _show_balance(self, data):
         """余额查询结果：品牌对话框展示（替代系统 messagebox）。"""
-        t = self._theme()
-        dialog, body, footer = self._dialog_shell("余额查询", 460, 320, subtitle="DeepSeek 账户余额")
-        self._lbl(
-            body, "账户状态: " + ("✅ 可用" if data.get("is_available") else "❌ 不可用"),
-            role="label_accent" if data.get("is_available") else "label_error",
-            bg="panel", font=(FONT_FAMILY, 11, "bold"),
-        ).pack(anchor="w", pady=(0, 10))
-        for info in data.get("balance_infos", []):
-            card = tk.Frame(body, bg=t["surface"], padx=12, pady=10)
-            card.pack(fill="x", pady=4)
-            self._restyle.append((card, "surface"))
-            self._lbl(
-                card, f"总余额 ¥{info.get('total_balance')}",
-                bg="surface", font=(FONT_FAMILY, 12, "bold"),
-            ).pack(anchor="w")
-            self._lbl(
-                card,
-                f"赠送 ¥{info.get('granted_balance')} · 充值 ¥{info.get('topped_up_balance')}",
-                role="label_sec", bg="surface", font=(FONT_FAMILY, 9),
-            ).pack(anchor="w", pady=(2, 0))
-        self._footer_btn(footer, "关闭", dialog.destroy)
+        dialogs.show_balance(self, data)
 
     def show_stats(self):
-        t = self._theme()
-        data = stats.load_stats(STATS_PATH)
-        today = date.today().isoformat()
-        today_usage = stats.day_total(data, today)
-        month_key = date.today().strftime("%Y-%m")
-        month_usage = stats.empty_day()
-        for day, models in data.items():
-            if day.startswith(month_key):
-                for usage in models.values():
-                    for key in month_usage:
-                        month_usage[key] += usage.get(key, 0)
-        total_usage = stats.all_total(data)
-        today_cost = sum(
-            stats.estimate_cost(usage, model)
-            for model, usage in (data.get(today) or {}).items()
-        )
-        month_cost = sum(
-            stats.estimate_cost(usage, model)
-            for day, models in data.items()
-            if day.startswith(month_key)
-            for model, usage in models.items()
-        )
-        total_cost = sum(
-            stats.estimate_cost(usage, model)
-            for models in data.values()
-            for model, usage in models.items()
-        )
-        savings = 0.0
-        for models in data.values():
-            for model, usage in models.items():
-                price = stats.pricing().get(model, stats.DEFAULT_PRICE)
-                savings += (
-                    usage.get("cache_hit", 0) * (price["prompt"] - price["cache_hit"])
-                    / 1_000_000
-                )
-
-        def fmt(u, cost):
-            hit = u["cache_hit"]
-            miss = u["cache_miss"]
-            ratio = f"缓存占比 {hit / (hit + miss):.0%}" if (hit + miss) else "缓存占比 -"
-            return (
-                f"输入 {u['prompt']:,} (命中 {hit:,} / 未命中 {miss:,} · {ratio})\n"
-                f"输出 {u['completion']:,}  |  预估费用 ¥{stats.format_cost(cost)}"
-            )
-
-        # 品牌对话框展示（替代系统 messagebox）
-        dialog, body, footer = self._dialog_shell("用量统计", 520, 460, subtitle="按天/月/累计汇总 · 含缓存节省估算")
-        scroll_wrap = tk.Frame(body, bg=t["panel"])
-        scroll_wrap.pack(fill="both", expand=True)
-        self._restyle.append((scroll_wrap, "panel"))
-
-        def section(title, usage, cost):
-            self._lbl(scroll_wrap, title, role="label_accent", bg="panel",
-                      font=(FONT_FAMILY, 10, "bold")).pack(anchor="w", pady=(8, 2))
-            self._lbl(scroll_wrap, fmt(usage, cost), bg="panel",
-                      font=(FONT_FAMILY, 9)).pack(anchor="w", padx=(12, 0))
-
-        section(f"今日 ({today})", today_usage, today_cost)
-        section(f"本月 ({month_key})", month_usage, month_cost)
-        section("累计", total_usage, total_cost)
-        self._lbl(
-            scroll_wrap, f"💰 缓存节省 ≈ ¥{stats.format_cost(savings)}（未命中价差估算）",
-            role="label_accent", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-        ).pack(anchor="w", pady=(10, 2))
-        if data:
-            self._lbl(scroll_wrap, "各模型累计:", role="label_sec", bg="panel",
-                      font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", pady=(6, 2))
-            for model in sorted({mdl for models in data.values() for mdl in models}):
-                mu = stats.model_total(data, model)
-                mc = stats.estimate_cost(mu, model)
-                self._lbl(
-                    scroll_wrap,
-                    f"· {model}: 输入 {mu['prompt']:,} / 输出 {mu['completion']:,} ≈ ¥{stats.format_cost(mc)}",
-                    bg="panel", font=(FONT_FAMILY, 9),
-                ).pack(anchor="w", padx=(12, 0))
-            self._lbl(scroll_wrap, f"统计文件: {STATS_PATH}", role="label_sec", bg="panel",
-                      font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(8, 0))
-        self._footer_btn(footer, "关闭", dialog.destroy)
+        dialogs.show_stats(self)
 
     def _estimate_context_tokens(self):
         return tokens.estimate_messages_tokens(self.messages)
@@ -11502,11 +9804,12 @@ class AssistantApp:
             self.blocks.append(("note", note))
 
     def _estimate_chars(self):
-        total = 0
-        for m in self.messages:
-            total += len(m.get("content") or "")
-            total += len(m.get("reasoning_content") or "")
-        return total
+        with self._messages_lock:
+            total = 0
+            for m in self.messages:
+                total += len(m.get("content") or "")
+                total += len(m.get("reasoning_content") or "")
+            return total
 
     def _trim_context(self, counts=None):
         # 整个裁剪流程持锁：worker 线程内唯一的 messages 复合写操作，
@@ -11784,7 +10087,8 @@ class AssistantApp:
         if not cfg["api_key"]:
             messagebox.showwarning("未配置 API Key", "请先填写 DeepSeek API Key。")
             return
-        msgs = [m for m in self.messages if m.get("role") != "system"]
+        with self._messages_lock:
+            msgs = [m for m in self.messages if m.get("role") != "system"]
         if len(msgs) < 2:
             messagebox.showinfo("提示", "会话内容太少，暂无可生成的纪要。")
             return
@@ -11949,11 +10253,9 @@ class AssistantApp:
         wd = self._get_active_dir()
         wd_short = wd if len(wd) <= 28 else "…" + wd[-27:]
         # 左段：模式 + 工作目录 + 本轮/累计 + 预算/高峰（信息密度最高的部分）
-        self.status_label.configure(
-            text=(
-                f"{privacy}{auto}{chat}📁 {wd_short} | {cur_str} | {total_str}{budget_str}{peak}"
-            )
-        )
+        status_text = f"{privacy}{auto}{chat}📁 {wd_short} | {cur_str} | {total_str}{budget_str}{peak}"
+        self._status_normal = status_text
+        self.status_label.configure(text=status_text)
         # 右段：模型 / 角色 / 场景 / 思考档位（角色 = 当前生效人格，状态全程可见）
         role_name = self._current_role_name(self.cfg.get("system_prompt", ""))
         self.status_right.configure(
@@ -12120,84 +10422,8 @@ class AssistantApp:
         self._flash_status("未找到可替换的回复")
 
     def show_variants(self):
-        t = self._theme()
-        variants = self._current.get("variants") or []
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        dialog.title(f"回复变体（{self._session_display_name(self._current)}）")
-        dialog.geometry("620x420")
-        dialog.transient(self.root)
-
-        left = tk.Frame(dialog, bg=t["panel"])
-        left.pack(side="left", fill="y", padx=(12, 6), pady=12)
-        self._restyle.append((left, "panel"))
-        listbox = tk.Listbox(
-            left,
-            width=16,
-            bg=t["input_bg"],
-            fg=t["input_fg"],
-            selectbackground=t["selection"],
-            selectforeground=t["accent_text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=t["border"],
-            highlightcolor=t["accent"],
-            exportselection=False,
-        )
-        listbox.pack(fill="both", expand=True)
-        for i in range(len(variants)):
-            listbox.insert("end", f"第 {i + 1} 版")
-
-        right = tk.Frame(dialog, bg=t["panel"])
-        right.pack(side="left", fill="both", expand=True, padx=(6, 12), pady=12)
-        self._restyle.append((right, "panel"))
-        viewer = tk.Text(
-            right,
-            wrap="word",
-            bg=t["input_bg"],
-            fg=t["input_fg"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=t["border"],
-            highlightcolor=t["accent"],
-            padx=10,
-            pady=8,
-        )
-        viewer.pack(fill="both", expand=True)
-        if not variants:
-            viewer.insert("1.0", "暂无变体。\n\n使用「编辑 → 生成变体」保存回复版本。")
-
-        def select_item(_e=None):
-            sel = listbox.curselection()
-            if not sel:
-                return
-            viewer.delete("1.0", "end")
-            viewer.insert("1.0", variants[sel[0]])
-
-        def restore_item():
-            sel = listbox.curselection()
-            if not sel or not variants:
-                return
-            self._replace_last_reply(variants[sel[0]])
-            dialog.destroy()
-
-        def copy_item():
-            sel = listbox.curselection()
-            if not sel or not variants:
-                return
-            self.root.clipboard_clear()
-            self.root.clipboard_append(variants[sel[0]])
-            self._flash_status("已复制该版本")
-
-        listbox.bind("<<ListboxSelect>>", select_item)
-        bar = tk.Frame(right, bg=t["panel"])
-        bar.pack(fill="x", pady=(8, 0))
-        self._restyle.append((bar, "panel"))
-        self._mk_button(bar, "恢复此版本", restore_item, kind="primary", fsz=9).pack(side="left")
-        self._mk_button(bar, "复制", copy_item, fsz=9).pack(side="left", padx=(6, 0))
-        self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right")
-        if variants:
-            listbox.selection_set(0)
-            select_item()
+        """回复变体：查看/恢复/复制已保存的回复版本。"""
+        dialogs.show_variants(self)
 
     def copy_last_code(self):
         last_code_blocks = self._current.get("last_code_blocks") or []
@@ -12245,7 +10471,9 @@ class AssistantApp:
 
     def _flash_status(self, msg, ms=1600):
         try:
-            old = self.status_label.cget("text")
+            old = getattr(self, "_status_normal", None)
+            if old is None:
+                old = self.status_label.cget("text")
         except Exception:
             old = ""
         self.status_label.configure(text=msg)
@@ -12295,8 +10523,10 @@ class AssistantApp:
             return None
         r0, r1 = found[0]
         content = text.get(r0, r1).rstrip()
-        for i in range(len(self.messages) - 1, 0, -1):
-            msg = self.messages[i]
+        with self._messages_lock:
+            msgs = list(self.messages)
+        for i in range(len(msgs) - 1, 0, -1):
+            msg = msgs[i]
             if msg.get("role") == "user" and (msg.get("content") or "") == content:
                 return i
         if found[1] == "assistant":
@@ -12346,103 +10576,8 @@ class AssistantApp:
         self._flash_status("已收藏消息")
 
     def show_stars(self):
-        stars = self._current.get("stars") or []
-        t = self._theme()
-        dialog, body, footer = self._dialog_shell(
-            f"收藏消息（{self._session_display_name(self._current)}）", 620, 420,
-            subtitle="聊天区右键消息选择「☆ 收藏此消息」；左侧列表点击查看，双击跳转",
-        )
-        left = tk.Frame(body, bg=t["panel"])
-        left.pack(side="left", fill="y", padx=(0, 8))
-        self._restyle.append((left, "panel"))
-        listbox = tk.Listbox(
-            left,
-            width=24,
-            bg=t["input_bg"],
-            fg=t["input_fg"],
-            selectbackground=t["selection"],
-            selectforeground=t["accent_text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=t["border"],
-            highlightcolor=t["accent"],
-            exportselection=False,
-        )
-        listbox.pack(fill="both", expand=True)
-        for star in stars:
-            content = star.get("content") or ""
-            preview = " ".join(content.split())[:20] or "（空消息）"
-            tag = "用户" if star.get("role") == "user" else "助手"
-            listbox.insert("end", f"[{tag}] {preview}")
-        right = tk.Frame(body, bg=t["panel"])
-        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        self._restyle.append((right, "panel"))
-        text = tk.Text(
-            right,
-            wrap="word",
-            bg=t["input_bg"],
-            fg=t["input_fg"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=t["border"],
-            highlightcolor=t["accent"],
-            padx=12,
-            pady=10,
-        )
-        text.pack(fill="both", expand=True)
-        if not stars:
-            text.insert("1.0", "暂无收藏消息。\n\n在聊天区右键任意消息，选择「☆ 收藏此消息」。")
-        text.configure(state="disabled")
-
-        def show_detail(_e=None):
-            sel = listbox.curselection()
-            text.configure(state="normal")
-            text.delete("1.0", "end")
-            if not sel or not stars:
-                text.insert("1.0", "（选择左侧列表查看详情）" if stars else "暂无收藏消息。")
-            else:
-                star = stars[sel[0]]
-                tag = "用户" if star.get("role") == "user" else "助手"
-                text.insert("end", f"【{tag}】{star.get('time', '')}\n\n")
-                text.insert("end", star.get("content") or "")
-            text.configure(state="disabled")
-
-        def copy_stars():
-            lines = []
-            for star in stars:
-                tag = "用户" if star.get("role") == "user" else "助手"
-                lines.append(f"【{tag}】{star.get('time', '')}\n{star.get('content')}")
-            self.root.clipboard_clear()
-            self.root.clipboard_append("\n\n".join(lines))
-            self._flash_status("已复制收藏内容")
-
-        def jump_to_star():
-            sel = listbox.curselection()
-            if not sel or not stars:
-                return
-            star = stars[sel[0]]
-            content = star.get("content")
-            role = star.get("role")
-            idx = next(
-                (
-                    i
-                    for i, m in enumerate(self.messages)
-                    if m.get("role") == role and m.get("content") == content
-                ),
-                None,
-            )
-            if idx is None:
-                self._flash_status("该消息已被删除，无法跳转")
-                return
-            dialog.destroy()
-            self.after(80, lambda: self._scroll_to_message(idx))
-
-        listbox.bind("<<ListboxSelect>>", show_detail)
-        listbox.bind("<Double-1>", lambda e: jump_to_star())
-        self._footer_btn(footer, "关闭", dialog.destroy)
-        self._footer_btn(footer, "复制全部", copy_stars)
-        self._footer_btn(footer, "跳转", jump_to_star, primary=True)
-        show_detail()
+        """收藏消息：查看/复制/跳转。"""
+        dialogs.show_stars(self)
 
     def _fork_from(self, msg_idx):
         if self.busy:
@@ -12693,87 +10828,13 @@ class AssistantApp:
         return items
 
     def show_session_timeline(self):
-        """会话轨迹：按时间顺序列出消息/思考/工具调用/系统事件的混合时间线，
-        双击/跳转定位到聊天区原文（Harness 式 Trajectory 的鲸语版）。"""
-        t = self._theme()
-        dialog, body, footer = self._dialog_shell(
-            "会话轨迹", 620, 480,
-            subtitle="完整轨迹：消息 + 思考 + 工具调用 + 系统事件；双击助手/用户行定位原文",
-        )
-        frame = tk.Frame(body, bg=t["panel"])
-        frame.pack(fill="both", expand=True)
-        self._restyle.append((frame, "panel"))
-        listbox = tk.Listbox(
-            frame, bg=t["input_bg"], fg=t["input_fg"],
-            selectbackground=t["selection"], selectforeground=t["accent_text"],
-            activestyle="none", relief="flat", borderwidth=0,
-            highlightthickness=0, font=(FONT_FAMILY, 9), exportselection=False,
-        )
-        sb = tk.Scrollbar(
-            frame, orient="vertical", command=listbox.yview,
-            relief="flat", bd=0, highlightthickness=0, width=10,
-        )
-        sb.pack(side="right", fill="y")
-        listbox.pack(side="left", fill="both", expand=True)
-        listbox.configure(yscrollcommand=sb.set)
-        sb.configure(
-            bg=t["disabled"], activebackground=t["text_sec"],
-            troughcolor=t["input_bg"],
-            highlightbackground=t["input_bg"], highlightcolor=t["input_bg"],
-        )
-        labels = self._timeline_items(self.blocks)
-        if len(labels) > 300:
-            labels = labels[-300:]
-        for _idx, text_, _j in labels:
-            listbox.insert("end", text_)
-        if not labels:
-            listbox.insert("end", "（会话暂无轨迹）")
-
-        def jump():
-            sel = listbox.curselection()
-            if not sel or sel[0] >= len(labels):
-                return
-            idx, _text, jumpl = labels[sel[0]]
-            if not jumpl or idx is None:
-                self._flash_status("该条目无原文可跳转（工具/事件/思考）")
-                return
-            dialog.destroy()
-            self._scroll_to_message(idx)
-
-        listbox.bind("<Double-1>", lambda e: jump())
-        listbox.bind("<Return>", lambda e: jump())
-        self._footer_hint(footer, f"{len(labels)} 个轨迹条目 · 消息/思考/工具/事件")
-        self._footer_btn(footer, "关闭", dialog.destroy)
-        self._footer_btn(footer, "跳转", jump, primary=True)
+        """会话轨迹：按时间顺序列出消息/思考/工具调用/系统事件，双击定位原文。"""
+        dialogs.show_session_timeline(self)
 
 
     def show_batch_task(self):
         """批量任务：多选文件 + 指令模板（{file} 占位），一次发送让 AI 逐个处理。"""
-        files = filedialog.askopenfilenames(
-            title="选择要批量处理的文件",
-            parent=self.root,
-            filetypes=[("所有文件", "*.*")],
-        )
-        if not files:
-            return
-        template = simpledialog.askstring(
-            "批量任务",
-            f"已选 {len(files)} 个文件。\n输入任务指令（用 {{{{file}}}} 表示每个文件路径）：\n"
-            "示例：读取 {file} 并总结要点",
-            parent=self.root,
-        )
-        if template is None or not template.strip():
-            return
-        file_list = "\n".join(f"- {p}" for p in files)
-        prompt = (
-            f"【批量任务】请对以下 {len(files)} 个文件逐个执行同一指令，每个文件都处理并单独汇报结果，不要遗漏。\n"
-            f"指令模板：{template.strip()}\n"
-            f"（模板中的 {{{{file}}}} 请替换为对应的文件完整路径）\n\n"
-            f"文件列表：\n{file_list}\n\n"
-            "请依次处理，逐个说明处理结果。"
-        )
-        self._clear_placeholder()
-        self.send(text=prompt)
+        dialogs.show_batch_task(self)
 
     @staticmethod
     def load_user_roles():
@@ -13178,120 +11239,7 @@ class AssistantApp:
 
     def show_command_palette(self):
         """命令面板（Ctrl+K）：输入过滤全部常用操作，Enter 执行。"""
-        t = self._theme()
-        if getattr(self, "_palette", None) is not None:
-            try:
-                if self._palette.winfo_exists():
-                    self._palette.destroy()
-            except tk.TclError:
-                pass
-            self._palette = None
-        dialog = tk.Toplevel(self.root, bg=t["panel"])
-        self._palette = dialog
-        dialog.title("命令面板")
-        dialog.overrideredirect(True)
-        dialog.transient(self.root)
-        dialog.geometry("420x360")
-        dialog.bind("<Escape>", lambda e: dialog.destroy())
-        entry = tk.Entry(
-            dialog, bg=t["input_bg"], fg=t["input_fg"], insertbackground=t["input_fg"],
-            relief="flat", highlightthickness=1, highlightbackground=t["border"],
-            highlightcolor=t["accent"], font=(FONT_FAMILY, 10),
-        )
-        entry.pack(fill="x", padx=10, pady=(10, 6))
-        hint = tk.Label(
-            dialog, text="Esc 关闭 · ↑/↓ 选择 · Enter 执行", bg=t["panel"],
-            fg=t["text_sec"], font=(FONT_FAMILY, 9),
-        )
-        hint.pack(anchor="e", padx=12, pady=(0, 2))
-        listbox = tk.Listbox(
-            dialog, bg=t["panel"], fg=t["text"],
-            selectbackground=t["selection"], selectforeground=t["accent_text"],
-            activestyle="none", relief="flat", borderwidth=0,
-            highlightthickness=0, font=(FONT_FAMILY, 9), exportselection=False,
-        )
-        listbox.pack(fill="both", expand=True, padx=6, pady=(0, 8))
-
-        actions = [
-            ("新会话", self.new_conversation),
-            ("新建临时会话", lambda: self.add_tab(ephemeral=True)),
-            ("生成会话纪要", self.generate_session_summary),
-            ("会话结构导航", self.show_session_timeline),
-            ("角色与提示词", self.show_roles),
-            ("切换主题", self.toggle_theme),
-            ("查余额", self.check_balance),
-            ("用量统计", self.show_stats),
-            ("预算设置", self.edit_budget),
-            ("上下文详情", self.show_context_details),
-            ("模型对比", self.compare_models),
-            ("工具设置", self.edit_tools),
-            ("权限设置", self.edit_permissions),
-            ("工作目录", self.choose_working_dir),
-            ("工作区文件树", self.show_workspace_tree),
-            ("最近产物", self.show_recent_outputs),
-            ("提示词库管理", self.manage_prompts),
-            ("定时任务", self.manage_schedules),
-            ("推送与数据库配置", self.show_external_config),
-            ("进程终端", self.show_process_terminal),
-            ("导出历史", self.export_history),
-            ("导入会话", self.import_session_file),
-            ("数据清理", self.show_cleanup),
-            ("关于", self.show_about),
-        ]
-
-        def refresh(_e=None):
-            q = entry.get().strip().lower()
-            listbox.delete(0, "end")
-            for label, _fn in actions:
-                if not q or q in label.lower():
-                    listbox.insert("end", label)
-            if listbox.size():
-                listbox.selection_set(0)
-                listbox.activate(0)
-
-        def run(_e=None):
-            sel = listbox.curselection()
-            if not sel:
-                return
-            idx = sel[0]
-            label = listbox.get(idx)
-            fn = dict((l, f) for l, f in actions)[label]
-            dialog.destroy()
-            self._palette = None
-            try:
-                fn()
-            except Exception:
-                logging.exception("命令面板执行失败: %s", label)
-
-        entry.bind("<KeyRelease>", refresh)
-        entry.bind("<Return>", run)
-        # 返回 "break"：阻止 Entry 默认光标移动与列表激活状态混杂
-        entry.bind("<Down>", lambda e: (
-            listbox.selection_clear(0, "end"),
-            listbox.selection_set(min(listbox.size() - 1, (listbox.curselection() or [0])[0] + 1)),
-            listbox.activate((listbox.curselection() or [0])[0]),
-            "break")[3])
-        entry.bind("<Up>", lambda e: (
-            listbox.selection_clear(0, "end"),
-            listbox.selection_set(max(0, (listbox.curselection() or [0])[0] - 1)),
-            listbox.activate((listbox.curselection() or [0])[0]),
-            "break")[3])
-        listbox.bind("<Button-1>", lambda e: None)
-        listbox.bind("<Double-1>", run)
-        dialog.bind("<Escape>", lambda e: dialog.destroy())
-        refresh()
-        try:
-            cx = self.root.winfo_rootx() + (self.root.winfo_width() - 420) // 2
-            cy = self.root.winfo_rooty() + (self.root.winfo_height() - 360) // 3
-            dialog.geometry(f"+{cx}+{cy}")
-        except Exception:
-            pass
-        # 注意：不用 grab_set——无边框窗口 + grab 会拦截主窗口全部事件，
-        # 且没有可见关闭按钮，极易表现为"程序卡死"（Windows 上还会与
-        # 输入法/焦点组合锁死事件循环）。非模态 + Esc 关闭更安全，
-        # 主窗口始终可交互，面板残留无害（再次 Ctrl+K 会先销毁旧面板）。
-        entry.focus_force()
-        entry.focus_set()
+        dialogs.show_command_palette(self)
 
     def run_task_template(self, template_name):
         if self.busy:
@@ -13310,89 +11258,8 @@ class AssistantApp:
         self.send(text=prompt)
 
     def show_context_details(self):
-        t = self._theme()
-        # 复用 worker 已算好的计数（若有），避免主线程全量 tiktoken（1M 上下文可卡 1-2s）
-        with self._messages_lock:
-            msgs = list(self.messages)
-        if getattr(self, "_ctx_counts", None) is None or len(self._ctx_counts) != len(msgs):
-            # 长度不一致 = worker 压缩/裁剪过，计数已失效，按当前消息重算
-            self._ctx_counts = tokens.message_token_counts(msgs)
-        counts = self._ctx_counts
-        total = tokens.BASE_OVERHEAD + sum(counts)
-
-        def cat(msg):
-            if msg.get("role") == "system":
-                if (msg.get("content") or "").startswith("[历史对话摘要]"):
-                    return "历史摘要"
-                return "系统提示词"
-            if msg.get("role") == "user":
-                return "用户消息"
-            if msg.get("role") == "tool":
-                return "工具调用记录"
-            if msg.get("role") == "assistant":
-                if msg.get("reasoning_content"):
-                    return "思考过程（含回复）"
-                return "助手回复"
-            return "其他"
-
-        groups = {}
-        for i, msg in enumerate(msgs):
-            key = cat(msg)
-            g = groups.setdefault(key, {"count": 0, "tokens": 0, "msgs": 0})
-            g["count"] += 1
-            g["tokens"] += counts[i] if i < len(counts) else 0
-            g["msgs"] += 1
-
-        dialog, body, footer = self._dialog_shell(
-            "上下文占用详情", 480, 440,
-            subtitle="当前上下文的构成占比，帮助了解 1M 窗口的使用情况",
-        )
-        self._lbl(
-            body,
-            f"当前上下文估算 {total:,} token / "
-            f"{MODELS.get(self.model_combo.get(), {}).get('max_context_tokens', MAX_CONTEXT_TOKENS):,}",
-            role="label_sec",
-            bg="panel",
-            font=(FONT_FAMILY, 10, "bold"),
-        ).pack(anchor="w", pady=(0, 8))
-        if self.last_usage:
-            lu = self.last_usage
-            hit = lu.get("cache_hit", 0)
-            miss = lu.get("cache_miss", 0)
-            ratio = f"{hit / (hit + miss):.0%}" if (hit + miss) else "-"
-            self._lbl(
-                body,
-                f"最近一轮：输入 {lu.get('prompt', 0):,} token（缓存命中 {hit:,} / 未命中 {miss:,}，占比 {ratio}）"
-                f" · 输出 {lu.get('completion', 0):,} token",
-                role="label_sec",
-                bg="panel",
-                font=(FONT_FAMILY, 9),
-            ).pack(anchor="w", pady=(0, 10))
-        order = ["系统提示词", "历史摘要", "用户消息", "助手回复", "思考过程（含回复）", "工具调用记录", "其他"]
-        max_tokens = max((g["tokens"] for g in groups.values()), default=1)
-        for key in order:
-            g = groups.get(key)
-            if not g:
-                continue
-            row = tk.Frame(body, bg=t["panel"])
-            row.pack(fill="x", pady=3)
-            self._restyle.append((row, "panel"))
-            pct = g["tokens"] / total if total else 0
-            bar = ttk.Progressbar(
-                row,
-                style="Context.Horizontal.TProgressbar",
-                maximum=max_tokens,
-                value=g["tokens"],
-                length=200,
-            )
-            bar.pack(side="left")
-            self._lbl(
-                row,
-                f"{key}: {g['tokens']:,} ({pct:.1%}) · {g['msgs']} 条",
-                bg="panel",
-                font=(FONT_FAMILY, 9),
-            ).pack(side="left", padx=(10, 0))
-        self._footer_btn(footer, "关闭", dialog.destroy)
+        """上下文占用详情：当前上下文的构成占比。"""
+        dialogs.show_context_details(self)
 
     def compare_models(self):
         """模型对比（参数化）：弹窗选择/输入任意两个模型，分会话对比结果。
@@ -13490,10 +11357,7 @@ class AssistantApp:
         prompt = template.replace("{content}", content[:8000])
         if self.busy:
             # 不覆盖已挂起的待发消息：追加到待发队列尾部，生成结束后依次发送
-            if self._pending_send:
-                self._pending_send += "\n\n" + prompt
-            else:
-                self._pending_send = prompt
+            self._pending_sends.append(prompt)
             self._flash_status("正在生成，结束后自动执行快速动作", 2500)
             return
         self._clear_placeholder()
@@ -13767,6 +11631,16 @@ class AssistantApp:
         """用系统默认程序打开（文件不存在时打开所在目录）。"""
         try:
             if os.path.exists(path):
+                low = str(path).lower()
+                if low.endswith((
+                    ".exe", ".bat", ".cmd", ".com", ".ps1", ".vbs",
+                    ".msi", ".reg", ".scr", ".jar",
+                )):
+                    if not messagebox.askyesno(
+                        "安全确认",
+                        f"即将打开可执行/脚本文件：\n{path}\n\n是否继续？",
+                    ):
+                        return
                 os.startfile(path)
                 return
         except Exception:
@@ -14131,7 +12005,9 @@ class AssistantApp:
             pos -= 1
         while pos >= 0 and cur[pos] not in " \t":
             pos -= 1
-        text.delete(f"{pos + 1}.0", idx)
+        # 用字符偏移量回退到删除起点：Tk 的 "1.0 + N chars" 对多行文本也准确，
+        # 不能用 f"{pos+1}.0"（多行时会把字符偏移误当行号）。
+        text.delete(f"1.0 + {pos + 1} chars", idx)
         text.focus_set()
         return "break"
 
@@ -14253,9 +12129,11 @@ class AssistantApp:
 
     def build_markdown(self):
         cfg = self.save_widgets_to_config()
-        return _build_markdown(
-            self.messages, self.usage_total, self.session_start, cfg
-        )
+        with self._messages_lock:
+            msgs = list(self.messages)
+            usage = dict(self.usage_total)
+            start = self.session_start
+        return exporters.build_markdown(msgs, usage, start, cfg, APP_NAME, APP_NAME_EN)
 
     def export_history(self, ask_dir=True):
         if len(self.messages) <= 1:
@@ -14270,7 +12148,8 @@ class AssistantApp:
         base = os.path.join(target_dir, f"session_{timestamp}")
         # 主线程快照：导出在后台线程执行（长会话 md 构建 + 4 文件写盘可冻结 UI 数秒），
         # 期间 worker 线程可能继续往 self.messages 追加，快照保证导出内容一致
-        msgs = list(self.messages)
+        with self._messages_lock:
+            msgs = list(self.messages)
         usage = dict(self.usage_total)
         start = self.session_start
         cfg_snap = self.cfg.copy()
@@ -14278,7 +12157,7 @@ class AssistantApp:
 
         def _do_export():
             try:
-                content = _build_markdown(msgs, usage, start, cfg_snap)
+                content = exporters.build_markdown(msgs, usage, start, cfg_snap, APP_NAME, APP_NAME_EN)
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(content)
                 plain = content.replace("```text\n", "【思考】\n").replace("```\n", "")
@@ -14421,7 +12300,7 @@ class AssistantApp:
         try:
             for s in self._sessions:
                 if not s.get("ephemeral") and not self.cfg.get("privacy_mode"):
-                    self.save_session_to_file(s)
+                    self.save_session_to_file(s, wait=True)
         except Exception:
             logging.exception("退出前保存会话失败")
         self.save_snapshot()
@@ -14435,7 +12314,7 @@ class AssistantApp:
             except Exception:
                 pass
         if not self.cfg.get("privacy_mode"):
-            write_clean_exit_flag()
+            write_clean_exit_flag(CLEAN_EXIT_FLAG)
         self._stop_tray()
         self.root.destroy()
 

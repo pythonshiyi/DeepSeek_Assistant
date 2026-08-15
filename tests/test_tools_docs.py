@@ -142,7 +142,10 @@ class TestDocxRead(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="dsa_docx_")
         self.ws = _init_perm(self.tmp)
-        from docx import Document
+        try:
+            from docx import Document
+        except ImportError:
+            self.skipTest("python-docx 未安装")
 
         doc = Document()
         doc.add_heading("主标题", 0)
@@ -190,7 +193,10 @@ class TestPptxRead(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="dsa_pptx_")
         self.ws = _init_perm(self.tmp)
-        from pptx import Presentation
+        try:
+            from pptx import Presentation
+        except ImportError:
+            self.skipTest("python-pptx 未安装")
 
         prs = Presentation()
         slide = prs.slides.add_slide(prs.slide_layouts[1])

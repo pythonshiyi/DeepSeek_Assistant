@@ -60,6 +60,24 @@ class TestRunPythonAstGuard(unittest.TestCase):
         ):
             self.assertTrue(dc._run_python_blocked(code), code)
 
+    def test_alias_and_star_import_blocked(self):
+        # 修复后：import os as x / from os import * / from importlib import import_module
+        for code in (
+            "import os as x; x.system('calc')",
+            "from os import *; system('calc')",
+            "from importlib import import_module; import_module('os')",
+            "import os as x; getattr(x, 'system')('calc')",
+        ):
+            self.assertTrue(dc._run_python_blocked(code), code)
+
+    def test_reflection_builtins_blocked(self):
+        for code in (
+            "globals()['os'].system('calc')",
+            "vars(os)['system']('calc')",
+            "compile('x', '<s>', 'exec')",
+        ):
+            self.assertTrue(dc._run_python_blocked(code), code)
+
     def test_write_open_blocked(self):
         for code in (
             "open('f.txt', 'w').write('x')",
@@ -178,7 +196,7 @@ class TestSSRFDnsRebinding(unittest.TestCase):
     def test_fetch_url_rejects_internal_after_resolve(self):
         with self._patch_getaddrinfo(["10.0.0.5"]):
             out = dc.fetch_url("http://rebind.example.com/")
-        self.assertIn("SSRF", out) or self.assertIn("阻止", out)
+        self.assertTrue("SSRF" in out or "阻止" in out, out)
 
 
 class TestCustomToolSSRF(unittest.TestCase):
@@ -186,8 +204,8 @@ class TestCustomToolSSRF(unittest.TestCase):
         """自定义工具 endpoint 为回环（用户注册的本地服务）默认放行。"""
         handler = {"function": {"name": "t", "endpoint": "http://127.0.0.1:8080/api"}}
         with mock.patch("deepseek_client._http_client") as http:
-            http.return_value.post.return_value.raise_for_status.return_value = None
-            http.return_value.post.return_value.text = "ok"
+            http.return_value.request.return_value.raise_for_status.return_value = None
+            http.return_value.request.return_value.text = "ok"
             out = dc.DeepSeekClient._run_custom_tool(handler, "{}")
         self.assertEqual(out, "ok")
 
@@ -199,8 +217,8 @@ class TestCustomToolSSRF(unittest.TestCase):
     def test_endpoint_public_allowed(self):
         handler = {"function": {"name": "t", "endpoint": "https://example.com/api"}}
         with mock.patch("deepseek_client._http_client") as http:
-            http.return_value.post.return_value.raise_for_status.return_value = None
-            http.return_value.post.return_value.text = "ok"
+            http.return_value.request.return_value.raise_for_status.return_value = None
+            http.return_value.request.return_value.text = "ok"
             out = dc.DeepSeekClient._run_custom_tool(handler, "{}")
         self.assertEqual(out, "ok")
 

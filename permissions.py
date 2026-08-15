@@ -155,9 +155,8 @@ def save():
             data["filesystem"]["allowed_dirs"].remove(WORKSPACE_DIR)
         except (ValueError, TypeError):
             pass
-        with open(PERMISSIONS_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
+        from persistence import atomic_json_write
+        return atomic_json_write(PERMISSIONS_PATH, data, indent=2)
     except Exception:
         logging.exception("保存权限配置失败")
         return False
