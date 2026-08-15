@@ -2,6 +2,13 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.19.0（2026-08-15）
+
+- **默认完全放开**：`DEFAULT_PERMISSIONS` 的所有黑名单/审批动作全部为空（blocked_dirs / command_blocklist / network_blocklist / approval_actions = []），用户自行增删，出厂即零限制。
+- **全局对话框加大**：`_dialog_shell` 所有对话框初始尺寸至少中档（宽/高都抬升），且 minsize 不低于初始尺寸，底部保存按钮不再被裁切；插件中心/工具中心 minsize 提升到 640×480。
+- 本地开发生成物清理：删除 build/dist/backups/evolutions/data/.pytest_cache/__pycache__/config.json 及运行时旧数据，恢复“刚 clone”体验。
+- 全量测试 570 项通过。
+
 ## v2.18.1（2026-08-15）
 
 - **修复 Agent Mail CLI 可调用性**：新增 `_resolve_agent_mail_cli`（shutil.which + Windows .CMD/.BAT 显式解析，shell=False 安全执行）；修复 `agent_mail` 与 `_agent_mail_run` 重复前置 CLI 导致的 `unknown command "agently-cli"` 参数错误。

@@ -45,24 +45,7 @@ DEFAULT_PERMISSIONS = {
     "network": {
         "blocklist": [],           # 两种模式均生效：命中的主机/网段拒绝
     },
-    "approval_actions": [         # blacklist 模式下默认需要审批的高风险动作（用户可清空）
-        "delete_file",
-        "database_execute",
-        "send_email",
-        "run_command",
-        "pip_install",
-        "start_process",
-        "stop_process",
-        "publish_draft",
-        "create_plugin",
-        "webdav",
-        "rpa_click",
-        "rpa_type",
-        "rpa_hotkey",
-        "rpa_move",
-        "rpa_scroll",
-        "rpa_screenshot",
-    ],
+    "approval_actions": [],        # 默认完全放开：黑名单里不能有任何数据（用户自行增删）
     "approval_mode": "auto",       # whitelist 模式用：auto / confirm / deny
     "approval_timeout": 120,
     "plan_confirm": False,

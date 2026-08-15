@@ -48,10 +48,13 @@ class TestSecretVault(unittest.TestCase):
 
 
 class TestPartnerDefaults(unittest.TestCase):
-    def test_high_risk_approval_defaults(self):
+    def test_default_blacklists_are_empty(self):
+        """v2.19：默认完全放开，黑名单里不能有任何数据。"""
         data = permissions.DEFAULT_PERMISSIONS
-        for name in ("delete_file", "run_command", "rpa_click", "rpa_hotkey", "webdav"):
-            self.assertIn(name, data["approval_actions"])
+        self.assertEqual(data["approval_actions"], [])
+        self.assertEqual(data["filesystem"]["blocked_dirs"], [])
+        self.assertEqual(data["shell"]["blocklist"], [])
+        self.assertEqual(data["network"]["blocklist"], [])
 
     def test_memory_capacity(self):
         self.assertEqual(dc.MEMORY_MAX_ITEMS, 2000)

@@ -196,7 +196,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.18.1"
+VERSION = "2.19.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -2076,12 +2076,18 @@ class AssistantApp:
             height = min(h_snaps, key=lambda d: abs(d - int(height)))
         except (TypeError, ValueError):
             width, height = w_snaps[1], h_snaps[1]
+        # v2.19 全局加大：所有对话框至少中档尺寸，杜绝底部保存按钮被裁到窗口外
+        width = max(int(width), w_snaps[1])
+        height = max(int(height), h_snaps[1])
         t = self._theme()
         dialog = tk.Toplevel(self.root, bg=t["panel"])
         dialog.title(title)
         dialog.geometry(self._center_geometry(width, height))  # 打开即居中（浏览器式）
         if minsize:
-            dialog.minsize(*minsize)
+            mw, mh = int(minsize[0]), int(minsize[1])
+        else:
+            mw, mh = width, height
+        dialog.minsize(max(mw, width), max(mh, height))
         dialog.transient(self.root)
         key = "dlg_" + title
         saved = getattr(self, "_dlg_positions", {}).get(key)
@@ -6682,7 +6688,7 @@ class AssistantApp:
         dialog.title("🧩 插件中心")
         w, h = self._hub_size(0.90, 0.93).split("x")
         dialog.geometry(self._center_geometry(int(w), int(h)))
-        dialog.minsize(560, 420)
+        dialog.minsize(640, 480)
         dialog.transient(self.root)
         dialog.bind("<Escape>", lambda e: dialog.destroy())
         header = tk.Frame(dialog, bg=t["panel"])
@@ -7225,7 +7231,7 @@ class AssistantApp:
         dialog.title("🛠 工具中心")
         w, h = self._hub_size(0.92, 0.94).split("x")
         dialog.geometry(self._center_geometry(int(w), int(h)))
-        dialog.minsize(560, 420)
+        dialog.minsize(640, 480)
         dialog.transient(self.root)
         dialog.bind("<Escape>", lambda e: dialog.destroy())
         header = tk.Frame(dialog, bg=t["panel"])
