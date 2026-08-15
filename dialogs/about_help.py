@@ -112,9 +112,13 @@ def show_welcome(app):
             anchor="w", pady=1
         )
     app._lbl(
+        body, "可选：系统菜单 → 「IM 通道配置」可接入企业微信/Telegram 推送与召唤（不配置不影响使用）。",
+        role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+    ).pack(anchor="w", pady=(12, 0))
+    app._lbl(
         body, "第一步：配置 API Key（可在 https://platform.deepseek.com 申请）",
         role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-    ).pack(anchor="w", pady=(18, 4))
+    ).pack(anchor="w", pady=(12, 4))
     row = tk.Frame(body, bg=t["panel"])
     row.pack(fill="x")
     app._restyle.append((row, "panel"))

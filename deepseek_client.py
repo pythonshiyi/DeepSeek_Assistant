@@ -2320,10 +2320,8 @@ def _load_im_config():
     """读取 im_config.json（敏感字段支持 dpapi: 密文）。返回 (dict, error)。"""
     if not IM_CONFIG_FILE or not os.path.exists(IM_CONFIG_FILE):
         return {}, (
-            "未配置 IM 通道。请在数据目录创建 im_config.json："
-            '{"telegram_bot_token": "123:abc", "telegram_chat_id": "123456", '
-            '"wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx", '
-            '"wecom_aibot_bot_id": "机器人 Bot ID", "wecom_aibot_secret": "机器人 Secret"}'
+            "IM 通道未配置（如不需要推送可忽略；如需开启：系统菜单 → IM 通道配置）。"
+            "支持 wecom_webhook / wecom_aibot_bot_id+secret / telegram_bot_token+chat_id"
         )
     try:
         with open(IM_CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -2381,7 +2379,7 @@ def telegram_poll_updates(timeout=15, limit=5):
     token = cfg.get("telegram_bot_token")
     chat_id = str(cfg.get("telegram_chat_id") or "").strip()
     if not token:
-        return "错误：未配置 telegram_bot_token"
+        return "未配置 telegram_bot_token（系统菜单 → IM 通道配置 可开启）"
     try:
         timeout = max(1, min(60, int(timeout or 15)))
         limit = max(1, min(20, int(limit or 5)))

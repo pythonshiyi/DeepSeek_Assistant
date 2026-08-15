@@ -2,6 +2,13 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.16.2（2026-08-15）
+
+- **IM 通道配置 UI**：外部服务配置新增「IM 通道」页签（企业微信群机器人 Webhook、智能机器人 Bot ID/Secret、Telegram Token/Chat ID），敏感字段 DPAPI 加密保存；系统菜单新增「📱 IM 通道配置…」快捷入口。
+- **未配置不报错**：无 IM 配置时启动/工具调用静默跳过，返回友好提示「如不需要推送可忽略；系统菜单 → IM 通道配置」。
+- **首次使用提示**：欢迎页增加可选提示（不配置不影响使用，不强制）。
+- 全量测试 559 项通过。
+
 ## v2.16.1（2026-08-15）
 
 - **修复企业微信回复失败（errcode=40008）**：`wecom_aibot.reply_text` 消息体从 `msgtype=text` 改为官方支持的 `msgtype=stream`（finish=True + 唯一 stream id）；`send_text` 主动发送改为 `msgtype=markdown`。新增消息体类型回归测试。

@@ -195,7 +195,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.16.1"
+VERSION = "2.16.2"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -665,6 +665,7 @@ class AssistantApp:
             self._menus.append(sysm)
             sysm.add_command(label="🔧 失败模式库…", command=self.show_failures)
             sysm.add_command(label="🔗 推送与数据库配置…", command=self.show_external_config)
+            sysm.add_command(label="📱 IM 通道配置…", command=self.show_im_config)
             sysm.add_command(label="🖼 从剪贴板图片提取文字 (OCR)…", command=self._ocr_clipboard)
             sysm.add_command(label="🧹 数据清理…", command=self.show_cleanup)
             sysm.add_command(label="⌨ 命令面板", accelerator="Ctrl+K", command=self.show_command_palette)
@@ -5893,12 +5894,12 @@ class AssistantApp:
         self._mk_button(bar, "保存", save_schedules, kind="primary", fsz=9).pack(side="right")
         self._mk_button(bar, "关闭", dialog.destroy, fsz=9).pack(side="right", padx=(0, 8))
 
-    def show_external_config(self):
-        """外部服务配置：Webhook / 数据库 / 邮件（SMTP+IMAP）/ 接收端 / 图片生成。"""
+    def show_external_config(self, select_tab=None):
+        """外部服务配置：Webhook / IM / 数据库 / 邮件（SMTP+IMAP）/ 接收端 / 图片生成。"""
         t = self._theme()
         dialog, body, footer = self._dialog_shell(
             "外部服务配置", 620, 540,
-            subtitle="Webhook 推送、数据库连接、邮件收发、远程接收端与图片生成的统一配置",
+            subtitle="Webhook 推送、IM 通道、数据库连接、邮件收发、远程接收端与图片生成的统一配置",
             minsize=(480, 420),
         )
         nb = ttk.Notebook(body)
@@ -5923,6 +5924,40 @@ class AssistantApp:
             var = tk.StringVar(value=str(wh_data.get(name) or ""))
             ttk.Entry(wh_frame, textvariable=var).pack(fill="x", pady=(2, 0))
             wh[name] = var
+
+        # ---- IM 通道页（企业微信 / Telegram）----
+        im_frame = tk.Frame(nb, bg=t["panel"])
+        nb.add(im_frame, text="IM 通道")
+        try:
+            im_data = _dc._load_im_config()[0]
+        except Exception:
+            im_data = {}
+        if not isinstance(im_data, dict):
+            im_data = {}
+        self._lbl(
+            im_frame,
+            "可选配置：配置后鲸语可通过 IM 主动推送通知；企业微信智能机器人还可接收召唤。"
+            "不配置则静默跳过，不影响其他功能。",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 9), wraplength=540, justify="left",
+        ).pack(anchor="w", pady=(4, 6))
+        im_vars = {}
+        im_fields = (
+            ("wecom_webhook", "企业微信群机器人 Webhook（主动推送用）", False),
+            ("wecom_aibot_bot_id", "企业微信智能机器人 Bot ID（召唤响应用）", False),
+            ("wecom_aibot_secret", "企业微信智能机器人 Secret（召唤响应用）", True),
+            ("telegram_bot_token", "Telegram Bot Token（@BotFather 创建）", True),
+            ("telegram_chat_id", "Telegram Chat ID（接收推送的会话）", False),
+        )
+        for key, label, secret in im_fields:
+            self._lbl(im_frame, f"{label}：", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(4, 0))
+            var = tk.StringVar(value=str(im_data.get(key) or ""))
+            ttk.Entry(im_frame, textvariable=var, show="*" if secret else None).pack(fill="x", pady=(2, 0))
+            im_vars[key] = var
+        self._lbl(
+            im_frame,
+            "所有敏感字段保存时自动 DPAPI 加密，只写入本机数据目录，不会进入开源仓库。",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 8),
+        ).pack(anchor="w", pady=(6, 0))
 
         # ---- 数据库页 ----
         db_frame = tk.Frame(nb, bg=t["panel"])
@@ -6029,6 +6064,21 @@ class AssistantApp:
                     if url:
                         wh_out[name] = _enc_secret(url)
                 self._atomic_json_write(_dc.WEBHOOK_CONFIG_FILE, wh_out)
+                im_out = {}
+                for key, var in im_vars.items():
+                    v = var.get().strip()
+                    if v:
+                        im_out[key] = _enc_secret(v)
+                self._atomic_json_write(_dc.IM_CONFIG_FILE, im_out)
+                # IM 长连接按新配置重启/停止（无配置时静默停止，不报错）
+                if im_out.get("wecom_aibot_bot_id") and im_out.get("wecom_aibot_secret"):
+                    self._start_aibot_listener()
+                else:
+                    try:
+                        wecom_aibot.stop_listener()
+                        self._aibot_listener = None
+                    except Exception:
+                        pass
                 db_out = {}
                 for kind, (conn_var, fields) in dbs.items():
                     conns = {}
@@ -6072,9 +6122,18 @@ class AssistantApp:
             except Exception as e:
                 messagebox.showerror("保存失败", str(e))
 
-        self._footer_hint(footer, "Webhook/数据库/邮件供工具使用；接收端与图片生成保存到 config.json")
+        if select_tab:
+            try:
+                nb.select(select_tab)
+            except tk.TclError:
+                pass
+        self._footer_hint(footer, "IM/Webhook/数据库/邮件供工具使用；接收端与图片生成保存到 config.json")
         self._footer_btn(footer, "关闭", dialog.destroy)
         self._footer_btn(footer, "保存", save, primary=True)
+
+    def show_im_config(self):
+        """IM 通道配置快捷入口（定位到外部服务配置的 IM 页签）。"""
+        self.show_external_config(select_tab="IM 通道")
 
     def manage_workflows(self):
         """流程管理：创建/查看/删除 run_workflow 使用的流程模板（workflows.json）。"""
