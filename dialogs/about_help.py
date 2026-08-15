@@ -96,29 +96,48 @@ def show_welcome(app):
         return
     t = app._theme()
     dialog, body, footer = app._dialog_shell(
-        f"欢迎使用 {app.APP_NAME} {app.APP_NAME_EN}", 560, 440,
-        subtitle="为 DeepSeek V4 深度优化的桌面 AI 工作台",
+        f"欢迎使用 {app.APP_NAME} {app.APP_NAME_EN}", 640, 620,
+        subtitle="为 DeepSeek V4 深度优化的桌面 AI 工作台 · 首次启动须知",
     )
     dialog.resizable(False, False)
     dialog.grab_set()
+    app._lbl(
+        body, "当前默认：完全智能模式 · 工具全开 · 权限黑名单制（默认零限制）。",
+        role="label_accent", bg="panel", font=(FONT_FAMILY, 9, "bold"),
+    ).pack(anchor="w", pady=(0, 6))
     for line in (
-        "· 流式输出思考过程与回答，支持 1M 长上下文与缓存优化",
-        "· 100+ Agent 工具：文档/代码/浏览器/数据/媒体/公众号写作",
-        "· 产物面板：生成的文件一键打开，无需翻找目录",
-        "· 多会话、上下文自动压缩、用量统计与预算控制",
-        "· 提示词库、消息收藏、分支对话、深色主题",
+        "· 完全智能：AI 可自主调用全部工具完成任务，适合“直接给我结果”的干活场景",
+        "· 纯对话：不调用任何工具，适合闲聊、问答、写作构思（设置面板可切换）",
+        "· 思考已默认关闭，响应更快；需要深度推理时可在设置中开启",
+        "· 浏览器默认可见：网页操作会弹出真实窗口，可在设置中改回无头",
     ):
-        app._lbl(body, "✓ " + line, bg="panel", font=(FONT_FAMILY, 9)).pack(
-            anchor="w", pady=1
-        )
+        app._lbl(body, line, bg="panel", font=(FONT_FAMILY, 9), wraplength=560, justify="left").pack(anchor="w", pady=1)
+
     app._lbl(
-        body, "可选：系统菜单 → 「IM 通道配置」可接入企业微信/Telegram 推送与召唤（不配置不影响使用）。",
-        role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-    ).pack(anchor="w", pady=(12, 0))
-    app._lbl(
-        body, "第一步：配置 API Key（可在 https://platform.deepseek.com 申请）",
+        body, "推荐增强体验（全部可选，不配置不影响使用）：",
         role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold"),
-    ).pack(anchor="w", pady=(12, 4))
+    ).pack(anchor="w", pady=(12, 2))
+    for line in (
+        "· 系统 → IM 通道配置：接入企业微信/Telegram，主动推送 + 随时召唤",
+        "· 系统 → 外部服务配置：Agent Mail 邮箱 / Webhook / 数据库 / 邮件",
+        "· 密钥保险箱 secret_store：让 AI 帮你加密托管 API Key/令牌",
+    ):
+        app._lbl(body, line, role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=1)
+
+    app._lbl(
+        body, "安全黑名单（仅推荐，可全部留空）：",
+        role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold"),
+    ).pack(anchor="w", pady=(12, 2))
+    app._lbl(
+        body, "工具中心 → 权限：可添加 C:\\Windows、C:\\Program Files、"
+              "169.254.169.254（云元数据）、format/diskpart 等；添加前 AI 完全放开。",
+        role="label_sec", bg="panel", font=(FONT_FAMILY, 9), wraplength=560, justify="left",
+    ).pack(anchor="w")
+
+    app._lbl(
+        body, "最后一步：配置 API Key（可在 https://platform.deepseek.com 申请）",
+        role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold"),
+    ).pack(anchor="w", pady=(14, 4))
     row = tk.Frame(body, bg=t["panel"])
     row.pack(fill="x")
     app._restyle.append((row, "panel"))

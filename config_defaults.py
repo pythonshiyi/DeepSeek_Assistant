@@ -116,7 +116,7 @@ DEFAULT_CONFIG = {
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-v4-flash",
     "scenario": "通用",
-    "thinking": "high",
+    "thinking": "none",  # 初始最干净：思考关闭（用户可在设置中开启）
     "max_tokens": 16384,
     "seed": "",
     "tools_enabled": True,
@@ -141,16 +141,16 @@ DEFAULT_CONFIG = {
     "input_height": 4,
     "input_height_px": 0,
     "sidebar_width": 260,
-    "browser_headless": True,
+    "browser_headless": False,  # 初始浏览器可见（有头模式）
     "json_output": False,
     "beta_api": False,
     "peak_warning": True,
     "fold_early_threshold": 0,
     "current_profile": "",
-    "notify_on_done": False,
+    "notify_on_done": True,  # 初始完成通知开启
     "ssrf_trusted": [],
     "project_context": False,
-    "full_auto": False,
+    "full_auto": True,  # 初始即完全智能：全部工具、零审批、零开关（黑名单仍生效）
     "active_dir": "",
     "evolution_reminder_days": 7,
     "suggestions_enabled": True,
@@ -162,8 +162,8 @@ DEFAULT_CONFIG = {
     "image_base_url": "",     # 图片生成端点（默认 = base_url）
     "image_model": "gpt-image-1",
     "window_geometry": "",    # 窗口大小位置记忆（如 1280x820+100+50）
-    "minimize_to_tray": False,  # 关闭时最小化到系统托盘（需 pystray）
-    "autostart": False,       # 开机自启（注册表 Run 键）
+    "minimize_to_tray": True,   # 初始关闭时最小化到系统托盘（需 pystray；不可用时回滚）
+    "autostart": True,          # 初始开机自启（注册表 Run 键；失败自动回滚）
     "strict_tools": False,    # strict 工具模式（Beta）：模型严格遵循工具 JSON Schema
     "update_url": "",         # 更新检查源（latest.json，如 https://example.com/latest.json）
     "call_api_allowed_hosts": [],  # call_api 内网/回环白名单（精确主机名，建议 IP；如 ["127.0.0.1"]）
