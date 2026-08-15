@@ -713,6 +713,128 @@ TOOLS = [
             },
         },
     },
+    # ===== IM 主动触达（P1）=====
+    {
+        "type": "function",
+        "function": {
+            "name": "im_send",
+            "description": "发送消息到 IM 通道（Telegram Bot / 企业微信群机器人，im_config.json 配置）。用于任务完成主动汇报、定时提醒。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "消息正文"},
+                    "title": {"type": "string", "description": "可选：消息标题（默认 鲸语提醒）"},
+                    "channel": {"type": "string", "description": "可选：指定通道 telegram/wecom，留空推送全部已配置通道"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "telegram_poll_updates",
+            "description": "接收 Telegram Bot 新消息（长轮询，游标自动去重）。AI 可定期调用检查用户是否通过 Telegram 召唤/下达新指令。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timeout": {"type": "integer", "description": "可选：长轮询秒数 1-60，默认 15"},
+                    "limit": {"type": "integer", "description": "可选：最多返回条数 1-20，默认 5"},
+                },
+                "required": [],
+            },
+        },
+    },
+    # ===== 二进制下载 / 文件格式扩展（P2）=====
+    {
+        "type": "function",
+        "function": {
+            "name": "download_file",
+            "description": "下载二进制文件（图片/附件/文档/安装包等任意格式）到工作区或指定目录；流式写盘，单文件 200MB 上限。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "文件完整 URL（http/https）"},
+                    "local_path": {"type": "string", "description": "可选：本地保存路径（留空保存到工作区 downloads/）"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "epub_read",
+            "description": "读取 EPUB 电子书正文（ebooklib 可选依赖）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "EPUB 文件绝对路径"},
+                    "max_chars": {"type": "integer", "description": "可选：最多返回字符数（默认 20000）"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mobi_read",
+            "description": "读取 MOBI 电子书正文（mobi 可选依赖）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "MOBI 文件绝对路径"},
+                    "max_chars": {"type": "integer", "description": "可选：最多返回字符数（默认 20000）"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "doc_read",
+            "description": "读取旧版 .doc 二进制文档正文（antiword/catdoc 可选依赖）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": ".doc 文件绝对路径"},
+                    "max_chars": {"type": "integer", "description": "可选：最多返回字符数（默认 20000）"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "msg_read",
+            "description": "读取 .msg Outlook 邮件（主题/发件人/正文/附件清单，extract_msg 可选依赖）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": ".msg 文件绝对路径"},
+                    "max_chars": {"type": "integer", "description": "可选：正文最多返回字符数（默认 20000）"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "archive_list",
+            "description": "列出压缩包内容：.zip / .tar / .gz / .7z / .rar（7z/rar 需可选依赖）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "压缩包绝对路径"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
     # ===== 多模态（A3）：语音合成 / 图像处理 / OCR =====
     {
         "type": "function",
@@ -2053,6 +2175,67 @@ def fetch_url(url):
         return f"错误：{e}"
 
 
+# ===== 二进制下载（P2）：图片/附件/安装包等任意文件 =====
+DOWNLOAD_MAX_BYTES = 200 * 1024 * 1024  # 单文件 200MB 上限（与 WebDAV 对齐）
+
+
+def download_file(url, local_path=""):
+    """下载二进制文件（图片/附件/文档/安装包等）到工作区或指定目录。
+
+    黑名单模式默认放行任意 URL（network.blocklist 除外）；流式写盘，超过
+    200MB 自动中止并删除半成品。
+    """
+    if not str(url or "").startswith(("http://", "https://")):
+        return "错误：url 必须以 http:// 或 https:// 开头"
+    err = _safe_url(url)
+    if err:
+        return f"错误：{err}"
+    try:
+        from urllib.parse import urlparse, unquote
+        fn = os.path.basename(unquote(urlparse(str(url)).path)) or f"download_{datetime.now():%Y%m%d_%H%M%S}.bin"
+        fn = re.sub(r"[\\/:*?\"<>|]", "_", fn)[:120]
+    except Exception:
+        fn = f"download_{datetime.now():%Y%m%d_%H%M%S}.bin"
+    if str(local_path or "").strip():
+        p = permissions.resolve(local_path)
+    else:
+        base = os.path.join(permissions.WORKSPACE_DIR or "", "downloads")
+        p = permissions.resolve(os.path.join(base, fn))
+    if not p:
+        return "错误：本地路径无效"
+    ok, reason = permissions.check_filesystem(p, write=True)
+    if not ok:
+        return reason
+    try:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        total = 0
+        too_large = False
+        with _safe_stream("GET", url, timeout=60) as resp:
+            resp.raise_for_status()
+            with open(p, "wb") as f:
+                for chunk in resp.iter_bytes(64 * 1024):
+                    total += len(chunk)
+                    if total > DOWNLOAD_MAX_BYTES:
+                        too_large = True
+                        break
+                    f.write(chunk)
+        if too_large:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            return f"错误：文件超过 {DOWNLOAD_MAX_BYTES // 1024 // 1024}MB 上限，已中止"
+        permissions.audit("download_file", url, f"{p} {total} 字节")
+        return f"已下载 {url} → {p}（{total} 字节）"
+    except Exception as e:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+        return f"错误：下载失败: {e}"
+
+
 # ===== 推送通知（A6）：钉钉 / ServerChan / Slack / 通用 Webhook =====
 WEBHOOK_CONFIG_FILE = None  # 由 main 注入（DATA_DIR/webhooks.json）
 
@@ -2126,6 +2309,109 @@ def _webhook_payload(channel, title, text):
 def send_webhook(title="", text="", channel=""):
     """主动推送通知到配置的 Webhook（钉钉/ServerChan/Slack/通用）。"""
     return send_webhook_notify(str(text or "").strip() or "（无内容）", str(title or "鲸语提醒"), channel)
+
+
+# ===== IM 主动触达（P1）：Telegram Bot / 企业微信群机器人 =====
+IM_CONFIG_FILE = None  # 由 main 注入（DATA_DIR/im_config.json）
+_TELEGRAM_OFFSET = 0   # Telegram getUpdates 游标（进程内去重）
+
+
+def _load_im_config():
+    """读取 im_config.json（敏感字段支持 dpapi: 密文）。返回 (dict, error)。"""
+    if not IM_CONFIG_FILE or not os.path.exists(IM_CONFIG_FILE):
+        return {}, (
+            "未配置 IM 通道。请在数据目录创建 im_config.json："
+            '{"telegram_bot_token": "123:abc", "telegram_chat_id": "123456", '
+            '"wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"}'
+        )
+    try:
+        with open(IM_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return {}, "错误：im_config.json 格式不是对象"
+        return {k: _decrypt_secret(v) for k, v in cfg.items()}, ""
+    except Exception:
+        logging.exception("读取 IM 配置失败")
+        return {}, "错误：读取 IM 配置失败"
+
+
+def im_send(text, title="", channel=""):
+    """主动触达：发送消息到 Telegram / 企业微信群机器人（可同时推送多通道）。"""
+    if not str(text or "").strip():
+        return "错误：text 必填"
+    cfg, err = _load_im_config()
+    if not cfg:
+        return err
+    title = str(title or "鲸语提醒").strip()
+    body = f"{title}\n{text}" if title else str(text)
+    ch = str(channel or "").strip().lower()
+    targets = {}
+    if not ch or ch == "telegram":
+        if cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id"):
+            targets["telegram"] = (cfg["telegram_bot_token"], str(cfg["telegram_chat_id"]))
+    if not ch or ch in ("wecom", "wechat", "weixin"):
+        if cfg.get("wecom_webhook"):
+            targets["wecom"] = (cfg["wecom_webhook"],)
+    if not targets:
+        return "错误：未配置可用的 IM 通道（telegram_bot_token/telegram_chat_id 或 wecom_webhook）"
+    sent = []
+    for name, val in targets.items():
+        try:
+            if name == "telegram":
+                token, chat_id = val
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                resp = _http_client().post(url, json={"chat_id": chat_id, "text": body[:4000]}, timeout=15)
+            else:
+                resp = _http_client().post(val[0], json={"msgtype": "text", "text": {"content": body[:4000]}}, timeout=15)
+            ok = resp.status_code < 400
+            sent.append(f"{name}:{'✅' if ok else '❌' + str(resp.status_code)}")
+        except Exception as e:
+            sent.append(f"{name}:❌ {e}")
+    permissions.audit("im_send", ",".join(sent), body[:80], result="ok")
+    return "；".join(sent)
+
+
+def telegram_poll_updates(timeout=15, limit=5):
+    """接收 Telegram 消息（供 AI 定期检查或用户召唤）。返回最近消息；游标自动前移去重。"""
+    global _TELEGRAM_OFFSET
+    cfg, err = _load_im_config()
+    if not cfg:
+        return err
+    token = cfg.get("telegram_bot_token")
+    chat_id = str(cfg.get("telegram_chat_id") or "").strip()
+    if not token:
+        return "错误：未配置 telegram_bot_token"
+    try:
+        timeout = max(1, min(60, int(timeout or 15)))
+        limit = max(1, min(20, int(limit or 5)))
+    except (TypeError, ValueError):
+        timeout, limit = 15, 5
+    try:
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        params = {"timeout": timeout, "limit": limit}
+        if _TELEGRAM_OFFSET:
+            params["offset"] = _TELEGRAM_OFFSET + 1
+        resp = _http_client().post(url, json=params, timeout=timeout + 15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return f"错误：Telegram 接收失败: {e}"
+    updates = data.get("result") or []
+    if not updates:
+        return "（暂无新消息）"
+    lines = []
+    for u in updates:
+        msg = u.get("message") or {}
+        if chat_id and str(msg.get("chat", {}).get("id")) != chat_id:
+            continue
+        sender = (msg.get("from") or {}).get("username") or (msg.get("from") or {}).get("first_name") or "?"
+        text = str(msg.get("text") or "[非文本消息]")[:500]
+        lines.append(f"@{sender}: {text}")
+        if int(u.get("update_id") or 0) > _TELEGRAM_OFFSET:
+            _TELEGRAM_OFFSET = int(u["update_id"])
+    if not lines:
+        return "（暂无来自配置 chat_id 的新消息）"
+    return "\n".join(lines)
 
 
 # ===== 多模态（A3）：语音合成 / 图像处理 / 文件 OCR =====
@@ -2740,6 +3026,192 @@ def read_excel(path, sheet=0, max_rows=100):
         return "\n".join(lines) + (f"\n[前 {limit} 行…]" if len(lines) >= limit else "")
     except Exception as e:
         return f"错误：读取 Excel 失败: {e}"
+
+
+def _read_optional_text(path, max_chars):
+    p = permissions.resolve(path)
+    if not p or not os.path.isfile(p):
+        return None, f"错误：文件不存在：{path}"
+    ok, reason = permissions.check_filesystem(p, write=False)
+    if not ok:
+        return None, reason
+    try:
+        max_chars = max(1000, min(100000, int(max_chars or 20000)))
+    except (TypeError, ValueError):
+        max_chars = 20000
+    return p, max_chars
+
+
+def _strip_html_tags(html_text):
+    import html as _html
+    txt = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html_text or "")
+    txt = re.sub(r"(?s)<[^>]+>", "\n", txt)
+    txt = _html.unescape(txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+
+def epub_read(path, max_chars=20000):
+    """读取 EPUB 电子书正文（ebooklib 可选依赖）。"""
+    p_or_err = _read_optional_text(path, max_chars)
+    if p_or_err[0] is None:
+        return p_or_err[1]
+    p, limit = p_or_err
+    try:
+        import ebooklib
+        from ebooklib import epub
+    except ImportError:
+        return "错误：需要 ebooklib（pip install ebooklib）"
+    try:
+        book = epub.read_epub(p)
+        parts = []
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            body = item.get_body_content() or b""
+            parts.append(_strip_html_tags(body.decode("utf-8", errors="replace")))
+        text = "\n\n".join(x for x in parts if x)
+        if not text:
+            return "（EPUB 无正文内容）"
+        if len(text) > limit:
+            text = text[:limit] + f"\n[正文已截断前 {limit} 字符]"
+        return text
+    except Exception as e:
+        return f"错误：读取 EPUB 失败: {e}"
+
+
+def mobi_read(path, max_chars=20000):
+    """读取 MOBI 电子书正文（mobi 可选依赖）。"""
+    p_or_err = _read_optional_text(path, max_chars)
+    if p_or_err[0] is None:
+        return p_or_err[1]
+    p, limit = p_or_err
+    try:
+        from mobi import Mobi
+    except ImportError:
+        return "错误：需要 mobi（pip install mobi）"
+    try:
+        book = Mobi(p)
+        book.parse()
+        text = str(book) if hasattr(book, "__str__") else ""
+        if not text:
+            text = "\n\n".join(str(getattr(book, field, "")) for field in ("title", "author", "publisher", "description"))
+        if len(text) > limit:
+            text = text[:limit] + f"\n[正文已截断前 {limit} 字符]"
+        return text or "（MOBI 解析无文本）"
+    except Exception as e:
+        return f"错误：读取 MOBI 失败: {e}"
+
+
+def doc_read(path, max_chars=20000):
+    """读取旧版 .doc 二进制文档（优先 antiword，其次 catdoc）。"""
+    p_or_err = _read_optional_text(path, max_chars)
+    if p_or_err[0] is None:
+        return p_or_err[1]
+    p, limit = p_or_err
+    import shutil as _shutil
+    for exe in ("antiword", "catdoc"):
+        if _shutil.which(exe):
+            try:
+                proc = subprocess.run(
+                    [exe, p], capture_output=True, text=True, timeout=30,
+                    errors="replace", creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                text = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+                if text:
+                    if len(text) > limit:
+                        text = text[:limit] + f"\n[正文已截断前 {limit} 字符]"
+                    return text
+            except Exception as e:
+                return f"错误：读取 .doc 失败（{exe}）: {e}"
+    return "错误：读取 .doc 需要 antiword 或 catdoc（Windows 可安装 antiword 或改用 .docx）"
+
+
+def msg_read(path, max_chars=20000):
+    """读取 .msg Outlook 邮件（extract_msg 可选依赖），返回主题/发件人/正文/附件清单。"""
+    p_or_err = _read_optional_text(path, max_chars)
+    if p_or_err[0] is None:
+        return p_or_err[1]
+    p, limit = p_or_err
+    try:
+        import extract_msg
+    except ImportError:
+        return "错误：需要 extract_msg（pip install extract-msg）"
+    try:
+        msg = extract_msg.Message(p)
+        attachments = [a.longFilename or a.shortFilename or "?" for a in (msg.attachments or [])]
+        lines = [
+            f"主题：{msg.subject}",
+            f"发件人：{msg.sender}",
+            f"收件人：{msg.to}",
+            f"日期：{msg.date}",
+        ]
+        if attachments:
+            lines.append(f"附件（{len(attachments)}）：{', '.join(attachments[:20])}")
+        body = str(msg.body or "").strip()
+        if body:
+            lines.append("正文：")
+            if len(body) > limit:
+                body = body[:limit] + f"\n[正文已截断前 {limit} 字符]"
+            lines.append(body)
+        return "\n".join(lines)
+    except Exception as e:
+        return f"错误：读取 .msg 失败: {e}"
+
+
+def archive_list(path):
+    """列出压缩包内容：.zip / .tar / .gz / .7z / .rar（可选依赖）。"""
+    p = permissions.resolve(path)
+    if not p or not os.path.isfile(p):
+        return f"错误：压缩包不存在：{path}"
+    ok, reason = permissions.check_filesystem(p, write=False)
+    if not ok:
+        return reason
+    ext = os.path.splitext(p)[1].lower()
+    try:
+        if ext in (".zip",):
+            import zipfile
+            with zipfile.ZipFile(p) as zf:
+                infos = zf.infolist()
+                lines = [f"压缩包 {path} 共 {len(infos)} 个条目："]
+                for info in infos[:100]:
+                    lines.append(f"· {info.filename}（{info.file_size} 字节）")
+                if len(infos) > 100:
+                    lines.append(f"… 其余 {len(infos) - 100} 个条目略")
+                return "\n".join(lines)
+        if ext in (".tar", ".gz", ".tgz"):
+            import tarfile
+            with tarfile.open(p) as tf:
+                members = tf.getmembers()
+                lines = [f"压缩包 {path} 共 {len(members)} 个条目："]
+                for m in members[:100]:
+                    lines.append(f"· {m.name}（{m.size} 字节）")
+                if len(members) > 100:
+                    lines.append(f"… 其余 {len(members) - 100} 个条目略")
+                return "\n".join(lines)
+        if ext == ".7z":
+            import py7zr
+            with py7zr.SevenZipFile(p, "r") as z:
+                items = z.getnames()
+                lines = [f"压缩包 {path} 共 {len(items)} 个条目："]
+                for name in items[:100]:
+                    lines.append(f"· {name}")
+                if len(items) > 100:
+                    lines.append(f"… 其余 {len(items) - 100} 个条目略")
+                return "\n".join(lines)
+        if ext == ".rar":
+            import rarfile
+            with rarfile.RarFile(p) as rf:
+                infos = rf.infolist()
+                lines = [f"压缩包 {path} 共 {len(infos)} 个条目："]
+                for info in infos[:100]:
+                    lines.append(f"· {info.filename}（{info.file_size} 字节）")
+                if len(infos) > 100:
+                    lines.append(f"… 其余 {len(infos) - 100} 个条目略")
+                return "\n".join(lines)
+        return f"错误：不支持的压缩格式 {ext or '（无扩展名）'}（支持 zip/tar/gz/7z/rar）"
+    except ImportError as e:
+        return f"错误：读取该格式需要额外依赖：{e}"
+    except Exception as e:
+        return f"错误：读取压缩包失败: {e}"
 
 
 def write_excel(path, data, sheet="Sheet1"):
@@ -5194,31 +5666,83 @@ def extract_archive(path, dest_dir):
     ok, reason = permissions.check_filesystem(dest, write=True)
     if not ok:
         return reason
-    import zipfile
-
     try:
         os.makedirs(dest, exist_ok=True)
-        count = 0
         base = os.path.normpath(dest)
-        with zipfile.ZipFile(p) as zf:
-            infos = zf.infolist()
-            if len(infos) > EXTRACT_MAX_ENTRIES:
-                return f"错误：压缩包条目数超过上限（{EXTRACT_MAX_ENTRIES}），已中止"
-            total_size = 0
-            for info in infos:
-                target = os.path.normpath(os.path.join(base, info.filename))
-                if not (target == base or target.startswith(base + os.sep)):
-                    return f"错误：压缩包含越界条目，已中止：{info.filename}"
-                if info.file_size > EXTRACT_MAX_SINGLE_BYTES:
-                    return f"错误：压缩包单文件超过大小上限：{info.filename}"
-                total_size += info.file_size
+        ext = os.path.splitext(p)[1].lower()
+        if ext == ".zip":
+            import zipfile
+            count = 0
+            with zipfile.ZipFile(p) as zf:
+                infos = zf.infolist()
+                if len(infos) > EXTRACT_MAX_ENTRIES:
+                    return f"错误：压缩包条目数超过上限（{EXTRACT_MAX_ENTRIES}），已中止"
+                total_size = 0
+                for info in infos:
+                    target = os.path.normpath(os.path.join(base, info.filename))
+                    if not (target == base or target.startswith(base + os.sep)):
+                        return f"错误：压缩包含越界条目，已中止：{info.filename}"
+                    if info.file_size > EXTRACT_MAX_SINGLE_BYTES:
+                        return f"错误：压缩包单文件超过大小上限：{info.filename}"
+                    total_size += info.file_size
+                    if total_size > EXTRACT_MAX_TOTAL_BYTES:
+                        return f"错误：压缩包总解压大小超过上限，已中止"
+                for info in infos:
+                    zf.extract(info, dest)
+                    count += 1
+            permissions.audit("extract_archive", dest, f"{count} 个条目")
+            return f"已解压 {count} 个条目到 {dest}"
+        if ext in (".tar", ".gz", ".tgz"):
+            import tarfile
+            with tarfile.open(p) as tf:
+                members = tf.getmembers()
+                if len(members) > EXTRACT_MAX_ENTRIES:
+                    return f"错误：压缩包条目数超过上限（{EXTRACT_MAX_ENTRIES}），已中止"
+                total_size = sum(m.size for m in members)
                 if total_size > EXTRACT_MAX_TOTAL_BYTES:
                     return f"错误：压缩包总解压大小超过上限，已中止"
-            for info in infos:
-                zf.extract(info, dest)
-                count += 1
-        permissions.audit("extract_archive", dest, f"{count} 个条目")
-        return f"已解压 {count} 个条目到 {dest}"
+                for m in members:
+                    target = os.path.normpath(os.path.join(base, m.name))
+                    if not (target == base or target.startswith(base + os.sep)):
+                        return f"错误：压缩包含越界条目，已中止：{m.name}"
+                tf.extractall(dest)
+            permissions.audit("extract_archive", dest, f"{len(members)} 个条目")
+            return f"已解压 {len(members)} 个条目到 {dest}"
+        if ext == ".7z":
+            import py7zr
+            with py7zr.SevenZipFile(p, "r") as z:
+                names = z.getnames()
+                if len(names) > EXTRACT_MAX_ENTRIES:
+                    return f"错误：压缩包条目数超过上限（{EXTRACT_MAX_ENTRIES}），已中止"
+                for name in names:
+                    target = os.path.normpath(os.path.join(base, name))
+                    if not (target == base or target.startswith(base + os.sep)):
+                        return f"错误：压缩包含越界条目，已中止：{name}"
+                z.extractall(dest)
+            permissions.audit("extract_archive", dest, f"{len(names)} 个条目")
+            return f"已解压 {len(names)} 个条目到 {dest}"
+        if ext == ".rar":
+            import rarfile
+            with rarfile.RarFile(p) as rf:
+                infos = rf.infolist()
+                if len(infos) > EXTRACT_MAX_ENTRIES:
+                    return f"错误：压缩包条目数超过上限（{EXTRACT_MAX_ENTRIES}），已中止"
+                total_size = 0
+                for info in infos:
+                    target = os.path.normpath(os.path.join(base, info.filename))
+                    if not (target == base or target.startswith(base + os.sep)):
+                        return f"错误：压缩包含越界条目，已中止：{info.filename}"
+                    if info.file_size > EXTRACT_MAX_SINGLE_BYTES:
+                        return f"错误：压缩包单文件超过大小上限：{info.filename}"
+                    total_size += info.file_size
+                    if total_size > EXTRACT_MAX_TOTAL_BYTES:
+                        return f"错误：压缩包总解压大小超过上限，已中止"
+                rf.extractall(dest)
+            permissions.audit("extract_archive", dest, f"{len(infos)} 个条目")
+            return f"已解压 {len(infos)} 个条目到 {dest}"
+        return f"错误：不支持的压缩格式 {ext or '（无扩展名）'}（支持 zip/tar/gz/7z/rar）"
+    except ImportError as e:
+        return f"错误：解压该格式需要额外依赖：{e}"
     except Exception as e:
         return f"错误：解压失败: {e}"
 
@@ -7447,6 +7971,14 @@ TOOL_CALL_MAP = {
     "database_query_mysql": database_query_mysql,
     "database_query_postgres": database_query_postgres,
     "send_webhook": send_webhook,
+    "im_send": im_send,
+    "telegram_poll_updates": telegram_poll_updates,
+    "download_file": download_file,
+    "epub_read": epub_read,
+    "mobi_read": mobi_read,
+    "doc_read": doc_read,
+    "msg_read": msg_read,
+    "archive_list": archive_list,
     "subagent_run": subagent_run,
     "run_tests": run_tests,
     "verify_output": verify_output,

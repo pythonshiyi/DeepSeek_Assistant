@@ -2,6 +2,15 @@
 
 本文件记录鲸语 WhaleTalk 的版本迭代历史。当前版本见 [README](README.md)。
 
+## v2.15.0（2026-08-15）
+
+- **IM 主动触达**：新增 `im_send`（Telegram Bot / 企业微信群机器人，im_config.json 配置，敏感字段 DPAPI 加密）与 `telegram_poll_updates`（长轮询接收用户消息，游标自动去重）——AI 可主动汇报、用户可随时召唤。
+- **浏览器自动化补全**：playwright + Chromium 已安装就绪；`browser_navigate` 保留 open/click/type/fill/submit/select/get_text 多步共享页面。
+- **二进制下载**：新增 `download_file` 工具，任意格式流式下载到工作区 downloads/ 或指定目录，200MB 上限、超限自动清理。
+- **文件格式扩展**：新增 `epub_read` / `mobi_read` / `doc_read`（antiword/catdoc）/ `msg_read`（extract_msg）；`archive_list` 支持 zip/tar/gz/7z/rar 列目录；`extract_archive` 扩展支持 tar/gz/7z/rar。
+- **默认启用**：上述新工具加入 `BUILTIN_TOOL_NAMES`，旧配置升级自动补入。
+- **测试**：新增 tests/test_p1p2_tools.py；全量 555 项通过。
+
 ## v2.14.0（2026-08-15）
 
 - **权限哲学反转：默认放行 + 黑名单（自由优先，用户掌权）**：`permissions.py` 升级 v2——默认 `security_mode="blacklist"`，AI 拥有全部文件/命令/网络/敏感操作能力，只按用户维护的黑名单拦截；黑名单默认为空，可一键清空/增删。旧 `whitelist` 模式保留可回退。

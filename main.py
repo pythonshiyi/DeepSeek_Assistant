@@ -157,6 +157,7 @@ _dc.MEMORY_FILE = MEMORY_PATH
 _dc.EMAIL_CONFIG_FILE = os.path.join(DATA_DIR, "email_config.json")
 _dc.DB_CONFIG_FILE = os.path.join(DATA_DIR, "db_config.json")
 _dc.WEBHOOK_CONFIG_FILE = os.path.join(DATA_DIR, "webhooks.json")
+_dc.IM_CONFIG_FILE = os.path.join(DATA_DIR, "im_config.json")
 _dc.BROWSER_HEADLESS = True
 _dc.WORKING_DIR = None  # 工作目录传导：run_command/start_process 的 cwd（由 _set_active_dir 更新）
 _dc.BROWSER_PROFILE_DIR = os.path.join(DATA_DIR, "browser_profile")
@@ -193,7 +194,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.14.0"
+VERSION = "2.15.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
