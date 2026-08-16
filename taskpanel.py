@@ -337,9 +337,10 @@ class TaskPanel:
 
 
 class InlineTaskPanel:
-    """聊天区右上角内嵌任务进度卡（替代左下角悬浮窗）。
+    """聊天区右上角内嵌任务进度条（替代左下角悬浮窗）。
 
-    小、轻、不打断：任务开始时出现，工具执行时更新状态，完成后 4 秒淡出。
+    单行紧凑设计：任务开始时出现在会话信息条下方，工具执行时更新，
+    完成后 4 秒淡出。高度仅 ~28px，不遮挡会话信息条。
     """
 
     def __init__(self, master, theme=None):
@@ -352,18 +353,19 @@ class InlineTaskPanel:
             highlightbackground=t.get("border", "#e3e5e9"),
             highlightcolor=t.get("accent", "#3478f6"),
         )
-        self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+        # 定位在会话信息条（header，约 42px）下方：不遮挡右上角信息
+        self.frame.place(relx=1.0, x=-12, y=48, anchor="ne")
         self.title_lbl = tk.Label(
             self.frame, text="🤖 任务执行中", bg=t.get("panel", "#ffffff"),
             fg=t.get("accent", "#3478f6"), font=(FONT_FAMILY, 9, "bold"),
         )
-        self.title_lbl.pack(side="left", padx=(10, 8), pady=6)
+        self.title_lbl.pack(side="left", padx=(10, 8), pady=5)
         self.status_lbl = tk.Label(
             self.frame, text="", bg=t.get("panel", "#ffffff"),
             fg=t.get("text_sec", "#8a9099"), font=(FONT_FAMILY, 9),
             anchor="w", justify="left",
         )
-        self.status_lbl.pack(side="left", padx=(0, 12), pady=6)
+        self.status_lbl.pack(side="left", padx=(0, 12), pady=5)
         self._count = 0
         self._started_at = 0.0
         self._hide_after = None
@@ -375,7 +377,7 @@ class InlineTaskPanel:
         try:
             self.title_lbl.configure(text="🤖 任务执行中")
             self.status_lbl.configure(text="准备工具…")
-            self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+            self.frame.place(relx=1.0, x=-12, y=48, anchor="ne")
             self.frame.lift()
         except tk.TclError:
             pass
@@ -388,7 +390,7 @@ class InlineTaskPanel:
             self.status_lbl.configure(
                 text=f"{mark} {name} · 第 {self._count} 个 · {self._elapsed():.0f}s"
             )
-            self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+            self.frame.place(relx=1.0, x=-12, y=48, anchor="ne")
             self.frame.lift()
         except tk.TclError:
             pass
@@ -397,7 +399,7 @@ class InlineTaskPanel:
         try:
             self.title_lbl.configure(text="🤖 任务完成")
             self.status_lbl.configure(text=str(summary or "")[:120])
-            self.frame.place(relx=1.0, x=-12, y=10, anchor="ne")
+            self.frame.place(relx=1.0, x=-12, y=48, anchor="ne")
             self.frame.lift()
         except tk.TclError:
             pass

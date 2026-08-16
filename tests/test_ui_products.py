@@ -553,7 +553,7 @@ class TestAutoModeSemantics(ProductUIBase):
             self.app._suggest()
         self.assertTrue(sug.called)
         text, fn, arg = sug.call_args[0][0]
-        self.assertIn("完全智能", text)
+        self.assertIn("任务模式", text)
         self.assertEqual(fn.__name__, "_switch_mode_quick")
         self.assertEqual(arg, "full_auto")
 
@@ -563,11 +563,13 @@ class TestAutoModeSemantics(ProductUIBase):
             self.app._switch_mode_quick("full_auto")
         self.assertTrue(self.app.cfg["full_auto"])
 
-    def test_suggest_quick_switch_cancel_keeps(self):
-        """建议采纳但取消确认：不生效。"""
-        with mock.patch.object(m.messagebox, "askyesno", return_value=False):
-            self.app._switch_mode_quick("full_auto")
-        self.assertFalse(self.app.cfg["full_auto"])
+    def test_suggest_quick_switch_effective(self):
+        """建议条快捷切换：无二次确认，直接生效（任务 ↔ 对话互斥）。"""
+        self.app.cfg["pure_chat"] = True
+        self.app.cfg["full_auto"] = False
+        self.app._switch_mode_quick("full_auto")
+        self.assertTrue(self.app.cfg["full_auto"])
+        self.assertFalse(self.app.cfg["pure_chat"])
 
     def test_full_auto_resolves_all_tools(self):
         """完全智能模式：运行时工具集 = 内置 + 自定义全部工具。"""
@@ -588,23 +590,34 @@ class TestAutoModeSemantics(ProductUIBase):
         self.assertEqual(names, [])
         self.assertFalse(tools_enabled)
 
-    def test_standard_resolves_configured_tools(self):
-        """标准模式：按工具中心配置的 enabled_tools。"""
+    def test_pure_chat_resolves_no_tools(self):
+        """纯对话模式：请求时工具集为空。"""
         self.app.cfg["full_auto"] = False
+        self.app.cfg["pure_chat"] = True
+        names, tools_enabled = self.app._mode_tools_for_request(self.app.cfg)
+        self.assertEqual(names, [])
+        self.assertFalse(tools_enabled)
+
+    def test_full_auto_smart_loads_all(self):
+        """完全智能模式：全部工具名返回（deepseek_client 侧做 smart 索引激活）。"""
+        self.app.cfg["full_auto"] = True
         self.app.cfg["pure_chat"] = False
-        self.app.cfg["enabled_tools"] = ["get_date", "get_weather"]
         names, tools_enabled = self.app._mode_tools_for_request(self.app.cfg)
         self.assertTrue(tools_enabled)
-        self.assertEqual(set(names), {"get_date", "get_weather"})
+        self.assertGreaterEqual(len(names), len(m.TOOLS))
 
-    def test_mode_switch_does_not_pollute_enabled_tools(self):
-        """模式切换不覆盖标准模式的工具配置（运行时语义，非配置污染）。"""
-        self.app.cfg["enabled_tools"] = ["get_date"]
+    def test_mode_switch_keeps_mode(self):
+        """模式切换（完全智能 ↔ 纯对话）互斥生效。"""
+        with mock.patch.object(m.messagebox, "askyesno", return_value=True):
+            self.app.mode_var.set("pure_chat")
+            self.app._on_mode_change()
+        self.assertFalse(self.app.cfg["full_auto"])
+        self.assertTrue(self.app.cfg["pure_chat"])
         with mock.patch.object(m.messagebox, "askyesno", return_value=True):
             self.app.mode_var.set("full_auto")
             self.app._on_mode_change()
         self.assertTrue(self.app.cfg["full_auto"])
-        self.assertEqual(self.app.cfg["enabled_tools"], ["get_date"])  # 原配置保留
+        self.assertFalse(self.app.cfg["pure_chat"])
 
     def test_intelligent_role_prompt_design(self):
         """「智能体」角色：为开发/创作任务而生的提示词设计（目标/执行/验证闭环）。"""
@@ -641,3 +654,4 @@ class TestRoleStatusVisible(ProductUIBase):
 
 if __name__ == "__main__":
     unittest.main()
+

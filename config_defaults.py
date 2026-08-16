@@ -126,7 +126,7 @@ DEFAULT_CONFIG = {
     "max_context_tokens": 400000,
     "min_kept_turns": 8,
     "timeout": 120,
-    "restore_session": True,
+    "restore_session": False,
     "font_size": 10,
     "font_size_custom": False,  # 用户手动改过字号后为 True，启动时不再自动按屏幕调整
     "theme": "light",

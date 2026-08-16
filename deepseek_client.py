@@ -2395,6 +2395,8 @@ def download_file(url, local_path=""):
 # ===== 推送通知（A6）：钉钉 / ServerChan / Slack / 通用 Webhook =====
 WEBHOOK_CONFIG_FILE = None  # 由 main 注入（DATA_DIR/webhooks.json）
 
+CHART_THEME = "dark"  # 图表配色跟随主题，由 main 注入（"dark"/"light"）
+
 
 def _load_webhooks():
     if not WEBHOOK_CONFIG_FILE or not os.path.exists(WEBHOOK_CONFIG_FILE):
@@ -3459,15 +3461,37 @@ def chart_data(data, path, kind="line", title="", x_label="", y_label=""):
                 return "错误：饼图最多支持 20 个数据点，请聚合后重试"
             if not any(v > 0 for v in ys):
                 return "错误：饼图需要至少一个正值数据"
-        fig, ax = plt.subplots(figsize=(8, 5), dpi=110)
-        if k == "bar":
-            ax.bar(xs, ys, color="#3478f6")
-        elif k == "pie":
-            ax.pie(ys, labels=xs, autopct="%1.1f%%")
-        elif k == "scatter":
-            ax.scatter(list(range(len(ys))), ys, color="#3478f6")
+        if CHART_THEME == "light":
+            face = "#ffffff"
+            grid = "#d5e4ec"
+            tick = "#5c7a96"
+            title_c = "#14283f"
+            series = "#00a3c8"
+            chart_bg = "#f5f9fc"
         else:
-            ax.plot(xs, ys, color="#3478f6", marker="o", markersize=4)
+            face = "#0a101f"
+            grid = "#14203a"
+            tick = "#9db0d1"
+            title_c = "#e9f1ff"
+            series = "#00d4ff"
+            chart_bg = "#0a101f"
+        fig, ax = plt.subplots(figsize=(8, 5), dpi=110, facecolor=face)
+        ax.set_facecolor(chart_bg)
+        for spine in ax.spines.values():
+            spine.set_color(grid)
+        ax.tick_params(colors=tick)
+        ax.xaxis.label.set_color(tick)
+        ax.yaxis.label.set_color(tick)
+        ax.title.set_color(title_c)
+        ax.grid(color=grid)
+        if k == "bar":
+            ax.bar(xs, ys, color=series)
+        elif k == "pie":
+            ax.pie(ys, labels=xs, autopct="%1.1f%%", textprops={"color": title_c})
+        elif k == "scatter":
+            ax.scatter(list(range(len(ys))), ys, color=series)
+        else:
+            ax.plot(xs, ys, color=series, marker="o", markersize=4)
         if title:
             ax.set_title(str(title))
         if x_label:
@@ -8608,6 +8632,219 @@ SELF_EVOLUTION_TOOLS = {
     "verify_files",
 }
 
+# ===== 智能工具调取（smart_tools）：索引 + 按需激活 =====
+# 完全智能模式不再一次性注入全部工具 schema（≈15k token），
+# 改为：常驻注入精简「工具索引」+ activate_tools 点菜工具；
+# AI 按需激活后，下一轮注入激活工具的完整 schema。
+
+ACTIVATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "activate_tools",
+        "description": (
+            "加载你拥有但尚未加载的能力定义。你的全部能力见系统消息中的能力地图。"
+            "当你决定使用某个工具时先调用本工具激活它，激活后即可正常调用。"
+            "只需激活本次要用到的工具，不要全部激活。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "要激活的工具名列表（来自能力地图）",
+                }
+            },
+            "required": ["tools"],
+        },
+    },
+}
+
+_TOOL_INDEX_CACHE = None
+_TOOL_INDEX_KEY = None
+
+# 能力地图分类（精确感知：类别 + 完整工具名 + 核心动作）。103 个工具全覆盖。
+TOOL_GROUPS = [
+    ("🌐 浏览器与网页", ["browser_navigate", "web_screenshot", "fetch_url", "fetch_blocked", "search_web", "search_realtime", "search_github", "webdav", "download_file", "rss_fetch"]),
+    ("💻 编程与执行", ["run_python", "run_command", "pip_install", "run_tests", "write_code_project", "subagent_run", "verify_output", "start_process", "stop_process", "list_processes", "environment_info", "system_status"]),
+    ("📁 文件与目录", ["read_file", "write_file", "edit_file", "list_dir", "search_local", "delete_file", "archive_files", "extract_archive", "batch_rename", "clipboard_get", "clipboard_set"]),
+    ("📊 数据与文档", ["read_csv", "write_csv", "read_excel", "write_excel", "chart_data", "database_query", "database_query_mysql", "database_query_postgres", "database_execute", "create_doc", "docx_read", "pptx_read", "pdf_extract", "pdf_create", "epub_read", "mobi_read", "doc_read", "archive_list", "secret_store", "kv_store"]),
+    ("📧 邮件与消息", ["send_email", "read_email", "email_summary", "agent_mail", "msg_read", "im_send", "telegram_poll_updates", "send_webhook", "publish_draft", "run_wechat_writer", "daily_brief"]),
+    ("🎨 媒体与图像", ["image_process", "image_understand", "image_generate", "ocr_image", "screen_capture", "speech_to_text", "tts_save", "media_ffmpeg", "qrcode"]),
+    ("🖱 桌面自动化", ["rpa_screen_size", "rpa_click", "rpa_type", "rpa_hotkey", "rpa_move", "rpa_scroll", "rpa_screenshot", "notify_desktop"]),
+    ("⏰ 定时与任务", ["schedule_task", "list_schedules", "cancel_schedule", "task_checkpoint_save", "task_checkpoint_load", "run_workflow"]),
+    ("🧠 记忆与知识", ["write_memory", "read_memory", "query_memory_graph", "knowledge_index", "knowledge_search"]),
+    ("🔧 系统与基础", ["get_date", "get_weather", "ask_user", "request_permission", "call_api", "project_info", "read_project_file", "create_evolution", "verify_files", "usage_report", "create_plugin"]),
+]
+
+# 核心动作短语（能力感知关键：一行说清「能做什么」）
+_TOOL_ACTION_PHRASES = {
+    "browser_navigate": "控制浏览器（打开网页/点击/输入/填表/提交/选择/取文本，共享登录态）",
+    "web_screenshot": "网页截图保存",
+    "fetch_url": "抓取网页/接口的文本或 JSON",
+    "fetch_blocked": "抓取被墙站点（代理+指纹绕过封锁）",
+    "search_web": "联网搜索（多引擎聚合）",
+    "search_realtime": "实时热点/社区讨论搜索",
+    "search_github": "搜索 GitHub 仓库",
+    "webdav": "WebDAV 云盘（坚果云/Nextcloud）上传下载",
+    "download_file": "下载文件到本地",
+    "rss_fetch": "RSS 订阅/聚合阅读",
+    "run_python": "执行 Python 代码",
+    "run_command": "执行系统命令",
+    "pip_install": "安装 Python 包",
+    "run_tests": "运行项目测试",
+    "write_code_project": "创建完整代码项目",
+    "subagent_run": "派发子智能体并行处理",
+    "verify_output": "核验产物/输出",
+    "start_process": "启动后台进程（服务器/长驻任务）",
+    "stop_process": "停止后台进程",
+    "list_processes": "查看后台进程列表",
+    "environment_info": "环境/依赖信息",
+    "system_status": "系统资源自检",
+    "read_file": "读取文件内容",
+    "write_file": "写入文件",
+    "edit_file": "编辑文件（局部修改）",
+    "list_dir": "列出目录",
+    "search_local": "在允许目录内全文检索文件",
+    "delete_file": "删除文件/目录",
+    "archive_files": "打包压缩",
+    "extract_archive": "解压归档",
+    "batch_rename": "批量重命名",
+    "clipboard_get": "读取剪贴板",
+    "clipboard_set": "写入剪贴板",
+    "read_csv": "读 CSV",
+    "write_csv": "写 CSV",
+    "read_excel": "读 Excel",
+    "write_excel": "写 Excel",
+    "chart_data": "数据可视化图表（线/柱/饼/散点）",
+    "database_query": "SQLite 只读查询",
+    "database_query_mysql": "MySQL 只读查询",
+    "database_query_postgres": "PostgreSQL 只读查询",
+    "database_execute": "数据库写操作（SQLite/MySQL/PG，带审批）",
+    "create_doc": "创建 Office 文档（docx/pptx/pdf）",
+    "docx_read": "读取 Word 文档",
+    "pptx_read": "读取 PPT",
+    "pdf_extract": "提取 PDF 文本",
+    "pdf_create": "生成 PDF",
+    "epub_read": "读取 epub 电子书",
+    "mobi_read": "读取 mobi 电子书",
+    "doc_read": "读取 doc/rtf 等旧格式",
+    "archive_list": "列出归档内容",
+    "secret_store": "加密密钥存储",
+    "kv_store": "轻量键值存储（缓存/状态）",
+    "send_email": "发送邮件（SMTP）",
+    "read_email": "读取邮件（IMAP）",
+    "email_summary": "邮件摘要/统计",
+    "agent_mail": "Agent 邮箱（查看/列表/搜索/回复/转发）",
+    "msg_read": "读取邮件消息",
+    "im_send": "IM 消息（Telegram/企业微信）",
+    "telegram_poll_updates": "轮询 Telegram 更新",
+    "send_webhook": "Webhook 推送（钉钉/ServerChan/Slack）",
+    "publish_draft": "发布草稿",
+    "run_wechat_writer": "公众号文章生成/排版",
+    "daily_brief": "每日简报",
+    "image_process": "图像处理（缩放/裁剪/滤镜/格式转换）",
+    "image_understand": "多模态看图理解",
+    "image_generate": "文生图",
+    "ocr_image": "图片文字识别 OCR",
+    "screen_capture": "屏幕截图",
+    "speech_to_text": "语音转文字",
+    "tts_save": "文字转语音",
+    "media_ffmpeg": "音视频处理（ffmpeg）",
+    "qrcode": "二维码生成/识别",
+    "rpa_screen_size": "获取屏幕尺寸",
+    "rpa_click": "模拟点击（屏幕坐标）",
+    "rpa_type": "模拟键盘输入",
+    "rpa_hotkey": "模拟快捷键",
+    "rpa_move": "移动鼠标",
+    "rpa_scroll": "滚动页面",
+    "rpa_screenshot": "屏幕区域截图",
+    "notify_desktop": "桌面通知",
+    "schedule_task": "定时任务（cron/每日/周期）",
+    "list_schedules": "查看定时任务",
+    "cancel_schedule": "取消定时任务",
+    "task_checkpoint_save": "保存任务断点",
+    "task_checkpoint_load": "加载任务断点",
+    "run_workflow": "执行工作流",
+    "write_memory": "写入长期记忆",
+    "read_memory": "检索长期记忆",
+    "query_memory_graph": "记忆知识图谱查询",
+    "knowledge_index": "建立知识库索引",
+    "knowledge_search": "语义检索知识库",
+    "get_date": "获取当前日期/时间",
+    "get_weather": "查询天气",
+    "ask_user": "向用户提问（澄清/确认）",
+    "request_permission": "请求权限（白名单）",
+    "call_api": "调用任意 HTTP API",
+    "project_info": "项目信息/文件树",
+    "read_project_file": "读取项目文件",
+    "create_evolution": "创建自我进化提案",
+    "verify_files": "核验项目文件完整性",
+    "usage_report": "用量/费用统计",
+    "create_plugin": "创建用户插件",
+}
+
+
+def build_tool_index(tools=None):
+    """生成能力地图：分类 + 完整工具名 + 核心动作短语（AI 准确感知全部能力）。"""
+    global _TOOL_INDEX_CACHE, _TOOL_INDEX_KEY
+    tools = tools if tools is not None else TOOLS
+    key = id(tools)
+    if _TOOL_INDEX_CACHE is not None and _TOOL_INDEX_KEY == key:
+        return _TOOL_INDEX_CACHE
+    by_name = {t["function"]["name"]: t for t in (tools or [])}
+    lines = [
+        "你拥有以下全部能力（工具），共 %d 项。需要某能力时，调用 activate_tools([\"工具名\",...]) 激活，激活后立即可用；"
+        "未激活前也具备该能力，只是定义尚未加载。简单对话可以不激活任何工具。" % len(by_name)
+    ]
+    for cat, members in TOOL_GROUPS:
+        rows = []
+        for name in members:
+            if name not in by_name:
+                continue
+            phrase = _TOOL_ACTION_PHRASES.get(name) or ""
+            if not phrase:
+                desc = by_name[name]["function"].get("description", "")
+                phrase = re.sub(r"\s+", " ", desc).strip()[:60]
+            rows.append(f"{name}({phrase})" if phrase else name)
+        if rows:
+            lines.append(f"{cat}: " + "、".join(rows))
+    _TOOL_INDEX_CACHE = "\n".join(lines)
+    _TOOL_INDEX_KEY = key
+    return _TOOL_INDEX_CACHE
+
+
+def compact_tool_schema(tool):
+    """压缩工具 schema 描述（省 token）：去掉兜底废话、截断长描述。"""
+    t = json.loads(json.dumps(tool))
+    fn = t["function"]
+    desc = fn.get("description", "")
+    for pat in (
+        r"（[^）]*可能不严格[^）]*）", r"（[^）]*依赖[^）]*）",
+        r"（[^）]*可选[^）]*）", r"（[^）]*保证生效[^）]*）",
+        r"（[^）]*默认为[^）]*）", r"（[^）]*默认 [^）]*）",
+    ):
+        desc = re.sub(pat, "", desc)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    if len(desc) > 130:
+        desc = desc[:130].rstrip("，。；;:：, ") + "…"
+    fn["description"] = desc
+    for p in (fn.get("parameters", {}).get("properties") or {}).values():
+        if isinstance(p, dict) and "description" in p:
+            d = p["description"]
+            d = re.sub(r"^可选[：:]\s*", "", d)
+            d = re.sub(r"（[^）]*）", "", d)
+            d = re.sub(r"\s+", " ", d).strip()
+            if len(d) > 60:
+                d = d[:60].rstrip("，。；;:：, ") + "…"
+            p["description"] = d
+    return t
+
+
+def compact_tools_list(tools):
+    """批量压缩工具 schema（保持顺序，安全返回原列表）。"""
+    return [compact_tool_schema(t) for t in tools]
+
 
 def check_balance(api_key, base_url=DEFAULT_BASE_URL, timeout=10.0):
     # balance 接口只在官方主端点，避免 base_url 带 /beta 等路径时拼接错误
@@ -8779,6 +9016,8 @@ class DeepSeekClient:
         on_truncated=None,
         trailing_text=None,
         strict_tools=False,
+        smart_tools=False,
+        preset_tools=None,
     ):
         cfg = SCENARIOS.get(scenario, SCENARIOS["通用"])
         thinking_key = thinking if thinking in THINKING_MODES else "high"
@@ -8840,6 +9079,33 @@ class DeepSeekClient:
         # 兜底：array 参数缺 items 会导致 API 400（missing field 'items'），
         # 内置/自定义/插件工具一律补齐，防御用户自定义 schema 遗漏
         _patch_array_items(all_tools)
+        # smart_tools（完全智能模式）：索引 + 按需激活，避免全量工具定义挤占上下文。
+        # enabled_tools 为 None 或「覆盖全部工具」时视为全量 → 可启用点菜
+        builtin_names = {t["function"]["name"] for t in TOOLS}
+        if enabled_tools is not None:
+            sel_names = set(enabled_tools)
+            if not (sel_names >= builtin_names):
+                enabled_tools = list(sel_names)  # 显式子集 → 非全量
+                smart_avail = False
+            else:
+                enabled_tools = None  # 全量 → smart 模式
+                smart_avail = True
+        else:
+            smart_avail = True
+        smart_avail = bool(smart_tools and tools_enabled and smart_avail)
+        activated = set(preset_tools or ())  # 预激活（关键词预筛）+ AI 点菜
+        smart_round = smart_avail  # 索引阶段：点菜工具 + 预激活工具并注入
+        index_msg = None
+        _index_shown = False
+        if smart_avail:
+            index_msg = {
+                "role": "system",
+                "content": (
+                    "你是一个拥有 100+ 项专业能力的桌面 AI 智能体，能力地图如下（你确实拥有这些能力，"
+                    "不要拒绝用户请求）。能力定义未加载时，先调用 activate_tools 激活再使用。\n\n"
+                    + build_tool_index()
+                ),
+            }
         if pure_chat:
             # 纯对话模式：完全不传 tools schema（避免工具提示词污染对话能力）
             pass
@@ -8851,6 +9117,7 @@ class DeepSeekClient:
                     if t["function"]["name"] in enabled_tools
                     or t["function"]["name"] in SELF_EVOLUTION_TOOLS
                 ]
+                smart_avail = False  # 显式子集时不启用点菜
             if tools:
                 kwargs["tools"] = _strictify_tools(tools) if strict_tools else tools
         elif any(t["function"]["name"] in SELF_EVOLUTION_TOOLS for t in all_tools):
@@ -8869,10 +9136,32 @@ class DeepSeekClient:
             for _ in range(rounds):
                 if stop_event and stop_event.is_set():
                     return False
+                # smart_tools 阶段切换：索引阶段注入 activate_tools 点菜；
+                # 激活后注入激活工具的完整 schema（压缩版），并移除点菜工具
+                if smart_avail:
+                    if smart_round:
+                        # 点菜阶段：点菜工具 + 已预激活工具（AI 可直接用，也可补充点菜）
+                        preset_specs = [t for t in all_tools if t["function"]["name"] in activated]
+                        kw_tools = [ACTIVATE_TOOL] + compact_tools_list(preset_specs)
+                    else:
+                        sel = [t for t in all_tools if t["function"]["name"] in activated]
+                        kw_tools = compact_tools_list(sel) if sel else None
+                    if kw_tools:
+                        kwargs["tools"] = _strictify_tools(kw_tools) if strict_tools else kw_tools
+                    else:
+                        kwargs.pop("tools", None)
+                    # 索引消息在「点菜/工具调用发生前」每轮注入（AI 可随时参考点菜），
+                    # 首次点菜或工具调用后移除（AI 已上手，避免浪费）
+                    if not _index_shown and index_msg is not None:
+                        req_work = [index_msg] + list(work)
+                    else:
+                        req_work = work
+                else:
+                    req_work = work
                 # 发送前构造请求消息：剥离无工具轮次的思考内容（省输入 token），
                 # 动态上下文（trailing_text）追加到最近一条 user 消息尾部。
                 # 仅作用于浅拷贝：不修改 work / 调用方内存历史（UI 与存档保留 reasoning）
-                req_msgs = _prune_reasoning_for_send(work)
+                req_msgs = _prune_reasoning_for_send(req_work)
                 if trailing:
                     req_msgs = list(req_msgs)
                     for i in range(len(req_msgs) - 1, -1, -1):
@@ -9005,6 +9294,38 @@ class DeepSeekClient:
                     if on_truncated and not (stop_event and stop_event.is_set()):
                         on_truncated("工具调用流被截断，本轮工具未执行")
                     return False
+
+                if smart_avail:
+                    # 拦截 activate_tools 点菜调用：更新激活集，切换为完整工具注入
+                    act_calls = [tc for tc in tool_calls if tc.get("name") == "activate_tools"]
+                    if act_calls:
+                        for tc in act_calls:
+                            try:
+                                args = json.loads(tc.get("args") or "{}")
+                                wanted = args.get("tools") or []
+                                for n in wanted:
+                                    if any(t["function"]["name"] == n for t in all_tools):
+                                        activated.add(str(n))
+                            except (TypeError, ValueError):
+                                pass
+                            work.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": f"已激活工具: {sorted(activated) or '（无）'}",
+                                }
+                            )
+                        # 非点菜工具也一并执行；点菜轮若有内容则保留
+                        rest = [tc for tc in tool_calls if tc.get("name") != "activate_tools"]
+                        if not rest:
+                            _index_shown = True
+                            if smart_round:
+                                smart_round = False  # 下一轮注入激活工具完整 schema
+                            continue
+                        tool_calls = rest
+                    else:
+                        # 直接调用工具（未点菜，如预激活场景）：索引已完成使命
+                        _index_shown = True
 
                 if on_plan is not None:
                     ok_plan, reason_plan = on_plan(

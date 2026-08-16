@@ -11,6 +11,7 @@ import threading
 import time
 import webbrowser
 import bisect
+import math
 from datetime import date, datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -196,7 +197,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.22.2"
+VERSION = "2.23.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -220,6 +221,11 @@ RECENT_PATH = os.path.join(DATA_DIR, "recent_outputs.json")
 FONT_FAMILY = "Microsoft YaHei UI"
 MONO_FAMILY = "Consolas"
 PLACEHOLDER_TEXT = "输入问题，Enter 发送，Shift+Enter 换行"
+
+
+def _hex_rgb(color):
+    color = str(color).lstrip("#")
+    return tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
 
 # THEMES 已移至 themes.py
 
@@ -315,6 +321,8 @@ class AssistantApp:
         self.APP_NAME = APP_NAME
         self.APP_NAME_EN = APP_NAME_EN
         self.VERSION = VERSION
+        # dialogs 包引用的路径/常量（模块级定义，注入为实例属性）
+        self.STATS_PATH = STATS_PATH
         self.cfg = load_config()
         # SSRF 信任主机白名单（回环默认放行；内网经白名单显式信任后放行）
         _dc.set_ssrf_trusted(self.cfg.get("ssrf_trusted") or [])
@@ -363,6 +371,7 @@ class AssistantApp:
         self._last_snapshot_time = 0.0
         self._fold_ranges = {}
         self._fold_nums = {}  # 折叠数值键缓存：与 _fold_ranges[text] 同步维护，点击命中免重建列表
+        self._code_copy_ranges = {}
         self._filelink_ranges = {}
         self._md_render = bool(self.cfg.get("md_render", True))
         self.md_var = tk.BooleanVar(value=self._md_render)
@@ -374,8 +383,17 @@ class AssistantApp:
         permissions.set_approval_callback(self._request_approval_dialog)
         permissions.set_whitelist_callback(self._request_whitelist_callback)
         permissions.set_audit_enabled(not bool(self.cfg.get("privacy_mode", False)))
+        # 双态模式：默认完全智能（旧标准模式配置 → 兼容迁移为完全智能）
+        if not self.cfg.get("full_auto") and not self.cfg.get("pure_chat"):
+            self.cfg["full_auto"] = True
+            self.cfg["pure_chat"] = False
+        # 默认空会话启动（主流会话管理习惯：启动即新对话，历史会话自行从左侧选择）；
+        # 旧配置 restore_session=True（旧默认）一并迁移为 False
+        if self.cfg.get("restore_session", False):
+            self.cfg["restore_session"] = False
         permissions.set_full_auto(bool(self.cfg.get("full_auto", False)))
         _dc.AGENT_MAIL_ENABLED = bool(self.cfg.get("agent_mail_enabled", False))
+        _dc.CHART_THEME = str(self.cfg.get("theme", "dark") or "dark")
         _dc.AGENT_MAIL_CLI = str(self.cfg.get("agent_mail_cli") or "agently-cli").strip() or "agently-cli"
         self._aibot_listener = None
         self._im_pending_frame = None
@@ -444,7 +462,7 @@ class AssistantApp:
 
     def build_ui(self):
         t = self._theme()
-        self.root.title(f"{APP_NAME} {APP_NAME_EN} v{VERSION}")
+        self.root.title(f"{APP_NAME} {APP_NAME_EN} v{VERSION} · 深海声呐")
         # 窗口几何：默认最大化启动（Windows zoomed，铺满屏幕工作区，天然上下左右居中）；
         # 最大化不可用时回退记忆几何（屏幕内校验：尺寸超屏收缩、位置越界校正），
         # 再回退默认 1280x820 居中
@@ -545,6 +563,49 @@ class AssistantApp:
         self._restyle.append((bar, "panel"))
         self.menu_bar_frame = bar
 
+        # ---- 品牌区（深海驾驶舱：声呐鲸标 + 品牌名，hover 微亮） ----
+        brand = tk.Frame(bar, bg=t["panel"])
+        brand.pack(side="left", padx=(10, 2), pady=2)
+        self._restyle.append((brand, "panel"))
+        brand_icon = tk.Label(
+            brand, text="🐋", bg=t["panel"], fg=t["accent"],
+            font=(FONT_FAMILY, 11),
+        )
+        brand_icon.pack(side="left")
+        self._restyle.append((brand_icon, "panel"))
+        brand_name = tk.Label(
+            brand, text="鲸语 WhaleTalk", bg=t["panel"], fg=t["accent"],
+            font=(FONT_FAMILY, 10, "bold"),
+        )
+        brand_name.pack(side="left", padx=(4, 0))
+        self._restyle.append((brand_name, ("label", "label_accent", "panel")))
+        self._brand_name = brand_name
+        self._brand_hover_bg = t["panel"]
+
+        def _brand_hover(on):
+            try:
+                bg = self.theme_color("hover") if on else self.theme_color("panel")
+                brand.configure(bg=bg)
+                brand_icon.configure(bg=bg)
+                brand_name.configure(bg=bg)
+            except tk.TclError:
+                pass
+
+        brand.bind("<Enter>", lambda e: _brand_hover(True))
+        brand.bind("<Leave>", lambda e: _brand_hover(False))
+        brand_icon.bind("<Enter>", lambda e: _brand_hover(True))
+        brand_icon.bind("<Leave>", lambda e: _brand_hover(False))
+        brand_name.bind("<Enter>", lambda e: _brand_hover(True))
+        brand_name.bind("<Leave>", lambda e: _brand_hover(False))
+        # 右侧版本号（标签化小胶囊）
+        ver_lbl = tk.Label(
+            bar, text=f"v{VERSION}", bg=t["surface"], fg=t["text_sec"],
+            font=(FONT_FAMILY, 8), padx=8, pady=2,
+        )
+        ver_lbl.pack(side="right", padx=(0, 10), pady=4)
+        self._restyle.append((ver_lbl, ("label", "label_sec", "surface")))
+        self._restyle.append((ver_lbl, ("label", "label_sec", "panel")))
+
         def add_menu(title, setup):
             menu = tk.Menu(self.root, **menu_opts)
             self._menus.append(menu)
@@ -566,7 +627,7 @@ class AssistantApp:
                 font=(FONT_FAMILY, 9),
             )
             btn.config(command=lambda m=menu, b=btn: self._post_menu(m, b))
-            btn.pack(side="left")
+            btn.pack(side="left", padx=(2, 0))
             self._menu_buttons.append(btn)
             self._restyle.append((btn, "menu_btn"))
             return menu
@@ -1384,15 +1445,24 @@ class AssistantApp:
         head = tk.Frame(frame, bg=t["page"])
         head.pack(fill="x", padx=12, pady=(10, 6))
         self._restyle.append((head, "page"))
-        self._lbl(head, "对话", role="label_sec", font=(FONT_FAMILY, 10, "bold")).pack(side="left")
+        self._lbl(head, "💬 会话", role="label_accent", font=(FONT_FAMILY, 10, "bold")).pack(side="left")
         self.btn_new = self._mk_button(head, "＋ 新建", lambda: self.add_tab(), kind="primary", fsz=9)
         self.btn_new.pack(side="right")
 
+        # 搜索卡片：surface 标题条 + 输入框
+        search_card = tk.Frame(frame, bg=t["panel"])
+        search_card.pack(fill="x", padx=10, pady=(2, 6))
+        self._restyle.append((search_card, "panel"))
+        search_head = tk.Frame(search_card, bg=t["surface"])
+        search_head.pack(fill="x")
+        self._restyle.append((search_head, "surface"))
+        self._lbl(search_head, "🔍 搜索会话", role="label_sec", bg="surface",
+                  font=(FONT_FAMILY, 8, "bold")).pack(side="left", padx=10, pady=3)
         self.session_search_var = tk.StringVar()
         self.session_search_entry = ttk.Entry(
-            frame, textvariable=self.session_search_var
+            search_card, textvariable=self.session_search_var
         )
-        self.session_search_entry.pack(fill="x", padx=10, pady=(0, 2))
+        self.session_search_entry.pack(fill="x", padx=10, pady=(0, 8))
         # 搜索词变化防抖 200ms：每敲一个字符就全量重建 Listbox 会让列表卡顿
         self.session_search_var.trace_add(
             "write", lambda *a: self._schedule_session_list_refresh()
@@ -1402,8 +1472,17 @@ class AssistantApp:
         )
         self.session_count_label.pack(anchor="w", padx=12, pady=(0, 4))
 
+        # 会话列表卡片：surface 标题条 + panel 列表区
+        list_card = tk.Frame(frame, bg=t["panel"])
+        list_card.pack(fill="both", expand=True, padx=10)
+        self._restyle.append((list_card, "panel"))
+        list_head = tk.Frame(list_card, bg=t["surface"])
+        list_head.pack(fill="x")
+        self._restyle.append((list_head, "surface"))
+        self._lbl(list_head, "📋 会话记录", role="label_sec", bg="surface",
+                  font=(FONT_FAMILY, 8, "bold")).pack(side="left", padx=10, pady=3)
         self.session_list = tk.Listbox(
-            frame,
+            list_card,
             bg=t["panel"],
             fg=t["text"],
             selectbackground=t["selection"],
@@ -1416,21 +1495,18 @@ class AssistantApp:
             font=(FONT_FAMILY, 9),
             exportselection=False,
         )
-        self.session_list.pack(fill="both", expand=True, padx=10)
+        self.session_list.pack(fill="both", expand=True, padx=6, pady=(2, 8))
         self._restyle.append((self.session_list, "listbox"))
         # 会话列表细滚动条：place 叠加（不参与 pack，长会话名撑宽列表时也不会被压缩掉）
-        list_sb = tk.Scrollbar(
-            frame,
+        list_sb = ttk.Scrollbar(
+            list_card,
             orient="vertical",
             command=self.session_list.yview,
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            width=10,
+            style="WT.Vertical.TScrollbar",
         )
-        list_sb.place(relx=1.0, x=-10, y=0, width=10, relheight=1.0)
+        list_sb.place(relx=1.0, x=-8, y=26, width=10, relheight=1.0)
         self.session_list.configure(yscrollcommand=list_sb.set)
-        self._restyle.append((list_sb, "list_scrollbar"))
+        # ttk 滚动条样式由 _apply_ttk_styles 统一配置（WT.Vertical.TScrollbar）
         self._session_list_scrollbar = list_sb
 
         def _on_list_wheel(event):
@@ -1450,33 +1526,100 @@ class AssistantApp:
         self.session_list.bind("<Button-5>", lambda e: (self.session_list.yview_scroll(1, "units"), "break")[1])
         self.session_list.bind("<<ListboxSelect>>", self._on_tab_changed)
         self.session_list.bind("<Double-1>", self._on_tab_double_click)
+        def _on_list_hover(event):
+            try:
+                idx = self.session_list.nearest(event.y)
+                if idx != getattr(self, "_list_hover_idx", None):
+                    if self._list_hover_idx is not None:
+                        try:
+                            self.session_list.itemconfig(
+                                self._list_hover_idx, bg=self._theme()["panel"]
+                            )
+                        except tk.TclError:
+                            pass
+                    self._list_hover_idx = idx
+                    try:
+                        self.session_list.itemconfig(idx, bg=self._theme()["hover"])
+                    except tk.TclError:
+                        pass
+            except Exception:
+                pass
+
+        def _on_list_hover_leave(_event=None):
+            if self._list_hover_idx is not None:
+                try:
+                    self.session_list.itemconfig(
+                        self._list_hover_idx, bg=self._theme()["panel"]
+                    )
+                except tk.TclError:
+                    pass
+                self._list_hover_idx = None
+
         self.session_list.bind("<Button-3>", self._on_session_menu)
         self.session_list.bind("<Delete>", lambda e: self.close_tab())
         self.session_list.bind("<F2>", lambda e: self.rename_tab())
+        # hover 行高亮：Motion 记录当前行，Leave 清除
+        self._list_hover_idx = None
+        self.session_list.bind("<Motion>", _on_list_hover)
+        self.session_list.bind("<Leave>", _on_list_hover_leave)
 
+        # 底部操作区：分隔线 + 操作按钮
         foot = tk.Frame(frame, bg=t["page"])
-        foot.pack(fill="x", padx=10, pady=(4, 10))
+        foot.pack(fill="x", padx=10, pady=(0, 10))
         self._restyle.append((foot, "page"))
-        self.btn_toggle_panel = self._mk_button(foot, "⚙ 设置", self.toggle_side_panel, fsz=9)
+        self._line(foot)
+        foot_row = tk.Frame(foot, bg=t["page"])
+        foot_row.pack(fill="x", pady=(8, 0))
+        self._restyle.append((foot_row, "page"))
+        self.btn_toggle_panel = self._mk_button(foot_row, "⚙ 设置", self.toggle_side_panel, fsz=9)
         self.btn_toggle_panel.pack(side="left")
-        self.btn_balance = self._mk_button(foot, "余额", self.check_balance, fsz=9)
+        self.btn_balance = self._mk_button(foot_row, "💰 余额", self.check_balance, fsz=9)
         self.btn_balance.pack(side="right")
 
-        # 聊天区宽度分隔条：默认与页面同色（不明显），悬停/拖拽时高亮；双击恢复默认
-        handle = tk.Frame(self.root, bg=t["page"], width=6, cursor="sb_h_double_arrow")
+        # 聊天区宽度分隔条：默认与页面同色（不明显），悬停/拖拽时高亮 + 圆点把手；双击恢复默认
+        handle = tk.Canvas(
+            self.root, bg=t["page"], width=10, cursor="sb_h_double_arrow",
+            highlightthickness=0, bd=0,
+        )
         handle.pack(side="left", fill="y")
         self._restyle.append((handle, "chat_resize_handle"))
         self.chat_resize_handle = handle
+        self._handle_dots = [
+            handle.create_oval(3, y, 7, y + 4, fill=t["border"], outline="") for y in (8, 14, 20)
+        ]
         handle.bind("<Button-1>", self._on_width_press)
         handle.bind("<Double-1>", self._reset_sidebar_width)
         handle.bind(
-            "<Enter>", lambda e: handle.configure(bg=self.theme_color("accent"))
+            "<Enter>", lambda e: self._handle_hover(True)
         )
         handle.bind(
-            "<Leave>", lambda e: handle.configure(bg=self.theme_color("page"))
+            "<Leave>", lambda e: self._handle_hover(False)
         )
         self._width_drag_start_x = None
         self._width_drag_base = 0
+
+    def _handle_hover(self, on):
+        """分割手柄 hover：底色 accent、圆点变深，指示可拖动。"""
+        try:
+            t = self._theme()
+            bg = t["accent"] if on else t["page"]
+            dot = t["accent_text"] if on else t["border"]
+            self.chat_resize_handle.configure(bg=bg)
+            for d in self._handle_dots:
+                self.chat_resize_handle.itemconfig(d, fill=dot)
+        except tk.TclError:
+            pass
+
+    def _panel_handle_hover(self, on):
+        try:
+            t = self._theme()
+            bg = t["accent"] if on else t["page"]
+            dot = t["accent_text"] if on else t["border"]
+            self.panel_resize_handle.configure(bg=bg)
+            for d in self._panel_handle_dots:
+                self.panel_resize_handle.itemconfig(d, fill=dot)
+        except tk.TclError:
+            pass
 
     def _set_sidebar_width(self, w):
         """设置侧栏宽度（LAYOUT 档位内），chat_frame 自动重排，聊天列随之调整。"""
@@ -1579,46 +1722,99 @@ class AssistantApp:
         self._side_tab = "settings"  # settings / files
 
         # 右侧设置面板拖拽分隔条：左右拉动调整聊天区/设置面板宽度
-        handle = tk.Frame(self.root, bg=t["page"], width=6, cursor="sb_h_double_arrow")
+        handle = tk.Canvas(self.root, bg=t["page"], width=10, cursor="sb_h_double_arrow",
+                           highlightthickness=0, bd=0)
         handle.pack(side="right", fill="y")
         self._restyle.append((handle, "chat_resize_handle"))
         self.panel_resize_handle = handle
+        self._panel_handle_dots = [
+            handle.create_oval(3, y, 7, y + 4, fill=t["border"], outline="") for y in (8, 14, 20)
+        ]
         handle.bind("<Button-1>", self._on_panel_width_press)
         handle.bind("<Double-1>", self._reset_panel_width)
-        handle.bind("<Enter>", lambda e: handle.configure(bg=self.theme_color("accent")))
-        handle.bind("<Leave>", lambda e: handle.configure(bg=self.theme_color("page")))
+        handle.bind("<Enter>", lambda e: self._panel_handle_hover(True))
+        handle.bind("<Leave>", lambda e: self._panel_handle_hover(False))
         self._panel_drag_start_x = None
         self._panel_drag_base = panel_w
 
+        # 面板头部：胶囊 Tab（设置 / 文件）+ 主题切换
         head = tk.Frame(panel, bg=t["panel"])
-        head.pack(fill="x", padx=14, pady=(10, 4))
+        head.pack(fill="x", padx=14, pady=(12, 8))
         self._restyle.append((head, "panel"))
-        self.btn_side_settings = self._mk_button(head, "⚙ 设置", lambda: self._switch_side_tab("settings"), fsz=9, kind="primary")
-        self.btn_side_settings.pack(side="left")
-        self.btn_side_files = self._mk_button(head, "📂 文件", lambda: self._switch_side_tab("files"), fsz=9)
-        self.btn_side_files.pack(side="left", padx=(6, 0))
+        tab_wrap = tk.Frame(head, bg=t["surface"], highlightthickness=0, bd=0)
+        tab_wrap.pack(side="left")
+        self._restyle.append((tab_wrap, "surface"))
+        self._side_tab_btns = {}
+        for _name, _key, _cmd in (("⚙ 设置", "settings", lambda: self._switch_side_tab("settings")),
+                                  ("📂 文件", "files", lambda: self._switch_side_tab("files"))):
+            b = tk.Label(
+                tab_wrap, text=_name, bg=t["surface"], fg=t["text_sec"],
+                font=(FONT_FAMILY, 9), padx=12, pady=4, cursor="hand2",
+            )
+            b.pack(side="left")
+            b.bind("<Button-1>", lambda e, k=_key: self._switch_side_tab(k))
+            self._side_tab_btns[_key] = b
         self.btn_theme = self._mk_button(head, "🌙 深色", self.toggle_theme, fsz=9)
         self.btn_theme.pack(side="right")
         self._line(panel)
 
+        # 设置区：可滚动容器（设置项多，避免超出面板高度）
         self.panel_settings_body = tk.Frame(panel, bg=t["panel"])
         self.panel_settings_body.pack(fill="both", expand=True, padx=14, pady=10)
         self._restyle.append((self.panel_settings_body, "panel"))
+        self._settings_canvas = tk.Canvas(
+            self.panel_settings_body, bg=t["panel"], highlightthickness=0, bd=0
+        )
+        self._settings_canvas.pack(side="left", fill="both", expand=True)
+        self._settings_canvas.bind(
+            "<Configure>", lambda e: self._settings_canvas.itemconfigure(
+                self._settings_canvas_win, width=e.width
+            )
+        )
+        self._settings_inner = tk.Frame(self._settings_canvas, bg=t["panel"])
+        self._settings_canvas_win = self._settings_canvas.create_window(
+            (0, 0), window=self._settings_inner, anchor="nw"
+        )
+        self._settings_inner.bind(
+            "<Configure>",
+            lambda e: self._settings_canvas.configure(scrollregion=self._settings_canvas.bbox("all")),
+        )
+        self._settings_sb = ttk.Scrollbar(
+            self.panel_settings_body, orient="vertical",
+            command=self._settings_canvas.yview, style="WT.Vertical.TScrollbar",
+        )
+        self._settings_sb.pack(side="right", fill="y")
+        self._settings_canvas.configure(yscrollcommand=self._settings_sb.set)
+        self._settings_canvas.bind(
+            "<Enter>", lambda e: self._settings_canvas.bind_all("<MouseWheel>", self._on_settings_wheel)
+        )
+        self._settings_canvas.bind(
+            "<Leave>", lambda e: self._settings_canvas.unbind_all("<MouseWheel>")
+        )
 
         self.panel_files_body = tk.Frame(panel, bg=t["panel"])
         self._restyle.append((self.panel_files_body, "panel"))
         self._build_files_panel(self.panel_files_body)
 
-        body = self.panel_settings_body
+        body = self._settings_inner
 
-        def group(title, setup):
+        def group(title, setup, icon="◆"):
+            # 深海驾驶舱卡片：surface 标题条 + panel 内容区（内部控件零改动）
             g = tk.Frame(body, bg=t["panel"])
-            g.pack(fill="x", pady=(0, 12))
+            g.pack(fill="x", pady=(0, 10))
             self._restyle.append((g, "panel"))
-            self._lbl(g, title, role="label_sec", bg="panel", font=(FONT_FAMILY, 9, "bold")).pack(
-                anchor="w", pady=(0, 4)
-            )
-            setup(g)
+            head = tk.Frame(g, bg=t["surface"])
+            head.pack(fill="x")
+            self._restyle.append((head, "surface"))
+            self._lbl(head, icon, role="label_accent", bg="surface",
+                      font=(FONT_FAMILY, 9)).pack(side="left", padx=(12, 6))
+            self._lbl(head, title, role="label_text", bg="surface",
+                      font=(FONT_FAMILY, 9, "bold")).pack(side="left", pady=6)
+            self._line(head)
+            inner = tk.Frame(g, bg=t["panel"])
+            inner.pack(fill="x", padx=12, pady=10)
+            self._restyle.append((inner, "panel"))
+            setup(inner)
 
         def model_group(g):
             self.model_combo = ttk.Combobox(
@@ -1638,7 +1834,7 @@ class AssistantApp:
             )
             self.scenario_combo.pack(fill="x", pady=(6, 0))
             self.scenario_combo.bind("<<ComboboxSelected>>", self.on_scenario_change)
-            self._lbl(g, "任务能力由「自主模式」表达：完全智能 = 全部工具 / 纯对话 = 无工具",
+            self._lbl(g, "任务能力由「工作模式」表达：任务 = 全部工具 / 对话 = 无工具",
                       role="label_sec", bg="panel", font=(FONT_FAMILY, 8)).pack(anchor="w", pady=(6, 0))
             self.thinking_combo = ttk.Combobox(
                 g, width=14, values=list(THINKING_MODES.values()), state="readonly"
@@ -1710,7 +1906,7 @@ class AssistantApp:
             self.json_check.pack(in_=self.adv_frame, anchor="w", pady=(6, 0))
             self.beta_check.pack(in_=self.adv_frame, anchor="w", pady=(2, 0))
 
-        group("模型与参数", model_group)
+        group("模型与参数", model_group, icon="🎛")
 
         def role_row(g):
             self._lbl(g, "人格 = 系统提示词（说什么）", role="label_sec", bg="panel",
@@ -1720,54 +1916,45 @@ class AssistantApp:
             self._role_lbl.pack(anchor="w", pady=(2, 0))
             self._mk_button(g, "🎭 角色与提示词…", self.show_roles, fsz=9).pack(anchor="w", pady=(4, 0))
 
-        group("AI 人格", role_row)
+        group("AI 人格", role_row, icon="🎭")
 
         def tools_group(g):
-            self.tools_var = tk.BooleanVar(value=True)
-            ttk.Checkbutton(
-                g, text="启用工具 (Agent 自动调用)", variable=self.tools_var,
-                command=self._persist_panel_settings,
-            ).pack(anchor="w")
-            self.btn_tools = self._mk_button(g, "工具设置", self.edit_tools, fsz=9)
-            self.btn_tools.pack(anchor="w", pady=(6, 0))
+            self.btn_tools = self._mk_button(g, "🔧 工具库", self.edit_tools, fsz=9)
+            self.btn_tools.pack(anchor="w")
             self.browser_visible_var = tk.BooleanVar(value=not bool(self.cfg.get("browser_headless", True)))
             ttk.Checkbutton(
                 g,
-                text="🖥 浏览器可见（有头预览）",
+                text="🖥 浏览器可见",
                 variable=self.browser_visible_var,
                 command=self._on_browser_mode_change,
             ).pack(anchor="w", pady=(6, 0))
             self._lbl(
                 g,
-                "开启后 AI 操作浏览器会弹出真实窗口，可实时观看；关闭为无头静默。",
-                role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
-                wraplength=205, justify="left",
-            ).pack(anchor="w", pady=(0, 2))
-
-        group("工具", tools_group)
-
-        def auto_group(g):
-            self.mode_var = tk.StringVar(value="standard")
-            ttk.Radiobutton(
-                g, text="标准模式（工具与审批按配置）",
-                value="standard", variable=self.mode_var, command=self._on_mode_change,
-            ).pack(anchor="w")
-            ttk.Radiobutton(
-                g, text="🤖 完全智能（允许目录内全自动，免审批）",
-                value="full_auto", variable=self.mode_var, command=self._on_mode_change,
-            ).pack(anchor="w", pady=(4, 0))
-            ttk.Radiobutton(
-                g, text="💬 纯对话（不注入工具，回归纯粹对话）",
-                value="pure_chat", variable=self.mode_var, command=self._on_mode_change,
-            ).pack(anchor="w", pady=(4, 0))
-            self._lbl(
-                g,
-                "三种模式互斥：任务用完全智能/标准，对话写作用纯对话。",
+                "任务模式下全部工具自动可用；工具库可查看每项能力与依赖。",
                 role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
                 wraplength=205, justify="left",
             ).pack(anchor="w", pady=(6, 0))
 
-        group("自主模式", auto_group)
+        group("工具", tools_group, icon="🔧")
+
+        def auto_group(g):
+            self.mode_var = tk.StringVar(value="full_auto")
+            ttk.Radiobutton(
+                g, text="🤖 任务模式（完全智能，全部工具）",
+                value="full_auto", variable=self.mode_var, command=self._on_mode_change,
+            ).pack(anchor="w")
+            ttk.Radiobutton(
+                g, text="💬 对话模式（纯对话，不注入工具）",
+                value="pure_chat", variable=self.mode_var, command=self._on_mode_change,
+            ).pack(anchor="w", pady=(4, 0))
+            self._lbl(
+                g,
+                "任务模式：工具按需加载，目录内全自动；对话模式：回归纯粹问答。",
+                role="label_sec", bg="panel", font=(FONT_FAMILY, 9),
+                wraplength=205, justify="left",
+            ).pack(anchor="w", pady=(6, 0))
+
+        group("工作模式", auto_group, icon="🚀")
 
         def api_group(g):
             self.key_var = tk.StringVar()
@@ -1776,7 +1963,7 @@ class AssistantApp:
             self.key_entry.bind("<FocusOut>", self._persist_panel_settings)
             self.key_entry.bind("<Return>", self._persist_panel_settings)
 
-        group("API Key", api_group)
+        group("API Key", api_group, icon="🔑")
 
         def look_group(g):
             row = tk.Frame(g, bg=t["panel"])
@@ -1792,13 +1979,31 @@ class AssistantApp:
                 anchor="w", pady=(6, 0)
             )
 
-        group("外观", look_group)
+        group("外观", look_group, icon="🎨")
 
         bar = tk.Frame(panel, bg=t["panel"])
-        bar.pack(fill="x", side="bottom", padx=14, pady=10)
+        bar.pack(fill="x", side="bottom", padx=14, pady=(0, 12))
         self._restyle.append((bar, "panel"))
-        self.btn_save = self._mk_button(bar, "保存配置", self.save_widgets_to_config, kind="primary", fsz=9)
+        self._line(bar)
+        inner = tk.Frame(bar, bg=t["panel"])
+        inner.pack(fill="x", pady=(10, 0))
+        self._restyle.append((inner, "panel"))
+        self.btn_save = self._mk_button(inner, "💾 保存配置", self.save_widgets_to_config, kind="primary", fsz=9)
         self.btn_save.pack(side="left")
+        self.panel_save_hint = self._lbl(
+            inner, "", role="label_sec", bg="panel", font=(FONT_FAMILY, 8)
+        )
+        self.panel_save_hint.pack(side="right", padx=(6, 0))
+
+    def _on_settings_wheel(self, event):
+        try:
+            if abs(event.delta) >= 120:
+                self._settings_canvas.yview_scroll(-3 * int(event.delta / 120), "units")
+            else:
+                self._settings_canvas.yview_scroll(-int(event.delta / 10), "pixels")
+        except tk.TclError:
+            pass
+        return "break"
 
     def _switch_side_tab(self, which):
         """右侧面板 Tab 切换：设置 / 📂 文件（文件视图自动加宽面板）。"""
@@ -1815,8 +2020,13 @@ class AssistantApp:
                 self.panel_files_body.pack_forget()
                 self.panel_settings_body.pack(fill="both", expand=True, padx=14, pady=10)
                 self.side_panel.configure(width=LAYOUT["panel_default"])
-            self.btn_side_settings.configure(relief="sunken" if not is_files else "flat")
-            self.btn_side_files.configure(relief="sunken" if is_files else "flat")
+            t = self._theme()
+            for _key, _b in self._side_tab_btns.items():
+                _sel = (_key == which)
+                _b.configure(
+                    bg=t["accent"] if _sel else t["surface"],
+                    fg=t["accent_text"] if _sel else t["text_sec"],
+                )
         except tk.TclError:
             pass
         if is_files:
@@ -2310,7 +2520,8 @@ class AssistantApp:
         像素级平滑调整输入区高度（微信同款交互，双击恢复默认）。
         """
         t = self._theme()
-        handle = tk.Frame(self.root, bg=t["surface"], height=8, cursor="sb_v_double_arrow")
+        handle = tk.Frame(self.root, bg=t["surface"], height=8, cursor="sb_v_double_arrow",
+                          highlightthickness=0, bd=0)
         handle.pack(side="bottom", fill="x")
         self._restyle.append((handle, "input_handle"))
         grip = tk.Label(
@@ -2457,10 +2668,322 @@ class AssistantApp:
         self.chat_frame.pack(side="left", fill="both", expand=True)
         self._restyle.append((self.chat_frame, "page"))
         self.chat_frame.bind("<Configure>", self._layout_all)
+        # 会话信息吸顶条：会话名 + 模型 + 上下文用量（随窗口呼吸）
+        self.chat_header = tk.Frame(self.chat_frame, bg=t["page"])
+        self.chat_header.pack(side="top", fill="x")
+        self._restyle.append((self.chat_header, "page"))
+        self._line(self.chat_header)
+        self.chat_header_row = tk.Frame(self.chat_header, bg=t["page"])
+        self.chat_header_row.pack(fill="x", padx=18, pady=(6, 5))
+        self._restyle.append((self.chat_header_row, "page"))
+        self.chat_title_lbl = self._lbl(
+            self.chat_header_row, "会话", role="label_text", bg="page",
+            font=(FONT_FAMILY, 10, "bold"),
+        )
+        self.chat_title_lbl.pack(side="left")
+        self.chat_model_lbl = self._lbl(
+            self.chat_header_row, "", role="label_sec", bg="page",
+            font=(FONT_FAMILY, 9),
+        )
+        self.chat_model_lbl.pack(side="left", padx=(10, 0))
+        self.chat_ctx_lbl = self._lbl(
+            self.chat_header_row, "", role="label_sec", bg="page",
+            font=(FONT_FAMILY, 9),
+        )
+        self.chat_ctx_lbl.pack(side="right")
+        self.chat_round_lbl = self._lbl(
+            self.chat_header_row, "", role="label_sec", bg="page",
+            font=(FONT_FAMILY, 9),
+        )
+        self.chat_round_lbl.pack(side="right", padx=(0, 10))
         # 内嵌任务进度卡（聊天区右上角，替代左下角悬浮弹窗）
         self.task_panel = InlineTaskPanel(self.chat_frame, theme=t)
         self._add_session()
         self._show_session_text(self._current)
+        self._build_welcome()
+
+    def _build_welcome(self):
+        """空状态深海欢迎页：渐变海底 + 鲸鱼 + 声呐波纹动画 + 快捷卡片。
+
+        仅当当前会话无消息时显示（_show_session_text/_append 控制显隐）。
+        Canvas 全尺寸叠加在 chat_frame 上，静态内容在 _redraw_welcome 绘制，
+        声呐波纹由 _welcome_anim_step 定时器驱动。
+        """
+        t = self._theme()
+        if (
+            getattr(self, "welcome_canvas", None) is None
+            or not self.welcome_canvas.winfo_exists()
+        ):
+            c = tk.Canvas(self.chat_frame, bg=t["chat_bg"], highlightthickness=0, bd=0)
+            self.welcome_canvas = c
+            self._welcome_rings = []
+            self._welcome_tick = None
+            self._welcome_size = None
+            self.welcome_canvas.bind("<Configure>", lambda e: self._redraw_welcome())
+        else:
+            c = self.welcome_canvas
+            self._cancel_welcome_anim()
+            c.delete("all")
+        self._redraw_welcome()
+        self._start_welcome_anim()
+        if self._has_real_messages(self._current):
+            self._hide_welcome_page()
+        else:
+            self._show_welcome_page()
+
+    def _cancel_welcome_anim(self):
+        if getattr(self, "_welcome_tick", None) is not None:
+            try:
+                self.root.after_cancel(self._welcome_tick)
+            except Exception:
+                pass
+            self._welcome_tick = None
+
+    def _redraw_welcome(self):
+        c = self.welcome_canvas
+        if not c.winfo_exists():
+            return
+        try:
+            w = max(200, c.winfo_width())
+            h = max(200, c.winfo_height())
+        except tk.TclError:
+            return
+        if self._welcome_size and abs(self._welcome_size[0] - w) < 40 and abs(self._welcome_size[1] - h) < 40:
+            return
+        self._welcome_size = (w, h)
+        self._welcome_whale_center = (w / 2, h * 0.30)
+        t = self._theme()
+        c.delete("all")
+        try:
+            c.configure(bg=t["chat_bg"])
+        except tk.TclError:
+            pass
+        # ---- 垂直渐变海底（8 段插值，模拟深海光晕） ----
+        r1, g1, b1 = _hex_rgb(t["chat_bg"])
+        r2, g2, b2 = _hex_rgb(t["quote_bg"])
+        seg = 8
+        for i in range(seg):
+            k = i / seg
+            col = f"#{int(r1 + (r2 - r1) * k):02x}{int(g1 + (g2 - g1) * k):02x}{int(b1 + (b2 - b1) * k):02x}"
+            c.create_rectangle(0, int(h * k), w, int(h * (k + 1)), fill=col, outline="")
+        # ---- 鲸鱼徽标（归一化坐标，跟随画布缩放） ----
+        cx, cy = w / 2, h * 0.30
+        s = max(70, min(w, h) * 0.16)
+        body = t["accent"]
+        belly = t["bubble_user_text"]
+        ring = t["border"]
+        c.create_oval(cx - s, cy - 0.62 * s, cx + s, cy + 0.62 * s,
+                      outline=ring, width=max(1, int(s * 0.03)))
+        # 尾鳍
+        c.create_polygon(
+            cx - 0.72 * s, cy - 0.08 * s, cx - 1.16 * s, cy - 0.38 * s,
+            cx - 1.20 * s, cy - 0.06 * s, cx - 0.78 * s, cy - 0.04 * s,
+            fill=body, outline="")
+        c.create_polygon(
+            cx - 0.72 * s, cy + 0.12 * s, cx - 1.16 * s, cy + 0.44 * s,
+            cx - 1.20 * s, cy + 0.10 * s, cx - 0.78 * s, cy + 0.06 * s,
+            fill=body, outline="")
+        # 身体
+        c.create_oval(cx - 0.62 * s, cy - 0.24 * s, cx + 0.54 * s, cy + 0.26 * s,
+                      fill=body, outline="")
+        # 肚皮亮弧
+        c.create_arc(
+            cx - 0.56 * s, cy - 0.20 * s, cx + 0.50 * s, cy + 0.28 * s,
+            start=18, extent=144, style="arc", outline=belly,
+            width=max(1, int(s * 0.035)),
+        )
+        # 背鳍
+        c.create_polygon(
+            cx + 0.20 * s, cy - 0.20 * s, cx + 0.32 * s, cy - 0.44 * s,
+            cx + 0.40 * s, cy - 0.20 * s, fill=body, outline="")
+        # 水柱
+        c.create_arc(
+            cx + 0.40 * s, cy - 0.58 * s, cx + 0.54 * s, cy - 0.30 * s,
+            start=180, extent=90, style="arc", outline=belly,
+            width=max(1, int(s * 0.035)),
+        )
+        c.create_arc(
+            cx + 0.47 * s, cy - 0.72 * s, cx + 0.62 * s, cy - 0.42 * s,
+            start=180, extent=80, style="arc", outline=belly,
+            width=max(1, int(s * 0.035)),
+        )
+        # 眼睛
+        c.create_oval(cx + 0.40 * s, cy - 0.06 * s, cx + 0.45 * s, cy - 0.01 * s,
+                      fill=t["chat_bg"], outline="")
+        # ---- 品牌文字 ----
+        c.create_text(
+            w / 2, h * 0.40, text="鲸语", fill=t["text"],
+            font=(FONT_FAMILY, 20, "bold"),
+        )
+        c.create_text(
+            w / 2, h * 0.40 + 30, text="WhaleTalk", fill=t["text_sec"],
+            font=(FONT_FAMILY, 11, "bold"),
+        )
+        # ---- 模式选择（DeepSeek 网页版风格：对话 / 任务二选一） ----
+        cur_mode = self.cfg.get("full_auto")
+        modes = [
+            ("dialog", "💬 对话模式", "纯问答 · 不调用工具", "适合聊天、翻译、写作、答疑"),
+            ("task", "🚀 任务模式", "全部工具自动可用", "适合查资料、处理文件、执行任务"),
+        ]
+        cw_card = max(150, int(min(w, 660) * 0.30))
+        ch_card = max(86, int(h * 0.20))
+        gap = max(16, int(min(w, 660) * 0.03))
+        total = 2 * cw_card + gap
+        x0 = (w - total) / 2
+        y0 = h * 0.56
+        for i, (key, title, sub, desc) in enumerate(modes):
+            x = x0 + i * (cw_card + gap)
+            tag = f"wmode_{key}"
+            selected = (key == "task" and cur_mode) or (key == "dialog" and not cur_mode)
+            fill = t["panel"]
+            outline = t["accent"] if selected else t["border"]
+            ow = 2 if selected else 1
+            c.create_rectangle(
+                x, y0, x + cw_card, y0 + ch_card,
+                fill=fill, outline=outline, width=ow, tags=(tag, "wmode"),
+            )
+            # 选中标记（右上角 ✓ 胶囊）
+            if selected:
+                c.create_text(
+                    x + cw_card - 16, y0 + 16, text="✓ 当前",
+                    fill=t["accent_text"], font=(FONT_FAMILY, 8, "bold"),
+                    tags=(tag, "wmode"),
+                )
+            c.create_text(
+                x + cw_card / 2, y0 + ch_card * 0.30, text=title,
+                fill=t["accent"], font=(FONT_FAMILY, 12, "bold"), tags=(tag, "wmode"),
+            )
+            c.create_text(
+                x + cw_card / 2, y0 + ch_card * 0.55, text=sub,
+                fill=t["text"], font=(FONT_FAMILY, 9), tags=(tag, "wmode"),
+            )
+            c.create_text(
+                x + cw_card / 2, y0 + ch_card * 0.80, text=desc,
+                fill=t["text_sec"], font=(FONT_FAMILY, 8), tags=(tag, "wmode"),
+            )
+            c.tag_bind(tag, "<Enter>", lambda e, tg=tag: self._welcome_mode_hover(tg, True))
+            c.tag_bind(tag, "<Leave>", lambda e, tg=tag: self._welcome_mode_hover(tg, False))
+            c.tag_bind(
+                tag, "<Button-1>",
+                lambda e, k=key: self._welcome_switch_mode(k),
+            )
+
+    def _welcome_switch_mode(self, key):
+        """欢迎页模式卡片点击：切换工作模式并刷新选中态。"""
+        mode = "full_auto" if key == "task" else "pure_chat"
+        if (mode == "full_auto") == bool(self.cfg.get("full_auto")):
+            return  # 已是当前模式
+        try:
+            self.mode_var.set(mode)
+            self._on_mode_change()
+        except Exception:
+            pass
+        self._welcome_size = None
+        self._redraw_welcome()
+
+    def _welcome_mode_hover(self, tag, on):
+        c = self.welcome_canvas
+        if not c.winfo_exists():
+            return
+        t = self._theme()
+        fill = t["hover"] if on else t["panel"]
+        try:
+            for it in c.find_withtag(tag):
+                if c.type(it) == "rectangle":
+                    c.itemconfig(it, fill=fill)
+        except tk.TclError:
+            pass
+
+    def _start_welcome_anim(self):
+        self._cancel_welcome_anim()
+        self._welcome_tick = self.root.after(90, self._welcome_anim_step)
+
+    def _welcome_anim_step(self):
+        if getattr(self, "welcome_canvas", None) is None or not self.welcome_canvas.winfo_exists():
+            self._welcome_tick = None
+            return
+        c = self.welcome_canvas
+        try:
+            for it in self._welcome_rings:
+                c.delete(it)
+            self._welcome_rings = []
+            cx, cy = self._welcome_whale_center
+            t = self._theme()
+            base = getattr(self, "_welcome_anim_frame", 0)
+            self._welcome_anim_frame = base + 1
+            r1, g1, b1 = _hex_rgb(t["accent"])
+            r2, g2, b2 = _hex_rgb(t["chat_bg"])
+            for k in range(3):
+                phase = (base + k * 24) % 72
+                rr = max(1, int(s := 10 + phase / 71 * 130))
+                mix = phase / 71
+                col = f"#{int(r1 + (r2 - r1) * mix):02x}{int(g1 + (g2 - g1) * mix):02x}{int(b1 + (b2 - b1) * mix):02x}"
+                self._welcome_rings.append(
+                    c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
+                                  outline=col, width=max(1, int(s * 0.02)))
+                )
+            if not c.winfo_ismapped():
+                self._welcome_tick = self.root.after(90, self._welcome_anim_step)
+                return
+        except tk.TclError:
+            self._welcome_tick = None
+            return
+        self._welcome_tick = self.root.after(90, self._welcome_anim_step)
+
+    def _show_welcome_page(self):
+        if getattr(self, "welcome_canvas", None) is None or not self.welcome_canvas.winfo_exists():
+            return
+        try:
+            header_h = 42
+            try:
+                if getattr(self, "chat_header", None) is not None and self.chat_header.winfo_manager():
+                    header_h = self.chat_header.winfo_height() or 42
+            except tk.TclError:
+                header_h = 42
+            self.welcome_canvas.place(
+                x=0, y=header_h, anchor="nw", relwidth=1, relheight=1
+            )
+            self.welcome_canvas.lift()
+            self._start_welcome_anim()
+            # 布局未就绪时 header 高度可能滞后：下一帧校正一次
+            self.root.after(60, self._fix_welcome_pos)
+        except tk.TclError:
+            pass
+
+    def _fix_welcome_pos(self):
+        wc = getattr(self, "welcome_canvas", None)
+        if wc is None or not wc.winfo_exists() or not wc.winfo_ismapped():
+            return
+        try:
+            header_h = 42
+            if getattr(self, "chat_header", None) is not None:
+                header_h = self.chat_header.winfo_height() or 42
+            if wc.winfo_y() != header_h:
+                wc.place_configure(y=header_h)
+        except tk.TclError:
+            pass
+
+    def _hide_welcome_page(self):
+        if getattr(self, "welcome_canvas", None) is None or not self.welcome_canvas.winfo_exists():
+            return
+        try:
+            self.welcome_canvas.place_forget()
+            self._cancel_welcome_anim()
+        except tk.TclError:
+            pass
+
+    def _has_real_messages(self, session):
+        return any(
+            mm.get("role") not in ("system", "note")
+            for mm in (session.get("messages") or [])
+        )
+
+    def _maybe_hide_welcome(self):
+        wc = getattr(self, "welcome_canvas", None)
+        if wc is None or not wc.winfo_exists() or not wc.winfo_ismapped():
+            return
+        if self._has_real_messages(self._current):
+            self._hide_welcome_page()
 
     def _layout_all(self, event=None):
         for s in self._sessions:
@@ -2478,11 +3001,19 @@ class AssistantApp:
                 s["col"].place(relx=0.5, rely=0, anchor="n", width=1, height=1)
                 self._layout_input(tw)
                 return
+            # 内容列高度：扣除会话信息条（col 从 header 下方开始，底部填满 chat_frame，
+            # 避免信息条区域被闲置在 chat_frame 底部形成空白带）
+            header_h = 0
+            try:
+                if getattr(self, "chat_header", None) is not None and self.chat_header.winfo_manager():
+                    header_h = self.chat_header.winfo_height() or 34
+            except tk.TclError:
+                header_h = 0
             # 内容列宽度：理想范围 [content_min, content_max]，但物理容器更窄时
             # 必须让步（上限 = tw-40，防列宽超出聊天区被截断——真实冒烟发现）
             cw = max(LAYOUT["content_min"], min(LAYOUT["content_max"], tw - LAYOUT["content_margin"]))
             cw = min(cw, max(360, tw - 40))
-            s["col"].place(relx=0.5, rely=0, anchor="n", width=cw, height=th)
+            s["col"].place(relx=0.5, y=header_h, anchor="n", width=cw, height=max(1, th - header_h))
             # 核心对齐：输入区与聊天内容列同宽居中（此前输入框横跨整个聊天区，错位 96px+）
             self._layout_input(tw)
             return
@@ -2509,7 +3040,7 @@ class AssistantApp:
         self.input_frame.pack(side="bottom", fill="x")
         self._restyle.append((self.input_frame, "page"))
         self.input_wrap = wrap = tk.Frame(self.input_frame, bg=t["page"])
-        wrap.pack(fill="x", padx=28, pady=(4, 10))
+        wrap.pack(fill="x", padx=28, pady=(0, 10))
         wrap.pack_propagate(False)
         self._restyle.append((wrap, "page"))
         card = tk.Frame(wrap, bg=t["panel"], highlightthickness=1, bd=0,
@@ -2610,6 +3141,27 @@ class AssistantApp:
         self.btn_stop.pack(side="right")
         self.btn_send = self._mk_button(foot, "发送", self.send, kind="primary", fsz=10)
         self.btn_send.pack(side="right")
+        # 圆形发送键：声呐青圆底 + 纸飞机，hover 放大微动效（替换上面的文字按钮）
+        self.btn_send.destroy()
+        self._send_canvas = tk.Canvas(
+            foot, width=30, height=30, bg=t["panel"], highlightthickness=0, bd=0,
+            cursor="hand2",
+        )
+        self._restyle.append((self._send_canvas, "panel"))
+        self._send_circle = self._send_canvas.create_oval(
+            2, 2, 28, 28, fill=t["accent"], outline="", tags="c"
+        )
+        self._send_icon = self._send_canvas.create_text(
+            15, 15, text="➤", fill=t["accent_text"], font=(FONT_FAMILY, 11, "bold"), tags="t"
+        )
+        self._send_canvas.tag_bind("c", "<Button-1>", lambda e: self.send())
+        self._send_canvas.tag_bind("t", "<Button-1>", lambda e: self.send())
+        self._send_canvas.tag_bind("c", "<Enter>", lambda e: self._send_btn_hover(True))
+        self._send_canvas.tag_bind("t", "<Enter>", lambda e: self._send_btn_hover(True))
+        self._send_canvas.tag_bind("c", "<Leave>", lambda e: self._send_btn_hover(False))
+        self._send_canvas.tag_bind("t", "<Leave>", lambda e: self._send_btn_hover(False))
+        self.btn_send = self._send_canvas
+        self.btn_send.pack(side="right", padx=(6, 0), pady=1)
 
     def _search_bar(self):
         t = self._theme()
@@ -2654,21 +3206,108 @@ class AssistantApp:
         self.status_frame.pack(side="bottom", fill="x")
         self._restyle.append((self.status_frame, "page"))
         self._line(self.status_frame)
-        # 三段式状态栏：左=模式与目录 · 中=用量统计 · 右=模型与上下文
-        self.status_label = self._lbl(self.status_frame, "", anchor="w", bg=t["page"])
-        self.status_label.pack(side="left", fill="x", expand=True, padx=16, pady=5)
-        self.status_right = self._lbl(self.status_frame, "", anchor="e", bg=t["page"])
-        self.status_right.pack(side="right", padx=(8, 4), pady=5)
-        self.context_label = self._lbl(self.status_frame, "", anchor="e", width=32, bg=t["page"])
+        row = tk.Frame(self.status_frame, bg=t["page"])
+        row.pack(fill="x", padx=10, pady=5)
+        self._restyle.append((row, "page"))
+        # 品牌胶囊：声呐青圆点 + 🐋（深海驾驶舱状态灯，带呼吸脉动动画）
+        brand_pill = tk.Frame(row, bg=t["surface"])
+        brand_pill.pack(side="left")
+        self._restyle.append((brand_pill, "surface"))
+        self.status_dot = tk.Canvas(
+            brand_pill, width=14, height=14, bg=t["surface"],
+            highlightthickness=0,
+        )
+        self.status_dot.pack(side="left", padx=(8, 2), pady=4)
+        self._restyle.append((self.status_dot, "surface"))
+        self._dot = self.status_dot.create_oval(3, 3, 11, 11, fill=t["success"], outline="")
+        self._sonar_ring = None
+        self._sonar_phase = 0
+        self._sonar_tick = None
+        self.status_icon = tk.Label(brand_pill, text="🐋", bg=t["surface"], font=(FONT_FAMILY, 9))
+        self.status_icon.pack(side="left", padx=(0, 8), pady=4)
+        self._restyle.append((self.status_icon, "surface"))
+        self._start_sonar()
+        # 左=模式与目录（expand）· 右=模型/上下文/用量
+        self.status_label = self._lbl(row, "", anchor="w", bg="page")
+        self.status_label.pack(side="left", fill="x", expand=True, padx=10, pady=3)
+        self.status_right = self._lbl(row, "", anchor="e", bg="page")
+        self.status_right.pack(side="right", padx=(8, 2), pady=3)
+        self.context_label = self._lbl(row, "", anchor="e", width=30, bg="page")
         self.context_label.pack(side="right")
         self.context_bar = ttk.Progressbar(
-            self.status_frame,
+            row,
             style="Context.Horizontal.TProgressbar",
             maximum=MAX_CONTEXT_TOKENS,
             value=0,
-            length=120,
+            length=110,
         )
-        self.context_bar.pack(side="right", padx=(4, 2), pady=8)
+        self.context_bar.pack(side="right", padx=(2, 4), pady=7)
+
+    def _send_btn_hover(self, on):
+        """圆形发送键 hover：底色变深、纸飞机微放大。"""
+        try:
+            t = self._theme()
+            fill = t["accent_hover"] if on else t["accent"]
+            self._send_canvas.itemconfig(self._send_circle, fill=fill)
+            self._send_canvas.itemconfig(
+                self._send_icon, font=(FONT_FAMILY, 12 if on else 11, "bold")
+            )
+        except tk.TclError:
+            pass
+
+    def _start_sonar(self):
+        try:
+            self._stop_sonar()
+            self._sonar_tick = self.root.after(90, self._sonar_step)
+        except tk.TclError:
+            pass
+
+    def _stop_sonar(self):
+        if getattr(self, "_sonar_tick", None) is not None:
+            try:
+                self.root.after_cancel(self._sonar_tick)
+            except Exception:
+                pass
+            self._sonar_tick = None
+
+    def _sonar_step(self):
+        if not self.status_dot.winfo_exists():
+            self._sonar_tick = None
+            return
+        try:
+            t = self._theme()
+            busy = bool(getattr(self, "busy", False))
+            phase = getattr(self, "_sonar_phase", 0) + 1
+            self._sonar_phase = phase
+            color = t["accent"] if busy else t["success"]
+            # 圆点呼吸（4→12 往返）
+            period = 12 if busy else 28
+            k = (phase % period) / period
+            r = 3.5 + 2.5 * (0.5 - 0.5 * math.cos(2 * math.pi * k))
+            cx, cy = 7, 7
+            self.status_dot.coords(self._dot, cx - r, cy - r, cx + r, cy + r)
+            self.status_dot.itemconfig(self._dot, fill=color)
+            # 声呐环扩散（2 圈，busy 时加速）
+            if self._sonar_ring is not None:
+                try:
+                    self.status_dot.delete(self._sonar_ring)
+                except tk.TclError:
+                    pass
+                self._sonar_ring = None
+            ring_period = 8 if busy else 20
+            if phase % ring_period == 0:
+                rr = 6.5
+                self._sonar_ring = self.status_dot.create_oval(
+                    cx - rr, cy - rr, cx + rr, cy + rr,
+                    outline=color, width=1,
+                )
+        except tk.TclError:
+            self._sonar_tick = None
+            return
+        try:
+            self._sonar_tick = self.root.after(90, self._sonar_step)
+        except tk.TclError:
+            self._sonar_tick = None
 
     def _theme(self):
         themes = dict(THEMES)
@@ -2689,8 +3328,20 @@ class AssistantApp:
             self.cfg["theme"] = "dark" if self.cfg.get("theme") == "light" else "light"
         else:
             self.cfg["theme"] = "light"
+        _dc.CHART_THEME = str(self.cfg["theme"])
         self.apply_theme()
         save_config(self.cfg)
+        self._fade_theme_in()
+
+    def _fade_theme_in(self):
+        """主题切换后窗口透明度从 0.55 渐回 1.0，营造柔和过渡。"""
+        try:
+            for a in (0.55, 0.7, 0.85, 1.0):
+                self.root.attributes("-alpha", a)
+                self.root.update_idletasks()
+                time.sleep(0.04)
+        except tk.TclError:
+            pass
 
     def show_custom_theme_dialog(self):
         """自定义主题：输入名称与主要颜色 token，保存到配置并立即应用。"""
@@ -2789,19 +3440,25 @@ class AssistantApp:
                     w.configure(bg=t["page"])
                 elif kind == "chat_scrollbar":
                     w.configure(
-                        bg=t["disabled"],
+                        bg=t["surface"],
                         activebackground=t["text_sec"],
                         troughcolor=t["chat_bg"],
                         highlightbackground=t["chat_bg"],
                         highlightcolor=t["chat_bg"],
+                        bordercolor=t["surface"],
+                        arrowcolor=t["text_sec"],
+                        relief="flat",
                     )
                 elif kind == "list_scrollbar":
                     w.configure(
-                        bg=t["disabled"],
+                        bg=t["surface"],
                         activebackground=t["text_sec"],
                         troughcolor=t["panel"],
                         highlightbackground=t["panel"],
                         highlightcolor=t["panel"],
+                        bordercolor=t["surface"],
+                        arrowcolor=t["text_sec"],
+                        relief="flat",
                     )
                 elif kind == "listbox":
                     w.configure(
@@ -2881,6 +3538,12 @@ class AssistantApp:
         )
         if self._placeholder_active:
             self.input_text.configure(fg=t["text_sec"])
+        if getattr(self, "_send_circle", None) is not None:
+            try:
+                self._send_canvas.itemconfig(self._send_circle, fill=t["accent"])
+                self._send_canvas.itemconfig(self._send_icon, fill=t["accent_text"])
+            except tk.TclError:
+                pass
         self.btn_theme.configure(text="☀️ 浅色" if t is THEMES["dark"] else "🌙 深色")
         if getattr(self, "task_panel", None) is not None:
             try:
@@ -2892,6 +3555,50 @@ class AssistantApp:
                 self.proc_panel.apply_theme(t)
             except Exception:
                 pass
+        # 防御机制：已打开的 Toplevel 若实现 apply_theme（未来对话框扩展），同步刷新
+        for _w in self.root.winfo_children():
+            if isinstance(_w, tk.Toplevel) and hasattr(_w, "apply_theme"):
+                try:
+                    _w.apply_theme(t)
+                except Exception:
+                    pass
+        # 欢迎页跟随主题重绘（空会话时）
+        if getattr(self, "welcome_canvas", None) is not None and self.welcome_canvas.winfo_exists():
+            try:
+                self._welcome_size = None
+                self._redraw_welcome()
+                if self.welcome_canvas.winfo_ismapped():
+                    self._start_welcome_anim()
+            except Exception:
+                pass
+        # 分割手柄圆点跟随主题
+        for _h, _dots in (
+            (getattr(self, "chat_resize_handle", None), getattr(self, "_handle_dots", None)),
+            (getattr(self, "panel_resize_handle", None), getattr(self, "_panel_handle_dots", None)),
+        ):
+            if _h is not None and _dots:
+                try:
+                    for _d in _dots:
+                        _h.itemconfig(_d, fill=t["border"])
+                except tk.TclError:
+                    pass
+        # 设置栏滚动容器跟随主题 + 侧栏 Tab 高亮
+        for _w in (getattr(self, "_settings_canvas", None), getattr(self, "_settings_inner", None)):
+            if _w is not None:
+                try:
+                    _w.configure(bg=t["panel"])
+                except tk.TclError:
+                    pass
+        if getattr(self, "_side_tab_btns", None):
+            try:
+                for _key, _b in self._side_tab_btns.items():
+                    _sel = (_key == self._side_tab)
+                    _b.configure(
+                        bg=t["accent"] if _sel else t["surface"],
+                        fg=t["accent_text"] if _sel else t["text_sec"],
+                    )
+            except tk.TclError:
+                pass
 
     def _apply_ttk_styles(self, t):
         style = ttk.Style(self.root)
@@ -2899,6 +3606,21 @@ class AssistantApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
+        # ---- 全局默认色（option database）：消灭一切未显式着色的浅色残留 ----
+        # 所有后创建的 tk 控件（Frame/Label/Text/Scrollbar/Toplevel…）未指定颜色时
+        # 使用深海配色默认值；换肤时整体刷新。
+        self.root.option_add("*background", t["page"])
+        self.root.option_add("*foreground", t["text"])
+        self.root.option_add("*highlightThickness", 0)
+        self.root.option_add("*borderWidth", 0)
+        self.root.option_add("*highlightBackground", t["border"])
+        self.root.option_add("*highlightColor", t["accent"])
+        self.root.option_add("*selectBackground", t["selection"])
+        self.root.option_add("*selectForeground", t["accent_text"])
+        self.root.option_add("*troughColor", t["surface"])
+        self.root.option_add("*activeBackground", t["hover"])
+        self.root.option_add("*activeForeground", t["text"])
+        self.root.option_add("*insertBackground", t["text"])
         # Combobox 下拉列表颜色（clam 主题下通过 option database 配置）
         self.root.option_add("*TCombobox*Listbox.background", t["input_bg"])
         self.root.option_add("*TCombobox*Listbox.foreground", t["input_fg"])
@@ -2939,6 +3661,9 @@ class AssistantApp:
             "TEntry",
             fieldbackground=[("disabled", t["surface"])],
             foreground=[("disabled", t["disabled"])],
+            bordercolor=[("focus", t["accent"])],
+            lightcolor=[("focus", t["accent"])],
+            darkcolor=[("focus", t["accent"])],
         )
         style.configure(
             "TSpinbox",
@@ -2976,6 +3701,36 @@ class AssistantApp:
             selectbackground=[("readonly", t["selection"])],
             selectforeground=[("readonly", t["input_fg"])],
             arrowcolor=[("readonly", t["text_sec"])],
+            bordercolor=[("focus", t["accent"])],
+            lightcolor=[("focus", t["accent"])],
+            darkcolor=[("focus", t["accent"])],
+        )
+        # 通用 Treeview（历史会话库/数据查看等未带 Files. 前缀的场景）
+        style.configure(
+            "Treeview",
+            background=t["panel"],
+            fieldbackground=t["panel"],
+            foreground=t["text"],
+            bordercolor=t["border"],
+            lightcolor=t["panel"],
+            darkcolor=t["panel"],
+            rowheight=24,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", t["selection"])],
+            foreground=[("selected", t["accent_text"])],
+        )
+        style.configure(
+            "Treeview.Item",
+            background=t["panel"],
+            foreground=t["text"],
+            padding=(4, 2),
+        )
+        style.map(
+            "Treeview.Item",
+            background=[("selected", t["selection"])],
+            foreground=[("selected", t["accent_text"])],
         )
         style.configure("TCheckbutton", background=t["page"], foreground=t["text"])
         style.map(
@@ -2983,6 +3738,24 @@ class AssistantApp:
             background=[("active", t["page"])],
             foreground=[("active", t["text"])],
             indicatorbackground=[("!selected", t["input_bg"]), ("selected", t["accent"])],
+            indicatorforeground=[("selected", t["accent_text"])],
+        )
+        # Radiobutton（右侧面板「自主模式」三选一）——指示器默认白色，必须显式深色化
+        style.configure(
+            "TRadiobutton",
+            background=t["panel"],
+            foreground=t["text"],
+            indicatorbackground=t["input_bg"],
+            indicatorforeground=t["accent_text"],
+            bordercolor=t["border"],
+            lightcolor=t["input_bg"],
+            darkcolor=t["input_bg"],
+        )
+        style.map(
+            "TRadiobutton",
+            background=[("active", t["panel"])],
+            foreground=[("active", t["text"])],
+            indicatorbackground=[("selected", t["accent"])],
             indicatorforeground=[("selected", t["accent_text"])],
         )
         # 📂 文件面板树（右侧面板「文件」Tab）
@@ -3035,6 +3808,23 @@ class AssistantApp:
         style.map(
             "TScrollbar",
             background=[("active", t["accent"])],
+        )
+        # 鲸语专属垂直滚动条：深色轨道 + 深蓝滑块（ttk 样式完全可控，规避 tk.Scrollbar 系统元素渲染）
+        style.configure(
+            "WT.Vertical.TScrollbar",
+            troughcolor=t["chat_bg"],
+            background=t["surface"],
+            bordercolor=t["chat_bg"],
+            lightcolor=t["surface"],
+            darkcolor=t["surface"],
+            arrowcolor=t["text_sec"],
+            arrowsize=0,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.map(
+            "WT.Vertical.TScrollbar",
+            background=[("active", t["text_sec"]), ("pressed", t["text_sec"])],
         )
 
     def _set_placeholder(self):
@@ -3192,8 +3982,8 @@ class AssistantApp:
         )
         text.tag_configure(
             "user",
-            foreground=t["text"],
-            background=t.get("quote_bg", t["surface"]),
+            foreground=t.get("bubble_user_text", t["text"]),
+            background=t.get("bubble_user", t["quote_bg"]),
             lmargin1=10,
             lmargin2=10,
             rmargin=14,
@@ -3215,6 +4005,7 @@ class AssistantApp:
         text.tag_configure(
             "assistant",
             foreground=t["text"],
+            background=t.get("bubble_assistant", t["panel"]),
             lmargin1=8,
             lmargin2=8,
             rmargin=8,
@@ -3225,8 +4016,9 @@ class AssistantApp:
             "thinking",
             foreground=t["thinking"],
             font=(FONT_FAMILY, sizes["small"]),
-            lmargin1=8,
-            lmargin2=8,
+            lmargin1=16,
+            lmargin2=16,
+            rmargin=10,
             spacing1=2,
             spacing3=8,  # 正式回答与思考过程之间留出换行间距
         )
@@ -3251,11 +4043,24 @@ class AssistantApp:
         text.tag_configure(
             "tool_toggle",
             foreground=t["tool"],
-            font=(MONO_FAMILY, sizes["mono_small"], "underline"),
-            lmargin1=8,
-            lmargin2=8,
-            spacing1=4,
+            background=t["surface"],
+            font=(MONO_FAMILY, sizes["mono_small"], "bold"),
+            lmargin1=14,
+            lmargin2=14,
+            rmargin=10,
+            spacing1=6,
             spacing3=0,
+        )
+        text.tag_configure(
+            "tool",
+            foreground=t["text_sec"],
+            background=t["surface"],
+            font=(MONO_FAMILY, sizes["mono_small"]),
+            lmargin1=14,
+            lmargin2=14,
+            rmargin=10,
+            spacing1=1,
+            spacing3=6,
         )
         text.tag_configure("error", foreground=t["error"], lmargin1=12, lmargin2=12)
         text.tag_configure("fold_hidden", elide=True)
@@ -3287,6 +4092,20 @@ class AssistantApp:
             rmargin=14,
             spacing1=4,
         )
+        text.tag_configure(
+            "code_copy",
+            background=t["code_bg"],
+            foreground=t["accent"],
+            font=(MONO_FAMILY, sizes["mono_small"]),
+            lmargin1=14,
+            lmargin2=14,
+            rmargin=14,
+            spacing1=0,
+            spacing3=6,
+        )
+        text.tag_bind("code_copy", "<Button-1>", self._on_code_copy_click)
+        text.tag_bind("code_copy", "<Enter>", lambda e: text.configure(cursor="hand2"))
+        text.tag_bind("code_copy", "<Leave>", lambda e: text.configure(cursor=""))
         text.tag_configure(
             "code",
             background=t["code_bg"],
@@ -3367,18 +4186,15 @@ class AssistantApp:
         # 细窄无箭头滚动条：主题随动，默认低调（disabled 灰），悬停/拖动加深。
         # 用 place 叠加而非 pack：text 请求宽度受最长行影响（长 URL/代码/长词），
         # pack 在列宽不足时会先把滚动条压缩到 0 宽导致不可见；place 不参与 pack 计算。
-        scrollbar = tk.Scrollbar(
+        scrollbar = ttk.Scrollbar(
             col,
             orient="vertical",
             command=text.yview,
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            width=10,
+            style="WT.Vertical.TScrollbar",
         )
         scrollbar.place(relx=1.0, x=-10, y=0, width=10, relheight=1.0)
         text.configure(yscrollcommand=scrollbar.set)
-        self._restyle.append((scrollbar, "chat_scrollbar"))
+        # ttk 滚动条样式由 _apply_ttk_styles 统一配置（WT.Vertical.TScrollbar）
         # 滚动条拖动 = 手动滚动：拖动中停止跟随，拖回底部自动恢复
         scrollbar.bind("<Button-1>", lambda e: setattr(self, "_follow_bottom", False))
         scrollbar.bind("<B1-Motion>", lambda e: setattr(self, "_follow_bottom", False))
@@ -3461,7 +4277,16 @@ class AssistantApp:
         name = self._session_base_name(session)
         tags = session.get("tags") or []
         if tags:
-            return f"{prefix}[{','.join(tags[:2])}] {name}"
+            name = f"[{','.join(tags[:2])}] {name}"
+        # 历史占位会话：附首条消息预览与消息数（一眼识别内容）
+        if session.get("placeholder"):
+            preview = (session.get("preview") or "").strip()
+            count = int(session.get("count") or 0)
+            if preview and count:
+                return f"{name} · {preview[:14]}（{count} 条）"
+            if count:
+                return f"{name}（{count} 条）"
+            return name
         return prefix + name
 
     def _session_base_name(self, session):
@@ -3548,7 +4373,10 @@ class AssistantApp:
                     if visible else "无匹配会话"
                 )
             else:
-                self.session_count_label.configure(text="")
+                n = len(visible)
+                self.session_count_label.configure(
+                    text=f"{n} 个会话" if n else "暂无历史会话，点击 ＋ 新建开始"
+                )
             if had_items:
                 self.session_list.yview_moveto(frac)
             elif visible:
@@ -3558,14 +4386,88 @@ class AssistantApp:
         finally:
             self._updating_list = False
 
+    def _tools_definition_tokens(self):
+        """本次请求实际注入的工具定义估算 token（DeepSeek 计入 prompt_tokens）。
+
+        缓存到 _tools_def_cache：工具集只随配置变化，避免每轮重复估算。
+        """
+        key = (self.cfg.get("full_auto"), self.cfg.get("pure_chat"),
+               tuple(self.cfg.get("enabled_tools") or []))
+        cache = getattr(self, "_tools_def_cache", None)
+        if cache and cache[0] == key:
+            return cache[1]
+        try:
+            names, enabled = self._mode_tools_for_request(self.cfg)
+            if not enabled:
+                val = 0
+            else:
+                if names is None:
+                    names = [t["function"]["name"] for t in TOOLS] + [
+                        t["function"]["name"] for t in load_user_tools(USER_TOOLS_PATH)
+                    ]
+                by_name = {t["function"]["name"]: t for t in TOOLS}
+                specs = [by_name[n] for n in names if n in by_name]
+                customs = [
+                    t for t in load_user_tools(USER_TOOLS_PATH)
+                    if t.get("function", {}).get("name") in names
+                ]
+                all_specs = specs + customs
+                text = json.dumps(all_specs, ensure_ascii=False)
+                val = tokens.estimate_text_tokens(text)
+            self._tools_def_cache = (key, val)
+            return val
+        except Exception:
+            return 0
+
+    def _update_chat_header(self):
+        """刷新会话信息条：会话名 + 模型 + 本轮输入输出 + 上下文用量。"""
+        try:
+            if getattr(self, "chat_title_lbl", None) is None:
+                return
+            name = (self._current.get("name") or "新会话").strip()[:24]
+            self.chat_title_lbl.configure(text=name)
+            model = str(self.cfg.get("model", "") or "")
+            self.chat_model_lbl.configure(text=f"模型 {model}" if model else "")
+            n = self.usage_total.get("prompt", 0) + self.usage_total.get("completion", 0)
+            max_tok = MAX_CONTEXT_TOKENS
+            self.chat_ctx_lbl.configure(
+                text=f"上下文 {n:,}/{max_tok:,}" if n else ""
+            )
+            # 本轮输入输出（从状态栏迁移到这里，状态栏只留累计）
+            cur = self.last_usage
+            if cur:
+                hit = cur.get("cache_hit", 0)
+                miss = cur.get("cache_miss", 0)
+                ratio = hit / (hit + miss) if (hit + miss) else None
+                cache = f"缓存{ratio:.0%}" if ratio is not None else ""
+                prompt_n = cur.get("prompt", 0)
+                tdef = self._tools_definition_tokens()
+                tool_note = ""
+                if tdef and prompt_n > 0 and tdef >= prompt_n * 0.3:
+                    tool_note = f" · 工具定义≈{tdef:,}"
+                self.chat_round_lbl.configure(
+                    text=f"本轮 输入 {prompt_n:,} · 输出 {cur.get('completion', 0):,}"
+                         f"{(' · ' + cache) if cache else ''}{tool_note}"
+                )
+            else:
+                self.chat_round_lbl.configure(text="")
+        except tk.TclError:
+            pass
+
     def _show_session_text(self, session):
         for s in self._sessions:
             if s is session:
-                s["col"].place(relx=0.5, rely=0, anchor="n", width=760, height=600)
+                s["col"].place(relx=0.5, y=42, anchor="n", width=760, height=1)
                 self._layout_all(None)
                 self._follow_bottom = True  # 切换会话后贴底浏览
             else:
                 s["col"].place_forget()
+        if getattr(self, "welcome_canvas", None) is not None:
+            if self._has_real_messages(session):
+                self._hide_welcome_page()
+            else:
+                self._show_welcome_page()
+        self._update_chat_header()
 
     def _maybe_auto_name(self, text):
         session = self._current
@@ -3603,14 +4505,20 @@ class AssistantApp:
             messagebox.showinfo("提示", "生成中不能切换会话，请先停止。")
             return
         old = self._current
-        self._current = self._list_visible[idx]
+        target = self._list_visible[idx]
+        # 历史会话占位 → 懒加载真实消息（用户点击进入历史对话，直接进入对话界面）
+        if target.get("placeholder") and target.get("id"):
+            loaded = self.load_session_from_file(target["id"], target=target)
+            if loaded is not None:
+                target = loaded
+        self._current = target
         if old is not self._current:
             self._show_session_text(self._current)
             self._ctx_counts = None  # 计数是会话维度的，切换后失效（下次 worker 重算）
             self._snapshot_dirty = True
             # 切走前把旧会话完整落盘：否则其他会话只存在于内存，
             # 退出/崩溃后 100% 丢失（此前仅 close_tab 才写盘）
-            if not old.get("ephemeral") and not self.cfg.get("privacy_mode"):
+            if not old.get("ephemeral") and not self.cfg.get("privacy_mode") and not old.get("placeholder"):
                 self.save_session_to_file(old)
             self._maybe_save_snapshot()  # 新 current 的快照也尽快落盘
         self.update_status()
@@ -3745,9 +4653,12 @@ class AssistantApp:
         idx = self._sessions.index(self._current)
         session = self._current
         self._cancel_paged_render()
+        sid = session.get("id")
+        is_placeholder = bool(session.get("placeholder"))
         if (
             not session.get("ephemeral")
             and not self.cfg.get("privacy_mode")
+            and not is_placeholder
         ):
             self.save_session_to_file(session)
         session["text"].destroy()
@@ -3762,9 +4673,17 @@ class AssistantApp:
             if w is not session["col"] and w is not session["scrollbar"]
         ]
         self._sessions.pop(idx)
+        self._session_name_cache.pop(id(session), None)  # 关闭会话清显示名缓存
+        if sid:
+            # 历史会话（占位或已加载）删除 = 磁盘文件一并删除（用户右键删除的真实语义）
+            try:
+                path = os.path.join(SESSIONS_DIR, f"{self._safe_sid(sid)}.json")
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                logging.exception("删除会话文件失败")
         new_idx = min(idx, len(self._sessions) - 1)
         self._current = self._sessions[new_idx]
-        self._session_name_cache.pop(id(session), None)  # 关闭会话清显示名缓存
         self._show_session_text(self._current)
         self._refresh_session_list()
         self._on_tab_changed()
@@ -3864,7 +4783,6 @@ class AssistantApp:
         self.thinking_combo.set(THINKING_MODES[thinking])
         self.max_tokens_spin.set(str(self.cfg["max_tokens"]))
         self.seed_var.set(str(self.cfg.get("seed", "")))
-        self.tools_var.set(bool(self.cfg.get("tools_enabled", True)))
         self.font_size_combo.set(str(self.cfg.get("font_size", 10)))
         self.md_var.set(bool(self.cfg.get("md_render", True)))
         self.json_var.set(bool(self.cfg.get("json_output", False)))
@@ -3909,12 +4827,11 @@ class AssistantApp:
                 new["thinking"] = key
                 break
         new["seed"] = self.seed_var.get().strip()
-        new["tools_enabled"] = self.tools_var.get()
         new["json_output"] = self.json_var.get()
         new["beta_api"] = self.beta_var.get()
         mode = self.mode_var.get()
         new["full_auto"] = mode == "full_auto"
-        new["pure_chat"] = mode == "pure_chat"
+        new["pure_chat"] = mode != "full_auto"
         try:
             new["custom_temperature"] = max(0.0, min(2.0, float(self.custom_temp_var.get())))
         except (TypeError, ValueError):
@@ -3934,6 +4851,14 @@ class AssistantApp:
                 changed = True
         if changed:
             save_config(self.cfg)
+        if getattr(self, "panel_save_hint", None) is not None:
+            try:
+                self.panel_save_hint.configure(
+                    text="✓ 已保存" if changed else "无更改", fg=self.theme_color("success")
+                )
+                self.panel_save_hint.after(2200, lambda: self.panel_save_hint.configure(text=""))
+            except tk.TclError:
+                pass
         return self.cfg
 
     def on_scenario_change(self, _event=None, persist=True, reset_thinking=True):
@@ -4011,48 +4936,29 @@ class AssistantApp:
         return "其他"
 
     def edit_tools(self):
-        """工具设置（工具中心面板版）。"""
+        """工具库：查看全部能力（任务模式下自动全部可用）。"""
         dialog, body, footer = self._dialog_shell(
-            "工具设置", 460, 620,
-            subtitle="选择 AI 可自动调用的工具（未选中的不会出现在请求中）",
+            "工具库", 460, 620,
+            subtitle="任务模式下全部工具自动可用 · 能力总览",
             minsize=(380, 420),
         )
-        save = self._edit_tools_panel(body)
+        self._edit_tools_panel(body)
         self._footer_hint(footer, f"共 {len(TOOLS) + len(load_user_tools())} 个工具 · 滚轮或拖动右侧滚动条")
-        self._footer_btn(footer, "取消", dialog.destroy)
-        self._footer_btn(footer, "保存", lambda: (save(), dialog.destroy()), primary=True)
+        self._footer_btn(footer, "关闭", dialog.destroy)
 
     def _edit_tools_panel(self, body):
-        """工具设置面板（嵌入工具中心）：返回保存回调。"""
+        """工具库面板（只读展示：分类 + 名称 + 功能描述 + 搜索）。"""
         t = self._theme()
-        master = tk.BooleanVar(value=self.tools_var.get())
-        vars = {}
-        enabled = set(self.cfg.get("enabled_tools", []))
-        builtin = list(TOOLS)
-        customs = list(load_user_tools())
-        all_tools = builtin + customs
-        for tool in all_tools:
-            name = tool["function"]["name"]
-            vars[name] = tk.BooleanVar(value=name in enabled)
+        all_tools = list(TOOLS) + list(load_user_tools())
 
         head = tk.Frame(body, bg=t["panel"])
         head.pack(fill="x", pady=(0, 6))
         self._restyle.append((head, "panel"))
-        if self.cfg.get("full_auto"):
-            self._lbl(body, "🤖 完全智能模式生效中：全部工具自动可用，以下勾选仅作为切回标准模式后的默认集。",
-                      role="label_accent", bg="panel", font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", pady=(0, 4))
-        elif self.cfg.get("pure_chat"):
-            self._lbl(body, "💬 纯对话模式生效中：不调用任何工具，以下勾选仅作为切回标准模式后的默认集。",
-                      role="label_sec", bg="panel", font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", pady=(0, 4))
-        ttk.Checkbutton(
-            head, text="启用工具（Agent 自动调用）", variable=master,
-            command=lambda: [v.set(master.get()) for v in vars.values()],
-        ).pack(side="left")
         self._lbl(head, "搜索:", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(
-            side="left", padx=(14, 4)
+            side="left", padx=(0, 4)
         )
         search_var = tk.StringVar()
-        search_entry = ttk.Entry(head, textvariable=search_var, width=20)
+        search_entry = ttk.Entry(head, textvariable=search_var, width=24)
         search_entry.pack(side="left")
 
         canvas, inner = self._scroll_panel(body)
@@ -4068,7 +4974,7 @@ class AssistantApp:
                 if query and query not in name.lower() and query not in desc.lower():
                     continue
                 is_custom = bool(tool["function"].get("endpoint"))
-                gname = "自定义工具" if is_custom else self._tool_group_of(name)
+                gname = "✨ 自定义工具" if is_custom else self._tool_group_of(name)
                 if not hasattr(render, "_last_group") or render._last_group != gname:
                     if shown > 0:
                         ttk.Separator(inner).pack(fill="x", pady=(6, 2))
@@ -4084,10 +4990,14 @@ class AssistantApp:
                     render._last_group = gname
                 row = tk.Frame(inner, bg=t["panel"])
                 row.pack(fill="x", padx=4, pady=2)
-                cb = ttk.Checkbutton(
-                    row, text=name, variable=vars[name]
-                )
-                cb.pack(anchor="w")
+                tk.Label(
+                    row,
+                    text="🧩 " + name,
+                    bg=t["panel"],
+                    fg=t["text"],
+                    font=(FONT_FAMILY, 9, "bold"),
+                    anchor="w",
+                ).pack(anchor="w")
                 dl = tk.Label(
                     row,
                     text=desc,
@@ -4111,11 +5021,8 @@ class AssistantApp:
         render()
 
         def save():
-            self.tools_var.set(master.get())
-            chosen = [n for n, v in vars.items() if v.get()] if master.get() else []
-            self.cfg["enabled_tools"] = chosen
-            save_config(self.cfg)
-            self._flash_status("工具配置已保存")
+            # 双态模式下工具集由模式决定（完全智能=全部），此处仅保留 hub 兼容回调
+            self._flash_status("工具能力已确认（完全智能模式自动加载全部工具）")
 
         return save
 
@@ -4384,7 +5291,9 @@ class AssistantApp:
         if self.proc_panel is None:
             try:
                 self.proc_panel = ProcessPanel(
-                    self.root, on_stop=self._stop_named_process, theme=self._theme()
+                    self.root, on_stop=self._stop_named_process, theme=self._theme(),
+                    embed_in=self.chat_frame,
+                    width_cb=lambda: (self._ensure_current().get("col") or self.chat_frame).winfo_width(),
                 )
             except Exception:
                 self.proc_panel = None
@@ -4805,38 +5714,21 @@ class AssistantApp:
             self._flash_status("浏览器无头模式：静默后台运行，不弹窗口")
 
     def _on_mode_change(self):
-        """三态模式单选：标准 / 完全智能 / 纯对话（互斥，消除同时开启的语义冲突）。"""
+        """双态模式单选：任务模式（完全智能）/ 对话模式（纯对话），互斥生效。"""
         mode = self.mode_var.get()
-        if mode == "full_auto" and not self.cfg.get("full_auto"):
-            if not messagebox.askyesno(
-                "完全智能模式",
-                "开启后，允许目录内的写文件 / 运行命令 / 工具链将全部自动执行，"
-                "不再弹出审批确认。\n\n系统目录与阻止列表仍然生效，审计日志继续记录。\n\n确定开启？",
-            ):
-                self._sync_mode_var()
-                return
         if mode == "full_auto":
             self.cfg["full_auto"] = True
             self.cfg["pure_chat"] = False
-            self._flash_status(
-                "🤖 完全智能已开启——全部工具自动可用，为开发/创作而生"
-                "（建议应用「智能体」人格：角色与提示词 → 智能体）"
-            )
-        elif mode == "pure_chat":
-            self.cfg["full_auto"] = False
-            self.cfg["pure_chat"] = True
         else:
             self.cfg["full_auto"] = False
-            self.cfg["pure_chat"] = False
+            self.cfg["pure_chat"] = True
         permissions.set_full_auto(self.cfg["full_auto"])
         save_config(self.cfg)
         self.update_status()
         if self.cfg["full_auto"]:
-            self._flash_status("🤖 完全智能模式已开启——允许目录内全自动，我只要结果")
-        elif self.cfg["pure_chat"]:
-            self._flash_status("💬 纯对话模式已开启——AI 回归纯粹对话，不注入工具提示词")
+            self._flash_status("🚀 任务模式已开启——全部工具就绪，只要结果")
         else:
-            self._flash_status("已恢复标准模式")
+            self._flash_status("💬 对话模式已开启——回归纯粹问答")
 
     def _sync_mode_var(self):
         """根据当前 cfg 回填单选值（取消确认时恢复显示）。"""
@@ -4846,7 +5738,8 @@ class AssistantApp:
             elif self.cfg.get("pure_chat"):
                 self.mode_var.set("pure_chat")
             else:
-                self.mode_var.set("standard")
+                # 默认完全智能（无历史配置时）
+                self.mode_var.set("full_auto")
         except Exception:
             pass
 
@@ -5144,7 +6037,7 @@ class AssistantApp:
                 return
             suggestions = []
             if "```" in last and self.mode_var.get() != "full_auto":
-                suggestions.append(("💡 检测到代码输出，建议切换「完全智能」模式（自动调用全部工具）",
+                suggestions.append(("💡 检测到代码输出，建议切换「任务模式」（自动调用全部工具）",
                                     self._switch_mode_quick, "full_auto"))
             if any(w in last for w in ("翻译", "润色", "改写", "周报")):
                 suggestions.append(("💡 翻译/润色/周报可用「⚡ 指令」模板一键套用", self._show_prompt_menu, None))
@@ -6606,9 +7499,8 @@ class AssistantApp:
             self.send(text=prompt)
 
     def _mode_tools_for_request(self, cfg):
-        """自主模式 = 任务能力：按当前模式解析本次请求的工具集（不污染配置）。
+        """自主模式 = 任务能力：完全智能 → 全部工具（smart 索引激活）；纯对话 → 无工具。
 
-        完全智能 → 全部工具（为开发/创作而生）；纯对话 → 无工具；标准 → 按工具中心配置。
         返回 (enabled_tools, tools_enabled)。
         """
         if cfg.get("full_auto"):
@@ -6616,9 +7508,7 @@ class AssistantApp:
                 t["function"]["name"] for t in load_user_tools(USER_TOOLS_PATH)
             ]
             return names, True
-        if cfg.get("pure_chat"):
-            return [], False
-        return list(cfg.get("enabled_tools") or []), bool(cfg.get("tools_enabled", True))
+        return [], False
 
     @staticmethod
     def _dependency_status():
@@ -7472,14 +8362,12 @@ class AssistantApp:
         card("依赖", [dep_line])
         # 工作目录
         card("工作目录", [self._get_active_dir()])
-        # 任务能力（自主模式语义：完全智能=全部工具 / 纯对话=无工具 / 标准=按工具设置）
+        # 任务能力（模式语义：任务=全部工具 / 对话=无工具）
         if self.cfg.get("full_auto"):
-            cap_line = "🤖 完全智能：全部工具自动可用（为开发/创作而生，权限闸门跳过）"
-        elif self.cfg.get("pure_chat"):
-            cap_line = "💬 纯对话：不调用任何工具"
+            cap_line = "🚀 任务模式：全部工具自动可用"
         else:
-            cap_line = "标准：按下方「工具设置」勾选"
-        card("任务能力", [f"自主模式 → {cap_line}"])
+            cap_line = "💬 对话模式：不调用任何工具"
+        card("工作模式", [cap_line])
         # 安全
         d = permissions.get_data()
         sec_mode = permissions.security_mode()
@@ -7494,7 +8382,7 @@ class AssistantApp:
             )
         else:
             sec_line = f"⬜ 白名单模式（旧）· 审批：{d.get('approval_mode', 'auto')}"
-        auto = " · 🤖 完全智能：零审批" if permissions.is_full_auto() else ""
+        auto = " · 🚀 任务模式：零审批" if permissions.is_full_auto() else ""
         card("安全", [sec_line + auto])
 
     def _hub_tools_settings(self, nb):
@@ -7539,12 +8427,9 @@ class AssistantApp:
                 if self.messages:
                     self.messages[0]["content"] = sp
                 self._update_role_label()
-        tools = sc.get("enabled_tools")
-        if isinstance(tools, list):
-            valid = self._valid_tool_names()
-            self.cfg["enabled_tools"] = [t for t in tools if t in valid]
+        # 双态模式下工具集由自主模式决定（完全智能=全部），场景不再覆盖工具配置
         save_config(self.cfg)
-        self._flash_status(f"🎭 已应用插件场景「{name}」（任务能力已配置）")
+        self._flash_status(f"🎭 已应用插件场景「{name}」（人格已更新）")
 
     def show_plugin_gallery(self):
         """插件画廊（已并入插件中心，兼容入口）。"""
@@ -7980,7 +8865,7 @@ class AssistantApp:
         ).pack(anchor="w", pady=(0, 10))
         if permissions.is_full_auto():
             self._lbl(
-                body, "🤖 完全智能模式已开启：零审批、零开关，AI 拥有无限权利（黑名单仍生效）。",
+                body, "🚀 任务模式已开启：零审批、零开关，AI 拥有全部工具（黑名单仍生效）。",
                 role="label_accent", bg="panel", font=(FONT_FAMILY, 8, "bold"),
             ).pack(anchor="w", pady=(0, 8))
 
@@ -8199,6 +9084,7 @@ class AssistantApp:
             self._follow_bottom = False
 
     def _append(self, text, tag=None):
+        self._maybe_hide_welcome()
         if self._paged_render is not None:
             # 分帧进行中：挂起追加，分帧完成后补插（同步补全渲染会冻结 UI 0.5-数秒）
             self._pending_appends.append((text, tag))
@@ -8209,6 +9095,8 @@ class AssistantApp:
         self._ensure_follow()
 
     def _append_message_block(self, header, body, tag):
+        # 真实消息渲染 = 离开空状态
+        self._hide_welcome_page()
         # 用户消息插入 = 新一轮交互，强制回到底部（先看到自己的消息与 AI 回复）
         self._follow_bottom = True
         now = datetime.now().strftime("%H:%M:%S")
@@ -8218,10 +9106,45 @@ class AssistantApp:
         self.blocks.append(("note", header_line, header_tag))
         if body:
             body_line = body.rstrip() + "\n"
+            start = self.chat_text.index("end-1c")
             self._append(body_line, tag)
+            end = self.chat_text.index("end-1c")
             self.blocks.append((tag, body_line))
+            self._flash_message(start, end)
         self._append("\n")
         self.blocks.append(("plain", "\n"))
+
+    def _flash_message(self, start, end):
+        """新消息入场高亮：背景从 accent 渐变色回 chat_bg（约 0.9s 5 帧）。"""
+        try:
+            text = self.chat_text
+            if not text.winfo_exists():
+                return
+            t = self._theme()
+            r1, g1, b1 = _hex_rgb(t["accent"])
+            r2, g2, b2 = _hex_rgb(t["chat_bg"])
+            tag = f"_flash_{int(time.monotonic() * 1000)}"
+            steps = [
+                f"#{int(r1 + (r2 - r1) * k):02x}{int(g1 + (g2 - g1) * k):02x}{int(b1 + (b2 - b1) * k):02x}"
+                for k in (0.25, 0.5, 0.75, 1.0)
+            ]
+            text.tag_add(tag, start, end)
+
+            def _fade(i=0):
+                try:
+                    if not text.winfo_exists():
+                        return
+                    if i < len(steps):
+                        text.tag_configure(tag, background=steps[i])
+                        text.after(220, lambda: _fade(i + 1))
+                    else:
+                        text.tag_delete(tag)
+                except tk.TclError:
+                    pass
+
+            _fade()
+        except tk.TclError:
+            pass
 
     def _snapshot_assets(self):
         """取主线程 Tcl 值并浅拷贝快照数据（纯 Python，供后台线程序列化写盘）。
@@ -8353,10 +9276,30 @@ class AssistantApp:
             path = os.path.join(SESSIONS_DIR, f"{sid}.json")
             if os.path.exists(path):
                 os.remove(path)
-                return True
+            self._drop_session_by_id(sid)
+            return True
         except Exception:
             logging.exception("删除会话文件失败")
         return False
+
+    def _drop_session_by_id(self, sid):
+        """删除会话后同步清理内存列表（占位/已加载均移除），并刷新侧栏。"""
+        try:
+            for i, s in enumerate(self._sessions):
+                if s.get("id") == sid:
+                    self._sessions.pop(i)
+                    self._session_name_cache.pop(id(s), None)
+                    if s is self._current:
+                        # 当前会话被删除：切换到最近会话（占位会从磁盘重新加载）
+                        if self._sessions:
+                            self._current = self._sessions[0]
+                            self._show_session_text(self._current)
+                        else:
+                            self._current = self._add_session()
+                    break
+            self._refresh_session_list()
+        except Exception:
+            logging.exception("清理会话列表失败")
 
     def list_saved_sessions(self):
         """扫描历史会话文件，返回轻量元信息列表。
@@ -8394,8 +9337,12 @@ class AssistantApp:
         items.sort(key=lambda x: x["updated_at"], reverse=True)
         return items
 
-    def load_session_from_file(self, sid):
-        """按需从文件载入完整会话，创建为新会话并切换。"""
+    def load_session_from_file(self, sid, target=None):
+        """按需从文件载入完整会话。
+
+        target 为 None 时创建新会话（历史库载入路径）；
+        传入占位会话时直接填充复用（侧栏点击历史会话路径，避免重复占位）。
+        """
         sid = self._safe_sid(sid)
         path = os.path.join(SESSIONS_DIR, f"{sid}.json")
         if not os.path.exists(path):
@@ -8406,7 +9353,7 @@ class AssistantApp:
         except Exception:
             logging.exception("载入历史会话失败")
             return None
-        session = self._add_session()
+        session = target or self._add_session()
         session["id"] = sid
         session["name"] = str(data.get("name") or "") or None
         # json.load 产物无共享引用，直接复用；dict 拷贝破坏 tokens 缓存并翻倍内存峰值
@@ -8423,6 +9370,7 @@ class AssistantApp:
             session["pinned"] = [str(p) for p in pinned if str(p)]
         session["ephemeral"] = bool(data.get("ephemeral"))
         session["top"] = bool(data.get("top"))
+        session["placeholder"] = False
         if not session["messages"] or session["messages"][0].get("role") != "system":
             session["messages"] = [{"role": "system", "content": self.cfg["system_prompt"]}]
         session["first_user"] = next(
@@ -8480,7 +9428,11 @@ class AssistantApp:
 
     def _save_snapshot_now(self):
         self._snapshot_after = None
-        if self.cfg.get("privacy_mode") or self._current.get("ephemeral"):
+        if (
+            self.cfg.get("privacy_mode")
+            or self._current.get("ephemeral")
+            or self._current.get("placeholder")
+        ):
             self._snapshot_dirty = False
             return
         try:
@@ -8516,9 +9468,15 @@ class AssistantApp:
             logging.exception("快照惰性落盘失败")
 
     def _restore_snapshot(self):
+        """默认空会话启动：不自动恢复上次会话。
+
+        历史会话载入左侧列表（用户自行点选进入，不替用户选择当前会话）；
+        快照恢复仅在显式开启 restore_session 时进行（保留能力）。
+        """
+        self._load_history_sessions_into_sidebar()
         if self.cfg.get("privacy_mode"):
             return
-        if not self.cfg.get("restore_session", True):
+        if not self.cfg.get("restore_session", False):
             return
         if not os.path.exists(SNAPSHOT_PATH):
             return
@@ -8566,6 +9524,96 @@ class AssistantApp:
         except Exception:
             logging.exception("会话快照恢复失败")
 
+    def _new_session_skeleton(self):
+        """创建会话骨架（UI 字段齐全，供占位/懒加载使用）。"""
+        sizes = self._font_sizes()
+        t = self._theme()
+        col = tk.Frame(self.chat_frame, bg=t["chat_bg"])
+        self._restyle.append((col, "chat_bg"))
+        text = tk.Text(
+            col, wrap="word", state="disabled",
+            bg=t["chat_bg"], fg=t["text"], insertbackground=t["text"],
+            selectbackground=t["selection"], selectforeground=t["accent_text"],
+            padx=40, pady=22, relief="flat", font=(FONT_FAMILY, sizes["base"]),
+        )
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(
+            col, orient="vertical", command=text.yview, style="WT.Vertical.TScrollbar",
+        )
+        scrollbar.place(relx=1.0, x=-10, y=0, width=10, relheight=1.0)
+        text.configure(yscrollcommand=scrollbar.set)
+        self._configure_tags(text, t, sizes)
+        self._fold_ranges[text] = []
+        self._fold_nums[text] = []
+        self._code_copy_ranges[text] = []
+        return {
+            "tab": col,
+            "col": col,
+            "scrollbar": scrollbar,
+            "text": text,
+            "name": None,
+            "id": None,
+            "ephemeral": False,
+            "stars": [],
+            "tags": [],
+            "pinned": [],
+            "placeholder": False,
+            "messages": [{"role": "system", "content": self.cfg["system_prompt"]}],
+            "usage_total": {"prompt": 0, "completion": 0, "cache_hit": 0, "cache_miss": 0},
+            "last_usage": None,
+            "assistant_answered": False,
+            "session_start": datetime.now(),
+            "blocks": CappedList(),
+            "first_user": None,
+            "last_code_blocks": [],
+            "top": False,
+        }
+
+    def _load_history_sessions_into_sidebar(self):
+        """把历史会话（sessions 目录）载入左侧列表，供用户自行选择进入。
+
+        后台线程扫描（JSON 解析可能耗时），完成后主线程刷新列表。
+        """
+        try:
+            if self.cfg.get("privacy_mode"):
+                return
+
+            def _scan():
+                try:
+                    metas = self.list_saved_sessions()
+                except Exception:
+                    logging.exception("历史会话扫描失败")
+                    metas = []
+                try:
+                    self.root.after(0, lambda: self._apply_history_metas(metas))
+                except Exception:
+                    pass
+
+            threading.Thread(target=_scan, daemon=True).start()
+        except Exception:
+            logging.exception("历史会话列表加载失败")
+
+    def _apply_history_metas(self, metas):
+        """主线程：把扫描结果应用到侧栏列表。"""
+        try:
+            existing = {s.get("id") for s in self._sessions}
+            for meta in metas:
+                sid = meta["id"]
+                if sid in existing:
+                    continue
+                session = self._new_session_skeleton()
+                session["id"] = sid
+                session["name"] = meta["name"] if meta["name"] != "未命名会话" else ""
+                session["placeholder"] = True
+                session["count"] = meta.get("count", 0)
+                session["preview"] = meta.get("preview", "")
+                session["saved_at"] = meta.get("updated_at", "")
+                self._sessions.append(session)
+                existing.add(sid)
+            self._refresh_session_list()
+        except Exception:
+            logging.exception("历史会话列表应用失败")
+
     def new_conversation(self, export_old=True):
         if self.busy:
             messagebox.showinfo("提示", "请先停止当前生成。")
@@ -8595,6 +9643,7 @@ class AssistantApp:
         self._fold_nums[self.chat_text] = []
         self._link_ranges[self.chat_text] = []
         self._filelink_ranges[self.chat_text] = []
+        self._code_copy_ranges[self.chat_text] = []
         self._stream_thinking_fold = None
         self.chat_text.configure(state="normal")
         self.chat_text.delete("1.0", "end")
@@ -8761,6 +9810,32 @@ class AssistantApp:
             return eff
         return thinking
 
+    _TOOL_PRESELECT_RULES = [
+        (re.compile(r"天气|气温|下雨|台风|温度|预报", re.I), ["get_weather"]),
+        (re.compile(r"搜索|搜一下|查一下|新闻|资讯|最新|百度|谷歌|网页|资讯", re.I), ["search_web", "fetch_url"]),
+        (re.compile(r"读.*(文件|文档|txt|md|py|json)|看看.*(文件|文档)|打开.*(文档|文件)", re.I), ["read_file", "list_files"]),
+        (re.compile(r"写.*(文件|文档|txt|md)|保存|写入|创建.*文件", re.I), ["write_file", "create_file"]),
+        (re.compile(r"图片|图像|截图|ocr|识别.*文字|画|生成图", re.I), ["image_process", "ocr_image", "screenshot"]),
+        (re.compile(r"代码|编程|python|函数|bug|脚本|写.*程序", re.I), ["run_python", "read_file", "list_files"]),
+        (re.compile(r"数据库|sql|mysql|postgres|查询.*表|建表", re.I), ["database_query"]),
+        (re.compile(r"邮件|发邮件|收件箱|邮件通知", re.I), ["send_email", "read_email"]),
+        (re.compile(r"定时|提醒|日程|定时任务|cron", re.I), ["schedule_task"]),
+        (re.compile(r"记忆|记住|忘了|偏好|习惯", re.I), ["write_memory", "read_memory"]),
+        (re.compile(r"csv|excel|表格|报表|数据|图表|统计", re.I), ["read_csv", "read_excel", "chart_data", "database_query"]),
+        (re.compile(r"翻译|英文|中文|日语|法语|德语|英语", re.I), []),
+    ]
+
+    def _preselect_tools(self, text):
+        """关键词预筛：完全智能模式下首轮按用户消息预激活相关工具（省一轮点菜）。"""
+        hits = []
+        for pat, tools in self._TOOL_PRESELECT_RULES:
+            try:
+                if pat.search(text or ""):
+                    hits.extend(tools)
+            except Exception:
+                continue
+        return list(dict.fromkeys(hits))
+
     def _worker(self, continue_mode=False):
         try:
             client = self.ensure_client()
@@ -8793,9 +9868,17 @@ class AssistantApp:
                 msgs = [dict(x) for x in msgs]
                 if msgs and msgs[0].get("role") == "system":
                     msgs[0]["content"] = DIALOG_SYSTEM_PROMPT
-            # 自主模式 = 任务能力（运行时语义，不污染 enabled_tools 配置）：
-            # 完全智能 = 全部工具（为开发/创作而生）；纯对话 = 无工具；标准 = 按工具中心配置
+            # 自主模式 = 任务能力（运行时语义，不污染配置）：
+            # 完全智能 = 全部工具（smart 索引激活）；纯对话 = 无工具
             enabled_tools, tools_enabled = self._mode_tools_for_request(cfg)
+            preset_tools = None
+            if cfg.get("full_auto"):
+                last_user = ""
+                for mm in reversed(self.messages):
+                    if mm.get("role") == "user":
+                        last_user = str(mm.get("content") or "")[:400]
+                        break
+                preset_tools = self._preselect_tools(last_user) or None
             seed = None
             if self._variant_seed_override is not None:
                 seed = self._variant_seed_override
@@ -8812,6 +9895,8 @@ class AssistantApp:
                 seed=seed,
                 tools_enabled=tools_enabled,
                 enabled_tools=enabled_tools,
+                smart_tools=bool(cfg.get("full_auto")),
+                preset_tools=preset_tools,
                 custom_tools=load_user_tools(USER_TOOLS_PATH),
                 max_tool_rounds=int(cfg.get("max_tool_rounds", 100)),
                 on_reasoning=self._push_reasoning,
@@ -9648,6 +10733,16 @@ class AssistantApp:
 
     def _insert_content(self, text, payload, tag, msg_idx, last_code_blocks, pos):
         pos = text.index(pos)
+        _was_disabled = str(text.cget("state")) == "disabled"
+        if _was_disabled:
+            text.configure(state="normal")
+        try:
+            return self._insert_content_impl(text, payload, tag, msg_idx, last_code_blocks, pos)
+        finally:
+            if _was_disabled:
+                text.configure(state="disabled")
+
+    def _insert_content_impl(self, text, payload, tag, msg_idx, last_code_blocks, pos):
         if self._md_render:
             dtext, spans, links, code_blocks = mdparse.render_markdown(payload)
             text.insert(pos, dtext, tag)
@@ -9676,7 +10771,21 @@ class AssistantApp:
                 for _a, _b, code in code_blocks:
                     if code.strip():
                         last_code_blocks.append(code + "\n")
-            return text.index(f"{pos}+{len(dtext)}c")
+            # 代码块尾部复制锚点：常驻可视入口（与 last_code_blocks 无关）
+            _shift = 0
+            for _a, _b, _code in code_blocks:
+                if _code.strip():
+                    anchor = f"[📋 复制代码]\n"
+                    # 代码区间（插入锚点前，用累计偏移修正）
+                    r0 = text.index(f"{pos}+{_a + _shift}c")
+                    r1 = text.index(f"{pos}+{_b + _shift}c")
+                    # 锚点插在代码块末尾
+                    apos = text.index(f"{pos}+{_b + _shift}c")
+                    text.insert(apos, anchor, "code_copy")
+                    _shift += len(anchor)
+                    aend = text.index(f"{apos}+{len(anchor)}c")
+                    self._code_copy_ranges.setdefault(text, []).append((aend, (r0, r1)))
+            return text.index(f"{pos}+{len(dtext) + _shift}c")
         for style, seg in split_code_blocks(payload):
             text.insert(pos, seg, style)
             if style == "code" and seg.strip() and last_code_blocks is not None:
@@ -10591,35 +11700,13 @@ class AssistantApp:
         # 状态栏被正常刷新（非 flash）时让挂起的 flash 恢复回调作废，防止旧文本回退
         self._flash_gen = getattr(self, "_flash_gen", 0) + 1
         t = self._theme()
-        if self.last_usage:
-            cur = self.last_usage
-            hit = cur["cache_hit"]
-            miss = cur["cache_miss"]
-            ratio = hit / (hit + miss) if (hit + miss) else None
-            ratio_str = ""
-            if ratio is not None:
-                ratio_str = f" 缓存占比 {ratio:.0%}"
-            cur_str = (
-                f"本轮: 输入 {cur['prompt']} (缓存命中 {hit} / 未命中 {miss})"
-                f" 输出 {cur['completion']}{ratio_str}"
-            )
-            fg = None
-            if ratio is not None:
-                if ratio >= 0.9:
-                    fg = t["success"]
-                elif ratio >= 0.5:
-                    fg = t["warning"]
-                else:
-                    fg = t["error"]
-        else:
-            cur_str = "本轮: -"
-            fg = None
         total_str = (
-            f"累计: 输入 {self.usage_total['prompt']} 输出 {self.usage_total['completion']}"
-            f" (缓存命中 {self.usage_total['cache_hit']})"
+            f"累计: 输入 {self.usage_total['prompt']:,} · 输出 {self.usage_total['completion']:,}"
+            f" (缓存命中 {self.usage_total['cache_hit']:,})"
         )
         budget = float(self.cfg.get("monthly_budget", 0) or 0)
         budget_str = ""
+        fg = None
         if budget > 0:
             try:
                 cost = self._monthly_cost()
@@ -10634,13 +11721,12 @@ class AssistantApp:
                 budget_str += " ⚠ 接近上限"
                 fg = t["warning"]
         privacy = "🔒 " if self.cfg.get("privacy_mode") else ""
-        auto = "🤖 " if self.cfg.get("full_auto") else ""
-        chat = "💬 " if self.cfg.get("pure_chat") else ""
+        mode_tag = "🚀任务" if self.cfg.get("full_auto") else "💬对话"
         peak = " ⏰ 高峰" if is_peak_hour() else ""
         wd = self._get_active_dir()
         wd_short = wd if len(wd) <= 28 else "…" + wd[-27:]
-        # 左段：模式 + 工作目录 + 本轮/累计 + 预算/高峰（信息密度最高的部分）
-        status_text = f"{privacy}{auto}{chat}📁 {wd_short} | {cur_str} | {total_str}{budget_str}{peak}"
+        # 左段：模式 + 工作目录 + 累计 + 预算/高峰（本轮已迁移到聊天区信息条）
+        status_text = f"{privacy}{mode_tag} 📁 {wd_short} | {total_str}{budget_str}{peak}"
         self._status_normal = status_text
         self.status_label.configure(text=status_text)
         # 右段：模型 / 角色 / 场景 / 思考档位（角色 = 当前生效人格，状态全程可见）
@@ -10650,6 +11736,11 @@ class AssistantApp:
         )
         if fg is not None:
             self.status_label.configure(fg=fg)
+        # 本轮信息同步到聊天区信息条
+        try:
+            self._update_chat_header()
+        except Exception:
+            pass
 
     def rebuild_view_from_messages(self):
         """从 messages 重建渲染视图（切换会话/重发/删除消息后调用）。
@@ -11874,6 +12965,23 @@ class AssistantApp:
         self.root.clipboard_append(text.get(rng[0], rng[1]).rstrip())
         self._flash_status("已复制代码块")
 
+    def _on_code_copy_click(self, event):
+        """点击代码块尾部复制锚点：查找最近一次插入的该代码块区间并复制。"""
+        text = event.widget
+        try:
+            click = text.index(f"@{event.x},{event.y}")
+            entries = self._code_copy_ranges.get(text) or []
+            if not entries:
+                return
+            best = None
+            for aend, rng in entries:
+                if not text.compare(aend, ">", click):
+                    best = rng
+            if best is not None:
+                self._copy_code_range(best)
+        except tk.TclError:
+            pass
+
     def _quote_message(self, msg_idx):
         """引用指定消息插入输入框，便于结合上下文追问。"""
         if not (1 <= msg_idx < len(self.messages)):
@@ -12637,6 +13745,7 @@ class AssistantApp:
                     pass
         except Exception:
             pass
+        self._stop_sonar()
         self._cancel_paged_render()
         if getattr(self, "_snapshot_after", None) is not None:
             try:
@@ -12718,24 +13827,64 @@ def ensure_app_icon():
     try:
         from PIL import Image, ImageDraw
 
+        # 鲸鱼徽标（对齐 splash 造型）：深海圆角底 + 声呐青鲸 + 白肚弧 + 声呐光环
         def make(size):
+            s = float(size)
             img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
             d = ImageDraw.Draw(img)
             d.rounded_rectangle(
                 [0, 0, size - 1, size - 1], radius=max(2, size // 5),
-                fill=(52, 120, 246, 255),
+                fill=(6, 16, 40, 255),  # 深海深底
             )
-            cx = cy = size // 2
-            dot_r = max(1, size * 0.16)
-            ring_r = max(2, size * 0.34)
+            # 声呐光环
             d.ellipse(
-                [cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
-                fill=(255, 255, 255, 255),
+                [cx := size * 0.16, cy := size * 0.16,
+                 size * 0.84, size * 0.84],
+                outline=(0, 212, 255, 255), width=max(1, size // 18),
             )
+            # 尾鳍（上/下两瓣）
+            d.polygon(
+                [(size * 0.30, size * 0.42), (size * 0.06, size * 0.20),
+                 (size * 0.02, size * 0.46), (size * 0.27, size * 0.48)],
+                fill=(0, 212, 255, 255),
+            )
+            d.polygon(
+                [(size * 0.30, size * 0.52), (size * 0.06, size * 0.78),
+                 (size * 0.02, size * 0.52), (size * 0.27, size * 0.50)],
+                fill=(0, 212, 255, 255),
+            )
+            # 身体
             d.ellipse(
-                [cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r],
-                outline=(255, 255, 255, 255),
-                width=max(1, size // 16),
+                [size * 0.17, size * 0.31, size * 0.78, size * 0.68],
+                fill=(0, 212, 255, 255),
+            )
+            # 肚皮亮弧
+            d.arc(
+                [size * 0.21, size * 0.35, size * 0.73, size * 0.70],
+                start=18, end=162, fill=(233, 241, 255, 255),
+                width=max(1, size // 26),
+            )
+            # 背鳍
+            d.polygon(
+                [(size * 0.60, size * 0.33), (size * 0.69, size * 0.15),
+                 (size * 0.75, size * 0.33)],
+                fill=(0, 212, 255, 255),
+            )
+            # 水柱
+            d.arc(
+                [size * 0.69, size * 0.10, size * 0.80, size * 0.26],
+                start=180, end=270, fill=(233, 241, 255, 255),
+                width=max(1, size // 26),
+            )
+            d.arc(
+                [size * 0.75, size * 0.04, size * 0.86, size * 0.20],
+                start=180, end=260, fill=(233, 241, 255, 255),
+                width=max(1, size // 26),
+            )
+            # 眼睛
+            d.ellipse(
+                [size * 0.70, size * 0.39, size * 0.74, size * 0.43],
+                fill=(6, 16, 40, 255),
             )
             return img
 
@@ -12754,7 +13903,7 @@ def single_instance_lock():
         import ctypes
 
         kernel32 = ctypes.windll.kernel32
-        kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME_EN}Assistant")
+        kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME_EN}AssistantTkUI")
         return kernel32.GetLastError() != 183
     except Exception:
         return True
@@ -12809,7 +13958,12 @@ def main():
     root.withdraw()
     splash = None
     try:
-        splash = SplashScreen(root, version=VERSION)
+        _splash_theme = "dark"
+        try:
+            _splash_theme = str(load_config().get("theme") or "dark")
+        except Exception:
+            pass
+        splash = SplashScreen(root, version=VERSION, theme=_splash_theme)
         splash.show()
     except Exception:
         logging.warning("启动界面初始化失败", exc_info=True)
@@ -12830,3 +13984,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
