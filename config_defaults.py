@@ -129,6 +129,8 @@ DEFAULT_CONFIG = {
     "restore_session": False,
     "font_size": 10,
     "font_size_custom": False,  # 用户手动改过字号后为 True，启动时不再自动按屏幕调整
+    "font_family": "Microsoft YaHei UI",
+    "message_density": "comfort",  # compact / comfort / loose
     "theme": "light",
     "md_render": True,
     "custom_temperature": 1.0,

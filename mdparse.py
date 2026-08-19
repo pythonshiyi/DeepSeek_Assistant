@@ -7,7 +7,10 @@ HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*)$", re.MULTILINE)
 HR_RE = re.compile(r"^[ \t]*([-*_])([ \t]*\1){2,}[ \t]*$")
 QUOTE_RE = re.compile(r"^(>+)[ \t]*(.*)$")
 LIST_RE = re.compile(r"^[ \t]*([-*+]|\d+[.)])[ \t]+(.*)$")
+TASK_LIST_RE = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])[ \t]+\[( |x|X)\][ \t]+(.*)$")
 TABLE_SEP_CELL_RE = re.compile(r"^:?-+:?$")
+# 表格单格显示宽度上限：超长单元格截断为省略号，避免撑爆聊天区
+_TABLE_CELL_MAX = 120
 
 _CODE_RE = re.compile(r"`([^`\n]+?)`")
 _IMAGE_RE = re.compile(r"!\[([^\]]*?)\]\(([^()\s]+?)\)")
@@ -212,6 +215,21 @@ def _ljust_cjk(s, width):
     return s + " " * max(0, width - _disp_width(s))
 
 
+def _trunc_cjk(s, max_width):
+    """按显示宽度截断（CJK 算 2 列），超长追加省略号。"""
+    if _disp_width(s) <= max_width:
+        return s
+    out = []
+    w = 0
+    for ch in s:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > max_width - 1:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out).rstrip() + "…"
+
+
 def _render_table(block):
     rows = []
     for ln in block.split("\n"):
@@ -223,7 +241,7 @@ def _render_table(block):
         cells = [c.strip() for c in s.split("|")]
         if all(TABLE_SEP_CELL_RE.match(c) for c in cells):
             continue
-        rows.append(cells)
+        rows.append([_trunc_cjk(c, _TABLE_CELL_MAX) for c in cells])
     if not rows:
         return "", []
     width = max(len(r) for r in rows)
@@ -248,7 +266,7 @@ def render_markdown(text, plain=False):
     返回 (display_text, spans, links, code_blocks)：
     - spans: [(start, end, tag)]，相对 display_text 的偏移
     - links: [(start, end, url)]
-    - code_blocks: [(start, end, content)]
+    - code_blocks: [(start, end, content, lang)]
     plain=True 时原样返回，不做任何解析。
 
     内容级 LRU 缓存：长会话全量重渲染/流式重渲染时同一 payload 反复解析
@@ -297,7 +315,7 @@ def render_markdown(text, plain=False):
             seg = block + "\n"
             s = out_len
             emit(seg, "code")
-            code_blocks.append((s, out_len, block))
+            code_blocks.append((s, out_len, block, lang))
         elif kind == "hr":
             emit("━" * 36 + "\n", "hr")
         elif kind == "table":
@@ -308,6 +326,14 @@ def render_markdown(text, plain=False):
                 spans.append((s + a, s + b, st))
         elif kind == "list":
             for ln in block.split("\n"):
+                tm = TASK_LIST_RE.match(ln)
+                if tm:
+                    # 任务列表：- [ ] → ☐，- [x] → ☑，保留缩进
+                    mark = "☑" if tm.group(2).lower() == "x" else "☐"
+                    ln = f"{tm.group(1)}• {mark} {tm.group(3)}"
+                    emit_inline(ln, base_tag="list")
+                    emit("\n")
+                    continue
                 # 无序与有序列表统一渲染：1. 第一项 → • 第一项（此前只认 [-*+]）
                 mm = re.match(r"^(\s*)(?:[-*+]|\d+[.)])[ \t]+(.*)$", ln)
                 if mm:
@@ -374,6 +400,7 @@ def to_plain(text):
     t = HEADING_RE.sub(r"\2", t)
     t = re.sub(r"^[ \t]*>+[ \t]?", "", t, flags=re.M)
     t = re.sub(r"^[ \t]*([-*+]|\d+[.)])[ \t]+", "", t, flags=re.M)
+    t = TASK_LIST_RE.sub(r"\1\3", t)
     t = re.sub(r"^[ \t]*\|.*$", "", t, flags=re.M)
     t = re.sub(r"^[ \t]*([-*_])([ \t]*\1){2,}[ \t]*$", "", t, flags=re.M)
     t = _BOLD_RE.sub(r"\1", t)

@@ -132,6 +132,9 @@ def normalize_config(cfg):
         cfg["font_size"] = max(8, min(18, int(cfg.get("font_size", 10))))
     except (TypeError, ValueError):
         cfg["font_size"] = 10
+    cfg["font_family"] = str(cfg.get("font_family", "Microsoft YaHei UI") or "Microsoft YaHei UI").strip() or "Microsoft YaHei UI"
+    if cfg.get("message_density") not in ("compact", "comfort", "loose"):
+        cfg["message_density"] = "comfort"
     try:
         cfg["input_height"] = max(2, min(14, int(cfg.get("input_height", 4))))
     except (TypeError, ValueError):

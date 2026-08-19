@@ -147,18 +147,21 @@ class TestFinishPerformance(PerfBase):
         self.assertIn("回答1第一段", clip)
 
     def test_thinking_fold_toggle_streamed(self):
-        """流式创建的思考卡片可折叠（elide 隐藏显示，search 默认跳过折叠文本）。"""
+        """流式创建的思考卡片可折叠（elide 隐藏显示，search 默认跳过折叠文本）。
+
+        生成结束后思考卡片默认收起（v2.23+ 体验优化），用户点击可展开。
+        """
         self._simulate_round(1)
         text = self.app.chat_text
         fold = next(f for f in self.app._fold_ranges[text] if f["style"] == "thinking")
-        self.assertTrue(fold["visible"])
-        self.app._toggle_fold(text, fold)
         self.assertFalse(fold["visible"])
-        # 思考 body 被 elide：search 找不到（工具卡片自身保持折叠，fold_hidden 非空是正常的）
+        # 默认收起：思考 body 被 elide，search 找不到
         self.assertFalse(text.search("思考1a", "1.0", stopindex="end"))
         self.app._toggle_fold(text, fold)
         self.assertTrue(fold["visible"])
         self.assertTrue(text.search("思考1a", "1.0", stopindex="end"))
+        self.app._toggle_fold(text, fold)
+        self.assertFalse(fold["visible"])
 
 
 class TestStreamMarkdownRender(PerfBase):

@@ -316,6 +316,7 @@ class AssistantApp:
         self._ensure_current()["blocks"] = value
 
     def __init__(self, root):
+        global FONT_FAMILY
         _t_init = time.perf_counter()
         self.root = root
         self.APP_NAME = APP_NAME
@@ -324,6 +325,7 @@ class AssistantApp:
         # dialogs 包引用的路径/常量（模块级定义，注入为实例属性）
         self.STATS_PATH = STATS_PATH
         self.cfg = load_config()
+        FONT_FAMILY = str(self.cfg.get("font_family") or "Microsoft YaHei UI")
         # SSRF 信任主机白名单（回环默认放行；内网经白名单显式信任后放行）
         _dc.set_ssrf_trusted(self.cfg.get("ssrf_trusted") or [])
         self._apply_screen_font_default()
@@ -345,6 +347,7 @@ class AssistantApp:
         self._pending_sends = []
         self._needs_compression = False
         self._resend_index = None
+        self._edit_assistant_idx = None
         self._search_open = False
         self._search_matches = []
         self._search_index = 0
@@ -372,11 +375,18 @@ class AssistantApp:
         self._fold_ranges = {}
         self._fold_nums = {}  # 折叠数值键缓存：与 _fold_ranges[text] 同步维护，点击命中免重建列表
         self._code_copy_ranges = {}
+        self._chat_image_refs = []
         self._filelink_ranges = {}
         self._md_render = bool(self.cfg.get("md_render", True))
         self.md_var = tk.BooleanVar(value=self._md_render)
         self._link_ranges = {}
         self._menu_msg_index = None
+        self._hover_bar = None
+        self._hover_msg_range = None
+        self._sel_bar = None
+        self._mouse_down = False
+        self._multi_select_mode = False
+        self._multi_selected = set()
         self._status_after = None
         previous_run_crashed()  # 维护干净退出标记状态（不再弹窗提示）
         self._follow_bottom = True  # 智能跟随状态：True=贴底跟随（仅手动滚动置 False）
@@ -424,6 +434,7 @@ class AssistantApp:
         self._hist_index = None
         self._hist_draft = ""
         self._draft_after = None
+        self._input_preview_shown = False
         self.task_panel = None
         self.proc_panel = None
         self._current_inject_text = ""
@@ -1526,6 +1537,8 @@ class AssistantApp:
         self.session_list.bind("<Button-5>", lambda e: (self.session_list.yview_scroll(1, "units"), "break")[1])
         self.session_list.bind("<<ListboxSelect>>", self._on_tab_changed)
         self.session_list.bind("<Double-1>", self._on_tab_double_click)
+        self.session_list.bind("<ButtonPress-1>", self._on_session_drag_start)
+        self.session_list.bind("<ButtonRelease-1>", self._on_session_drag_end)
         def _on_list_hover(event):
             try:
                 idx = self.session_list.nearest(event.y)
@@ -1597,6 +1610,7 @@ class AssistantApp:
         )
         self._width_drag_start_x = None
         self._width_drag_base = 0
+        self._session_drag_idx = None
 
     def _handle_hover(self, on):
         """分割手柄 hover：底色 accent、圆点变深，指示可拖动。"""
@@ -1975,6 +1989,27 @@ class AssistantApp:
             )
             self.font_size_combo.pack(side="left", padx=(6, 0))
             self.font_size_combo.bind("<<ComboboxSelected>>", self.on_font_size_change)
+            row2 = tk.Frame(g, bg=t["panel"])
+            row2.pack(fill="x", pady=(6, 0))
+            self._restyle.append((row2, "panel"))
+            self._lbl(row2, "字体", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left")
+            self.font_family_combo = ttk.Combobox(
+                row2, width=16,
+                values=["Microsoft YaHei UI", "微软雅黑", "宋体", "SimSun", "Consolas", "Segoe UI", "Arial"],
+                state="normal",
+            )
+            self.font_family_combo.pack(side="left", padx=(6, 0))
+            self.font_family_combo.bind("<<ComboboxSelected>>", self._on_font_family_change)
+            self.font_family_combo.bind("<Return>", self._on_font_family_change)
+            row3 = tk.Frame(g, bg=t["panel"])
+            row3.pack(fill="x", pady=(6, 0))
+            self._restyle.append((row3, "panel"))
+            self._lbl(row3, "消息密度", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(side="left")
+            self.density_combo = ttk.Combobox(
+                row3, width=8, values=["compact", "comfort", "loose"], state="readonly"
+            )
+            self.density_combo.pack(side="left", padx=(6, 0))
+            self.density_combo.bind("<<ComboboxSelected>>", self._on_density_change)
             ttk.Checkbutton(g, text="Markdown 渲染", variable=self.md_var, command=self.toggle_md_render).pack(
                 anchor="w", pady=(6, 0)
             )
@@ -2041,6 +2076,13 @@ class AssistantApp:
         self._mk_button(top, "刷新", self._refresh_files_panel, fsz=9).pack(side="left")
         self._mk_button(top, "打开工作区", lambda: self._open_path(WORKSPACE_DIR), fsz=9).pack(side="left", padx=(6, 0))
         self._mk_button(top, "打开草稿箱", lambda: self._open_path(os.path.join(WORKSPACE_DIR, "drafts")), fsz=9).pack(side="left", padx=(6, 0))
+        self.files_search_var = tk.StringVar()
+        self.files_search_entry = ttk.Entry(top, textvariable=self.files_search_var, width=22)
+        self.files_search_entry.pack(side="left", padx=(6, 0))
+        self.files_search_entry.insert(0, "搜索文件…")
+        self.files_search_entry.bind("<FocusIn>", lambda e: self.files_search_entry.delete(0, "end") if self.files_search_entry.get() == "搜索文件…" else None)
+        self.files_search_entry.bind("<FocusOut>", lambda e: self.files_search_entry.insert(0, "搜索文件…") if not self.files_search_entry.get() else None)
+        self.files_search_entry.bind("<KeyRelease>", lambda e: self._on_files_search())
         self.files_tree = ttk.Treeview(body, show="tree", selectmode="browse", style="Files.Treeview")
         self.files_tree.pack(fill="both", expand=True, pady=(6, 0))
         sb = ttk.Scrollbar(body, orient="vertical", command=self.files_tree.yview, style="Files.Vertical.TScrollbar")
@@ -2076,6 +2118,34 @@ class AssistantApp:
                 self.files_tree.see("ws")
         except tk.TclError:
             pass
+
+    def _on_files_search(self):
+        """文件面板搜索：按文件名过滤，结果以扁平列表展示。"""
+        try:
+            tree = self.files_tree
+            query = self.files_search_var.get().strip().lower()
+            tree.delete(*tree.get_children())
+            if not query or query == "搜索文件…":
+                self._refresh_files_panel()
+                return
+            skip = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", "build", "dist"}
+            count = 0
+            for root in (WORKSPACE_DIR, DATA_DIR):
+                if not root or not os.path.isdir(root):
+                    continue
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if d not in skip]
+                    for fn in filenames:
+                        if query in fn.lower():
+                            full = os.path.join(dirpath, fn)
+                            display = os.path.relpath(full, root)
+                            tree.insert("", "end", iid=full, text=display, tags=("file",))
+                            count += 1
+                            if count >= 500:
+                                tree.insert("", "end", text="…结果过多，已截断…", tags=("placeholder",))
+                                return
+        except Exception:
+            logging.exception("文件面板搜索失败")
 
     def _files_entry_path(self, iid):
         """从树节点解析真实路径；最近产物节点 iid 直接存绝对路径。"""
@@ -2696,8 +2766,29 @@ class AssistantApp:
             font=(FONT_FAMILY, 9),
         )
         self.chat_round_lbl.pack(side="right", padx=(0, 10))
+        # 多选操作条：批量删除/导出/收藏（默认隐藏）
+        self.multi_bar = tk.Frame(self.chat_frame, bg=t["panel"])
+        self._restyle.append((self.multi_bar, "panel"))
+        self.multi_bar_lbl = self._lbl(
+            self.multi_bar, "已选 0 条", role="label_sec", bg="panel", font=(FONT_FAMILY, 9)
+        )
+        self.multi_bar_lbl.pack(side="left", padx=10, pady=4)
+        self._mk_button(self.multi_bar, "删除选中", self._delete_selected_messages, fsz=9, kind="danger").pack(side="left", padx=2)
+        self._mk_button(self.multi_bar, "导出选中", self._export_selected_messages, fsz=9).pack(side="left", padx=2)
+        self._mk_button(self.multi_bar, "收藏选中", self._star_selected_messages, fsz=9).pack(side="left", padx=2)
+        self._mk_button(self.multi_bar, "退出多选", self._toggle_multi_select, fsz=9).pack(side="left", padx=2)
+        self.multi_bar.pack_forget()
         # 内嵌任务进度卡（聊天区右上角，替代左下角悬浮弹窗）
         self.task_panel = InlineTaskPanel(self.chat_frame, theme=t)
+        # 回到底部悬浮按钮：用户向上滚动离开底部时出现
+        self.back_to_bottom_btn = tk.Label(
+            self.chat_frame, text="↓ 回到底部", bg=t["accent"], fg=t["accent_text"],
+            font=(FONT_FAMILY, 9, "bold"), padx=10, pady=4, cursor="hand2",
+            relief="flat",
+        )
+        self.back_to_bottom_btn.bind("<Button-1>", lambda e: self._scroll_to_bottom())
+        self.back_to_bottom_btn.place(relx=1.0, x=-18, rely=1.0, y=-58, anchor="se")
+        self.back_to_bottom_btn.place_forget()
         self._add_session()
         self._show_session_text(self._current)
         self._build_welcome()
@@ -3085,6 +3176,26 @@ class AssistantApp:
         # before=input_text：产物条显示在输入框上方（后 pack 默认在下方）
         self.recent_bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
         self.recent_bar.pack_forget()  # 默认隐藏，有产物才显示
+        # ---- 输入预览：发送前用现有 Markdown 引擎渲染，默认隐藏 ----
+        self.input_preview = tk.Frame(card, bg=t.get("quote_bg", t["surface"]), highlightthickness=1,
+                                      highlightbackground=t["border"])
+        self._restyle.append((self.input_preview, "surface"))
+        self.input_preview_lbl = self._lbl(
+            self.input_preview, "预览（发送前 Markdown 渲染效果）", role="label_sec",
+            bg="surface", font=(FONT_FAMILY, 8),
+        )
+        self.input_preview_lbl.pack(anchor="w", padx=10, pady=(6, 0))
+        self.input_preview_text = tk.Text(
+            self.input_preview, height=6, wrap="word", state="disabled",
+            font=(FONT_FAMILY, sizes["base"]), bg=t["surface"], fg=t["text"],
+            relief="flat", bd=0, padx=10, pady=6,
+        )
+        self.input_preview_text.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        try:
+            self._configure_tags(self.input_preview_text, t, sizes)
+        except Exception:
+            logging.exception("预览文本样式初始化失败")
+        self.input_preview.pack_forget()
         self._refresh_line_px()
         self._restore_input_height()
         self.input_text.bind("<Return>", self.on_enter)
@@ -3103,6 +3214,12 @@ class AssistantApp:
         self.input_text.bind("<Control-I>", lambda e: self._wrap_selection("*", "*", "文本"))
         self.input_text.bind("<Control-k>", self._insert_link)
         self.input_text.bind("<Control-K>", self._insert_link)
+        self.input_text.bind("<Control-y>", lambda e: (self.input_text.event_generate("<<Redo>>"), "break")[1])
+        self.input_text.bind("<Control-Y>", lambda e: (self.input_text.event_generate("<<Redo>>"), "break")[1])
+        self.input_text.bind("<Control-Shift-c>", self._insert_code_block)
+        self.input_text.bind("<Control-Shift-C>", self._insert_code_block)
+        self.input_text.bind("<Control-Alt-q>", self._insert_quote_block)
+        self.input_text.bind("<Control-Alt-Q>", self._insert_quote_block)
         self.input_text.bind("<Control-Up>", lambda e: self._step_input_height(1))
         self.input_text.bind("<Control-Down>", lambda e: self._step_input_height(-1))
         # ---- 编辑器增强：Tab 缩进 / Shift+Tab 反缩进 / 括号自动配对 / Ctrl+Backspace 删词 ----
@@ -3122,7 +3239,11 @@ class AssistantApp:
         self.input_text.bind("<FocusOut>", lambda e: self._set_placeholder())
         self.input_text.bind(
             "<KeyRelease>",
-            lambda e: (self._schedule_input_tokens(), self._schedule_draft_save()),
+            lambda e: (
+                self._schedule_input_tokens(),
+                self._schedule_draft_save(),
+                self._update_input_preview(),
+            ),
         )
         foot = tk.Frame(card, bg=t["panel"])
         foot.pack(side="top", fill="x", padx=(12, 10), pady=(0, 8))
@@ -3134,6 +3255,8 @@ class AssistantApp:
         self.input_hint_lbl.pack(side="left")
         self.btn_prompts = self._mk_button(foot, "⚡ 指令", self._show_prompt_menu, fsz=9)
         self.btn_prompts.pack(side="left", padx=(10, 0))
+        self.btn_preview = self._mk_button(foot, "预览", self._toggle_input_preview, fsz=9)
+        self.btn_preview.pack(side="left", padx=(6, 0))
         self.btn_dir = self._mk_button(foot, "📁 目录", self.choose_working_dir, fsz=9)
         self.btn_dir.pack(side="left", padx=(6, 0))
         self.btn_stop = self._mk_button(foot, "■ 停止", self.stop_generate, kind="danger", fsz=10)
@@ -3973,12 +4096,19 @@ class AssistantApp:
             self._apply_input_height_px(self._input_px)
 
     def _configure_tags(self, text, t, sizes):
+        density = str(self.cfg.get("message_density", "comfort") or "comfort")
+        if density == "compact":
+            _t1, _t3, _u1, _u3, _a1, _a3 = 3, 2, 1, 1, 1, 1
+        elif density == "loose":
+            _t1, _t3, _u1, _u3, _a1, _a3 = 8, 6, 8, 8, 4, 4
+        else:
+            _t1, _t3, _u1, _u3, _a1, _a3 = 6, 4, 4, 4, 2, 2
         text.tag_configure(
             "time",
             foreground=t.get("note", t["thinking"]),
             font=(FONT_FAMILY, sizes["small"]),
-            spacing1=6,
-            spacing3=4,
+            spacing1=_t1,
+            spacing3=_t3,
         )
         text.tag_configure(
             "user",
@@ -3987,8 +4117,8 @@ class AssistantApp:
             lmargin1=10,
             lmargin2=10,
             rmargin=14,
-            spacing1=8,
-            spacing3=8,
+            spacing1=_u1,
+            spacing3=_u3,
             justify="left",
         )
         text.tag_configure(
@@ -3998,8 +4128,8 @@ class AssistantApp:
             lmargin1=10,
             lmargin2=10,
             rmargin=14,
-            spacing1=8,
-            spacing3=2,
+            spacing1=_u1,
+            spacing3=_u3 // 2,
             justify="left",
         )
         text.tag_configure(
@@ -4009,8 +4139,8 @@ class AssistantApp:
             lmargin1=8,
             lmargin2=8,
             rmargin=8,
-            spacing1=2,
-            spacing3=2,
+            spacing1=_a1,
+            spacing3=_a3,
         )
         text.tag_configure(
             "thinking",
@@ -4128,6 +4258,14 @@ class AssistantApp:
         text.tag_configure(
             "search_cur", background=t["accent"], foreground=t["accent_text"]
         )
+        text.tag_configure(
+            "multi_sel", background=t["selection"], foreground=t["accent_text"]
+        )
+        text.tag_configure(
+            "msg_hover", background=t.get("hover", t["surface"])
+        )
+        # 显式配置内置 sel 标签：确保选区在任何状态下都有明显高亮
+        text.tag_configure("sel", background=t["selection"], foreground=t["accent_text"])
         text.tag_configure("link", foreground=t["accent"], underline=True)
         text.tag_configure("filelink", foreground=t["accent"], underline=True)
         text.tag_configure("bold", font=(FONT_FAMILY, sizes["base"], "bold"))
@@ -4161,6 +4299,12 @@ class AssistantApp:
                 spacing1=6,
                 spacing3=4,
             )
+        # 选中高亮必须高于所有业务 tag（尤其 msg_hover / multi_sel），
+        # 否则鼠标悬停背景会盖住选区，造成“选中跟没选中一样”
+        try:
+            text.tag_raise("sel")
+        except tk.TclError:
+            pass
 
     def _add_session(self):
         sizes = self._font_sizes()
@@ -4177,6 +4321,7 @@ class AssistantApp:
             insertbackground=t["text"],
             selectbackground=t["selection"],
             selectforeground=t["accent_text"],
+            inactiveselectbackground=t["selection"],
             padx=40,
             pady=22,
             relief="flat",
@@ -4223,6 +4368,10 @@ class AssistantApp:
         text.bind("<MouseWheel>", _on_chat_wheel)
         self._configure_tags(text, t, sizes)
         text.bind("<Button-3>", self._on_chat_menu)
+        text.bind("<Button-1>", self._on_chat_click)
+        text.bind("<ButtonRelease-1>", self._on_chat_release)
+        text.bind("<Motion>", self._on_chat_hover)
+        text.bind("<Leave>", lambda e: (self._hide_hover_bar(), self._clear_msg_hover(text)))
         text.tag_bind("link", "<Button-1>", self._on_link_click)
         text.tag_bind("link", "<Enter>", lambda e: text.configure(cursor="hand2"))
         text.tag_bind("link", "<Leave>", lambda e: text.configure(cursor=""))
@@ -4726,6 +4875,8 @@ class AssistantApp:
         menu.add_command(label="设置标签…", command=self.edit_session_tags)
         top_label = "取消置顶" if self._current.get("top") else "置顶会话"
         menu.add_command(label=top_label, command=self._toggle_session_top)
+        menu.add_command(label="上移", command=lambda: self._move_session(-1))
+        menu.add_command(label="下移", command=lambda: self._move_session(1))
         menu.add_command(label="新建会话", command=self.add_tab)
         menu.add_command(label="删除会话", command=self.close_tab)
         menu.add_separator()
@@ -4763,6 +4914,69 @@ class AssistantApp:
         self._refresh_session_list()
         self._flash_status("已置顶会话" if session["top"] else "已取消置顶")
 
+    def _move_session(self, delta):
+        """在会话列表中上移/下移当前会话。"""
+        try:
+            idx = self._sessions.index(self._current)
+        except ValueError:
+            return
+        new = idx + delta
+        if not (0 <= new < len(self._sessions)):
+            return
+        self._sessions[idx], self._sessions[new] = self._sessions[new], self._sessions[idx]
+        self._refresh_session_list()
+        self._flash_status("已调整会话顺序")
+
+    def _on_session_drag_start(self, event):
+        try:
+            self._session_drag_idx = self.session_list.nearest(event.y)
+        except Exception:
+            self._session_drag_idx = None
+
+    def _on_session_drag_end(self, event):
+        if getattr(self, "_session_drag_idx", None) is None:
+            return
+        try:
+            target = self.session_list.nearest(event.y)
+        except Exception:
+            self._session_drag_idx = None
+            return
+        start = self._session_drag_idx
+        self._session_drag_idx = None
+        if start == target or self.session_search_var.get().strip():
+            return
+        if not (0 <= start < len(self._list_visible) and 0 <= target < len(self._list_visible)):
+            return
+        src = self._list_visible[start]
+        dst = self._list_visible[target]
+        self._sessions.remove(src)
+        insert_at = self._sessions.index(dst)
+        if target > start:
+            insert_at += 1
+        self._sessions.insert(insert_at, src)
+        self._refresh_session_list()
+        self._flash_status("已拖拽调整会话顺序")
+
+    def _on_font_family_change(self, _event=None):
+        global FONT_FAMILY
+        fam = self.font_family_combo.get().strip()
+        if not fam:
+            return
+        FONT_FAMILY = fam
+        self.cfg["font_family"] = fam
+        self.apply_font_size()
+        save_config(self.cfg)
+        self._flash_status(f"字体已切换：{fam}")
+
+    def _on_density_change(self, _event=None):
+        val = self.density_combo.get()
+        if val not in ("compact", "comfort", "loose"):
+            return
+        self.cfg["message_density"] = val
+        self.apply_font_size()
+        save_config(self.cfg)
+        self._flash_status(f"消息密度：{val}")
+
     def on_font_size_change(self, _event=None):
         try:
             size = int(self.font_size_combo.get())
@@ -4784,6 +4998,10 @@ class AssistantApp:
         self.max_tokens_spin.set(str(self.cfg["max_tokens"]))
         self.seed_var.set(str(self.cfg.get("seed", "")))
         self.font_size_combo.set(str(self.cfg.get("font_size", 10)))
+        if hasattr(self, "font_family_combo"):
+            self.font_family_combo.set(str(self.cfg.get("font_family", "Microsoft YaHei UI")))
+        if hasattr(self, "density_combo"):
+            self.density_combo.set(str(self.cfg.get("message_density", "comfort")))
         self.md_var.set(bool(self.cfg.get("md_render", True)))
         self.json_var.set(bool(self.cfg.get("json_output", False)))
         self.beta_var.set(bool(self.cfg.get("beta_api", False)))
@@ -4844,6 +5062,14 @@ class AssistantApp:
             new["font_size"] = max(8, min(18, int(self.font_size_combo.get())))
         except ValueError:
             pass
+        if hasattr(self, "font_family_combo"):
+            fam = self.font_family_combo.get().strip()
+            if fam:
+                new["font_family"] = fam
+        if hasattr(self, "density_combo"):
+            den = self.density_combo.get()
+            if den in ("compact", "comfort", "loose"):
+                new["message_density"] = den
         changed = False
         for k, v in new.items():
             if self.cfg.get(k) != v:
@@ -9082,6 +9308,29 @@ class AssistantApp:
             self._follow_bottom = self.chat_text.yview()[1] >= 0.995
         except tk.TclError:
             self._follow_bottom = False
+        self._hide_selection_bar()
+        self._update_back_to_bottom_btn()
+
+    def _update_back_to_bottom_btn(self):
+        """根据跟随状态显示/隐藏「回到底部」悬浮按钮。"""
+        try:
+            btn = getattr(self, "back_to_bottom_btn", None)
+            if btn is None or not btn.winfo_exists():
+                return
+            if self._follow_bottom:
+                btn.place_forget()
+            else:
+                btn.place(relx=1.0, x=-18, rely=1.0, y=-58, anchor="se")
+        except tk.TclError:
+            pass
+
+    def _scroll_to_bottom(self, _event=None):
+        self._follow_bottom = True
+        try:
+            self.chat_text.see("end")
+        except tk.TclError:
+            pass
+        self._update_back_to_bottom_btn()
 
     def _append(self, text, tag=None):
         self._maybe_hide_welcome()
@@ -9762,6 +10011,30 @@ class AssistantApp:
                 "按高峰价计费（空闲时段为高峰一半）",
                 6000,
             )
+        if self._edit_assistant_idx is not None:
+            idx = self._edit_assistant_idx
+            self._edit_assistant_idx = None
+            self.input_text.delete("1.0", "end")
+            if not cfg.get("beta_api"):
+                messagebox.showinfo(
+                    "提示",
+                    "「编辑助手消息并继续」需要 Beta API，请先在设置面板开启。",
+                )
+                return
+            if not (1 <= idx < len(self.messages)) or self.messages[idx].get("role") != "assistant":
+                return
+            self.messages[idx]["content"] = text
+            del self.messages[idx + 1 :]
+            self._needs_compression = False
+            self._compression_note_shown = False
+            self.rebuild_view_from_messages()
+            note = "[编辑助手] 已更新助手消息，正在从该消息继续生成。\n"
+            self._append(note, "time")
+            self.blocks.append(("note", note))
+            self._ctx_counts = None
+            self._snapshot_dirty = True
+            self.continue_generation()
+            return
         self.input_text.delete("1.0", "end")
         if self._resend_index is not None:
             del self.messages[self._resend_index :]
@@ -10243,6 +10516,7 @@ class AssistantApp:
         try:
             self._drain_ui_queue()
             self._flush_pending()
+            self._update_back_to_bottom_btn()
             if self.busy and self._stream_start is not None:
                 idle = time.monotonic() - self._last_stream_activity
                 if idle > STREAM_IDLE_WARNING_S:
@@ -10554,6 +10828,10 @@ class AssistantApp:
         aborted = bool(getattr(self, "_round_aborted", False))
         self._round_aborted = False
         self._flush_pending(force=True)
+        try:
+            self._collapse_thinking_folds()
+        except Exception:
+            pass
         start = self._stream_start
         block_start = self._stream_block_start
         self._stream_start = None
@@ -10768,29 +11046,75 @@ class AssistantApp:
                 except tk.TclError:
                     pass
             if last_code_blocks is not None:
-                for _a, _b, code in code_blocks:
+                for _a, _b, code, _lang in code_blocks:
                     if code.strip():
                         last_code_blocks.append(code + "\n")
-            # 代码块尾部复制锚点：常驻可视入口（与 last_code_blocks 无关）
+            # 代码块头部复制按钮：常驻可视入口（与 last_code_blocks 无关）
             _shift = 0
-            for _a, _b, _code in code_blocks:
+            for _a, _b, _code, _lang in code_blocks:
                 if _code.strip():
-                    anchor = f"[📋 复制代码]\n"
+                    anchor = " [复制]\n"
                     # 代码区间（插入锚点前，用累计偏移修正）
                     r0 = text.index(f"{pos}+{_a + _shift}c")
                     r1 = text.index(f"{pos}+{_b + _shift}c")
-                    # 锚点插在代码块末尾
-                    apos = text.index(f"{pos}+{_b + _shift}c")
+                    # 锚点插在语言行之后、代码内容之前
+                    apos = text.index(f"{pos}+{_a + _shift}c")
                     text.insert(apos, anchor, "code_copy")
                     _shift += len(anchor)
                     aend = text.index(f"{apos}+{len(anchor)}c")
-                    self._code_copy_ranges.setdefault(text, []).append((aend, (r0, r1)))
-            return text.index(f"{pos}+{len(dtext) + _shift}c")
+                    self._code_copy_ranges.setdefault(text, []).append((apos, aend, (r0, r1)))
+            end_pos = text.index(f"{pos}+{len(dtext) + _shift}c")
+            return self._append_local_image_previews(text, payload, end_pos)
         for style, seg in split_code_blocks(payload):
             text.insert(pos, seg, style)
             if style == "code" and seg.strip() and last_code_blocks is not None:
                 last_code_blocks.append(seg)
             pos = text.index(f"{pos}+{len(seg)}c")
+        return self._append_local_image_previews(text, payload, pos)
+
+    def _append_local_image_previews(self, text, payload, pos):
+        """把消息中的本地图片路径渲染为聊天内嵌缩略图（Pillow 可选）。
+
+        远程图片仍保留 mdparse 的 [图片] 链接占位，避免引入网络请求。
+        """
+        try:
+            from PIL import Image as _PILImage
+            import io
+        except Exception:
+            return pos
+        image_re = re.compile(r"!\[([^\]]*?)\]\(([^()\s]+?)\)")
+        inserted_any = False
+        for m in image_re.finditer(str(payload or "")):
+            url = m.group(2).strip()
+            if not url or url.startswith(("http://", "https://")):
+                continue  # 远程图片暂不自动下载，保持轻量
+            if not os.path.isabs(url) or not os.path.isfile(url):
+                continue
+            try:
+                img = _PILImage.open(url)
+                img.load()
+            except Exception:
+                continue
+            max_w, max_h = 240, 240
+            w, h = img.size
+            scale = min(1.0, max_w / max(w, 1), max_h / max(h, 1))
+            if scale < 1.0:
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), _PILImage.LANCZOS)
+            try:
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="PNG")
+                photo = tk.PhotoImage(data=buf.getvalue())
+            except Exception:
+                continue
+            self._chat_image_refs.append(photo)
+            if not inserted_any:
+                text.insert(pos, "\n🖼 图片预览：\n", "assistant")
+                pos = text.index("end-1c")
+                inserted_any = True
+            text.image_create(pos, image=photo)
+            pos = text.index(f"{pos}+1c")
+            text.insert(pos, "\n", "assistant")
+            pos = text.index(f"{pos}+1c")
         return pos
 
     def _insert_fold(self, text, title, payload, style, visible, pos):
@@ -10887,6 +11211,29 @@ class AssistantApp:
         except tk.TclError:
             # 索引失效（重渲染/会话切换后残留的折叠记录）：静默忽略，避免事件层冒泡
             pass
+
+    def _collapse_all_folds(self):
+        """全部折叠（思考/工具卡片）。"""
+        text = self.chat_text
+        for f in list(self._fold_ranges.get(text, [])):
+            if f.get("visible", True):
+                self._toggle_fold(text, f)
+        self._flash_status("已全部折叠")
+
+    def _collapse_thinking_folds(self):
+        """生成结束后默认收起思考过程卡片，减少长回复视觉噪音。"""
+        text = self.chat_text
+        for f in list(self._fold_ranges.get(text, [])):
+            if f.get("style") == "thinking" and f.get("visible", True):
+                self._toggle_fold(text, f)
+
+    def _expand_all_folds(self):
+        """全部展开（思考/工具卡片）。"""
+        text = self.chat_text
+        for f in list(self._fold_ranges.get(text, [])):
+            if not f.get("visible", True):
+                self._toggle_fold(text, f)
+        self._flash_status("已全部展开")
 
     def _set_all_folds_elide(self, text, elide):
         try:
@@ -11808,6 +12155,22 @@ class AssistantApp:
                 return
         messagebox.showinfo("提示", "暂无消息可编辑。")
 
+    def _save_last_assistant_variant(self):
+        """把当前会话最后一条助手回复存入 variants，供重新生成后找回旧版。"""
+        try:
+            for i in range(len(self.messages) - 1, 0, -1):
+                m = self.messages[i]
+                if m.get("role") == "assistant" and m.get("content"):
+                    variants = self._current.setdefault("variants", [])
+                    if m["content"] not in variants:
+                        variants.append(m["content"])
+                        if len(variants) > 20:
+                            del variants[: len(variants) - 20]
+                    return True
+        except Exception:
+            logging.exception("保存旧回复变体失败")
+        return False
+
     def regenerate(self):
         if self.busy:
             messagebox.showinfo("提示", "请先停止当前生成。")
@@ -11815,10 +12178,14 @@ class AssistantApp:
         for i in range(len(self.messages) - 1, 0, -1):
             if self.messages[i].get("role") == "user":
                 text = self.messages[i].get("content", "")
+                saved = self._save_last_assistant_variant()
                 self._resend_index = None  # 重新生成会自行裁剪，清掉残留重发索引防止 send() 二次误删
                 del self.messages[i:]
                 self.rebuild_view_from_messages()
-                note = "[重新生成] 已移除上次回复，重新生成中。\n"
+                note = (
+                    "[重新生成] 已移除上次回复（旧版已存入变体，可右键「浏览变体」找回），重新生成中。\n"
+                    if saved else "[重新生成] 已移除上次回复，重新生成中。\n"
+                )
                 self._append(note, "time")
                 self.blocks.append(("note", note))
                 self.send(text=text)
@@ -11831,11 +12198,7 @@ class AssistantApp:
             messagebox.showinfo("提示", "请先停止当前生成。")
             return
         if not self.cfg.get("beta_api"):
-            messagebox.showinfo(
-                "提示",
-                "「继续生成」使用 DeepSeek 对话前缀续写（Beta），"
-                "请先在设置面板开启「Beta API」。",
-            )
+            self._toast("「继续生成」需要 Beta API，请先在设置面板开启。")
             return
         msgs = self.messages
         if not msgs or msgs[-1].get("role") != "assistant" or not msgs[-1].get("content"):
@@ -11972,6 +12335,38 @@ class AssistantApp:
                 else None
             ),
         )
+
+    def _toast(self, message, duration=3000):
+        """右下角非模态轻提示（不抢焦点，自动消失）。"""
+        try:
+            if getattr(self, "_toast_win", None) is not None:
+                try:
+                    self._toast_win.destroy()
+                except Exception:
+                    pass
+            t = self._theme()
+            win = tk.Toplevel(self.root, bg=t["panel"], bd=1, relief="solid")
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            lbl = tk.Label(win, text=str(message), bg=t["panel"], fg=t["text"],
+                           font=(FONT_FAMILY, 9), padx=14, pady=8, wraplength=360, justify="left")
+            lbl.pack()
+            win.update_idletasks()
+            x = self.root.winfo_rootx() + max(0, self.root.winfo_width() - win.winfo_width() - 24)
+            y = self.root.winfo_rooty() + max(0, self.root.winfo_height() - win.winfo_height() - 70)
+            win.wm_geometry(f"+{x}+{y}")
+            self._toast_win = win
+            self.root.after(duration, self._hide_toast)
+        except Exception:
+            logging.exception("显示 toast 失败")
+
+    def _hide_toast(self):
+        try:
+            if getattr(self, "_toast_win", None) is not None:
+                self._toast_win.destroy()
+                self._toast_win = None
+        except Exception:
+            self._toast_win = None
 
     def _copy_selection(self):
         self.root.clipboard_clear()
@@ -12844,6 +13239,185 @@ class AssistantApp:
         self.input_text.focus_set()
         self.send()
 
+    def _on_chat_hover(self, event):
+        """鼠标悬停消息时显示快捷操作小浮条，并高亮整条消息。
+
+        拖动选择期间（_mouse_down=True）禁止弹出任何 Toplevel，避免浮条
+        拦截鼠标事件导致选区无法正常显示/完成。
+        """
+        if getattr(self, "_mouse_down", False):
+            return
+        try:
+            text = self.chat_text
+            idx = text.index(f"@{event.x},{event.y}")
+            msg_range = self._msg_range_at(text, idx)
+            if msg_range is None or self.busy:
+                self._clear_msg_hover(text)
+                self._hide_hover_bar()
+                return
+            msg_idx = self._msg_index_at(text, idx)
+            if msg_idx is None:
+                self._clear_msg_hover(text)
+                self._hide_hover_bar()
+                return
+            r0, r1 = msg_range[0]
+            if self._hover_msg_range != (r0, r1):
+                self._clear_msg_hover(text)
+                try:
+                    text.tag_add("msg_hover", r0, r1)
+                except tk.TclError:
+                    pass
+                self._hover_msg_range = (r0, r1)
+            self._menu_msg_index = msg_idx
+            self._show_hover_bar(event.x_root, event.y_root, msg_idx)
+        except tk.TclError:
+            self._clear_msg_hover(self.chat_text if hasattr(self, "chat_text") else None)
+            self._hide_hover_bar()
+
+    def _clear_msg_hover(self, text):
+        """移除消息悬停高亮。"""
+        try:
+            if text is not None:
+                text.tag_remove("msg_hover", "1.0", "end")
+        except tk.TclError:
+            pass
+        self._hover_msg_range = None
+
+    def _show_hover_bar(self, x, y, msg_idx):
+        """在鼠标附近显示消息快捷操作浮条（非模态，不抢焦点）。"""
+        try:
+            cache_idx = getattr(self, "_hover_bar_idx", None)
+            cache_pos = getattr(self, "_hover_bar_pos", None)
+            if cache_idx == msg_idx and cache_pos and abs(cache_pos[0] - x) < 8 and abs(cache_pos[1] - y) < 8:
+                return
+            self._hide_hover_bar()
+            t = self._theme()
+            bar = tk.Toplevel(self.root, bg=t["panel"], bd=1, relief="solid")
+            bar.overrideredirect(True)
+            bar.attributes("-topmost", True)
+            role = self.messages[msg_idx].get("role") if 0 <= msg_idx < len(self.messages) else None
+            actions = []
+            actions.append(("复制", lambda: (self._copy_hover_message(), self._hide_hover_bar())))
+            actions.append(("编辑", lambda: (self._menu_edit_message(), self._hide_hover_bar())))
+            actions.append(("重新生成", lambda: (self._menu_regenerate_from(), self._hide_hover_bar())))
+            actions.append(("⭐ 收藏", lambda: (self._toggle_star(msg_idx), self._hide_hover_bar())))
+            if role == "assistant":
+                actions.append(("🔊 朗读", lambda: (self._menu_speak_message(), self._hide_hover_bar())))
+            for label, cmd in actions:
+                btn = tk.Label(bar, text=label, bg=t["panel"], fg=t["text"], padx=6, pady=2,
+                               cursor="hand2", font=(FONT_FAMILY, 9))
+                btn.pack(side="left", padx=1, pady=2)
+                btn.bind("<Button-1>", lambda e, c=cmd: c())
+                btn.bind("<Enter>", lambda e, b=btn: b.configure(bg=t.get("hover", t["surface"])))
+                btn.bind("<Leave>", lambda e, b=btn: b.configure(bg=t["panel"]))
+            bar.wm_geometry(f"+{x + 8}+{y + 8}")
+            self._hover_bar = bar
+            self._hover_bar_idx = msg_idx
+            self._hover_bar_pos = (x, y)
+        except Exception:
+            logging.exception("显示消息快捷操作条失败")
+
+    def _copy_hover_message(self):
+        idx = getattr(self, "_menu_msg_index", None)
+        if idx is None or not (1 <= idx < len(self.messages)):
+            return
+        content = self.messages[idx].get("content") or ""
+        if content:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            self._flash_status("已复制消息")
+
+    def _hide_hover_bar(self):
+        bar = getattr(self, "_hover_bar", None)
+        if bar is not None:
+            try:
+                if bar.winfo_exists():
+                    bar.destroy()
+            except Exception:
+                pass
+            self._hover_bar = None
+            self._hover_bar_idx = None
+            self._hover_bar_pos = None
+
+    def _on_chat_release(self, event):
+        """鼠标释放后，如果存在选中文本则显示快捷操作小浮条。"""
+        self._mouse_down = False
+        try:
+            if getattr(self, "_multi_select_mode", False):
+                self._hide_selection_bar()
+                return
+            text = self.chat_text
+            if text.tag_ranges("sel"):
+                self._show_selection_bar(event.x_root, event.y_root)
+            else:
+                self._hide_selection_bar()
+        except tk.TclError:
+            self._hide_selection_bar()
+
+    def _show_selection_bar(self, x, y):
+        try:
+            self._hide_selection_bar()
+            t = self._theme()
+            bar = tk.Toplevel(self.root, bg=t["panel"], bd=1, relief="solid")
+            bar.overrideredirect(True)
+            bar.attributes("-topmost", True)
+            actions = [
+                ("复制", self._copy_selection),
+                ("引用", self._quote_selection),
+                ("搜索", self._search_selection),
+            ]
+            for label, cmd in actions:
+                btn = tk.Label(bar, text=label, bg=t["panel"], fg=t["text"], padx=6, pady=2,
+                               cursor="hand2", font=(FONT_FAMILY, 9))
+                btn.pack(side="left", padx=1, pady=2)
+                btn.bind("<Button-1>", lambda e, c=cmd: (c(), self._hide_selection_bar()))
+                btn.bind("<Enter>", lambda e, b=btn: b.configure(bg=t.get("hover", t["surface"])))
+                btn.bind("<Leave>", lambda e, b=btn: b.configure(bg=t["panel"]))
+            bar.wm_geometry(f"+{x + 8}+{y + 8}")
+            self._sel_bar = bar
+        except Exception:
+            logging.exception("显示选中操作条失败")
+
+    def _hide_selection_bar(self):
+        bar = getattr(self, "_sel_bar", None)
+        if bar is not None:
+            try:
+                if bar.winfo_exists():
+                    bar.destroy()
+            except Exception:
+                pass
+            self._sel_bar = None
+
+    def _quote_selection(self):
+        try:
+            sel = self.chat_text.get("sel.first", "sel.last").strip()
+        except tk.TclError:
+            return
+        if not sel:
+            return
+        self._clear_placeholder()
+        self.input_text.delete("1.0", "end")
+        quoted = "\n".join("> " + ln for ln in sel.splitlines()[:8])
+        if len(sel.splitlines()) > 8:
+            quoted += "\n> …"
+        self.input_text.insert("1.0", f"请结合以下内容回答：\n{quoted}\n\n")
+        self.input_text.mark_set("insert", "end-1c")
+        self.input_text.focus_set()
+        self._flash_status("已插入引用，补充问题后按 Enter 发送")
+
+    def _search_selection(self):
+        try:
+            sel = self.chat_text.get("sel.first", "sel.last").strip()
+        except tk.TclError:
+            return
+        if not sel:
+            return
+        self.search_var.set(sel)
+        if not self._search_open:
+            self.toggle_search()
+        self._do_search_debounced()
+        self._flash_status("已搜索选中内容")
+
     def _on_chat_menu(self, event):
         text = self.chat_text
         try:
@@ -12876,6 +13450,29 @@ class AssistantApp:
         code_range = self._code_range_at(text, click)
         if code_range is not None:
             menu.add_command(label="复制该代码块", command=lambda r=code_range: self._copy_code_range(r))
+        tool_range = self._tool_range_at(text, click)
+        if tool_range is not None:
+            tool_seg = text.get(tool_range[0], tool_range[1])
+            if "参数: " in tool_seg:
+                menu.add_command(
+                    label="复制工具参数",
+                    command=lambda s=tool_seg: self._copy_tool_part(s, "参数"),
+                )
+            if "结果: " in tool_seg:
+                menu.add_command(
+                    label="复制工具结果",
+                    command=lambda s=tool_seg: self._copy_tool_part(s, "结果"),
+                )
+                result_part = tool_seg.split("结果: ", 1)[1]
+                for mm in PATH_RE.finditer(result_part):
+                    p = mm.group(0).rstrip("。.,;: \t")
+                    if os.path.exists(p):
+                        menu.add_command(
+                            label=f"打开结果文件：{os.path.basename(p)}",
+                            command=lambda path=p: self._open_path(path),
+                        )
+                        break
+            menu.add_separator()
         menu.add_command(label="复制全部对话", command=self._copy_all)
         if has_sel and msg_range is not None:
             sel_start = text.index("sel.first")
@@ -12888,6 +13485,8 @@ class AssistantApp:
                 )
         menu.add_separator()
         if msg_idx is not None and not self.busy:
+            if (self.messages[msg_idx].get("content") or "").strip():
+                menu.add_command(label="复制纯文本", command=self._copy_message_plain)
             menu.add_command(label="编辑此消息", command=self._menu_edit_message)
             menu.add_command(label="从此重新生成", command=self._menu_regenerate_from)
             menu.add_command(label="删除此消息", command=self._menu_delete_message)
@@ -12915,7 +13514,13 @@ class AssistantApp:
                 and self.messages[msg_idx].get("content")
             ):
                 menu.add_command(label="复制 Markdown 原文", command=self._copy_md_original)
+                menu.add_command(label="复制纯文本", command=self._copy_message_plain)
+                menu.add_command(label="编辑此消息并继续", command=self._menu_edit_assistant_continue)
                 menu.add_command(label="🔊 朗读此消息", command=self._menu_speak_message)
+            if self.messages[msg_idx].get("reasoning_content"):
+                menu.add_command(label="复制思考过程", command=self._copy_reasoning)
+            if self.messages[msg_idx].get("tool_calls"):
+                menu.add_command(label="复制工具调用 JSON", command=self._copy_tool_calls_json)
             # 快速动作：对消息内容一键发起处理（解释/总结/翻译/润色/测试）
             content = (self.messages[msg_idx].get("content") or "").strip()
             if content and len(content) >= 20:
@@ -12928,6 +13533,13 @@ class AssistantApp:
                         command=lambda tpl=template, c=content: self._quick_action(tpl, c),
                     )
                 menu.add_cascade(label="⚡ 快速动作", menu=qa)
+        menu.add_separator()
+        menu.add_command(label="全部折叠", command=self._collapse_all_folds)
+        menu.add_command(label="全部展开", command=self._expand_all_folds)
+        menu.add_command(
+            label="退出多选模式" if self._multi_select_mode else "进入多选模式",
+            command=self._toggle_multi_select,
+        )
         menu.add_separator()
         menu.add_command(label="继续生成（Beta 续写）", command=self.continue_generation)
         try:
@@ -12948,6 +13560,32 @@ class AssistantApp:
         if rng and text.compare(rng[0], "<=", index) and text.compare(index, "<", rng[1]):
             return rng
         return None
+
+    def _tool_range_at(self, text, index):
+        try:
+            rng = text.tag_prevrange("tool", f"{index}+1c")
+        except tk.TclError:
+            return None
+        if rng and text.compare(rng[0], "<=", index) and text.compare(index, "<", rng[1]):
+            return rng
+        return None
+
+    def _copy_tool_part(self, seg, part):
+        try:
+            marker = f"{part}: "
+            if marker not in seg:
+                return
+            val = seg.split(marker, 1)[1]
+            # 工具结果可能含后续换行，取到下一个已知标记或末尾
+            if part == "参数":
+                val = val.split("\n结果: ", 1)[0]
+            else:
+                val = val.rstrip()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(val.strip())
+            self._flash_status(f"已复制工具{part}")
+        except Exception:
+            logging.exception("复制工具片段失败")
 
     def _copy_message_range(self, rng, selected=False):
         text = self.chat_text
@@ -12974,9 +13612,10 @@ class AssistantApp:
             if not entries:
                 return
             best = None
-            for aend, rng in entries:
-                if not text.compare(aend, ">", click):
+            for astart, aend, rng in entries:
+                if text.compare(astart, "<=", click) and text.compare(click, "<", aend):
                     best = rng
+                    break
             if best is not None:
                 self._copy_code_range(best)
         except tk.TclError:
@@ -13012,6 +13651,52 @@ class AssistantApp:
         self.root.clipboard_append(content)
         self._flash_status("已复制 Markdown 原文")
 
+    def _copy_message_plain(self):
+        """复制消息的纯文本（去除 Markdown 标记）。"""
+        idx = self._menu_msg_index
+        if idx is None or not (1 <= idx < len(self.messages)):
+            return
+        content = self.messages[idx].get("content") or ""
+        if not content:
+            return
+        try:
+            plain = mdparse.to_plain(content)
+        except Exception:
+            plain = content
+        self.root.clipboard_clear()
+        self.root.clipboard_append(plain)
+        self._flash_status("已复制纯文本")
+
+    def _copy_reasoning(self):
+        """复制助手消息的思考过程。"""
+        idx = self._menu_msg_index
+        if idx is None or not (1 <= idx < len(self.messages)):
+            return
+        reasoning = self.messages[idx].get("reasoning_content") or ""
+        if not reasoning:
+            messagebox.showinfo("提示", "该消息没有思考过程。")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(reasoning)
+        self._flash_status("已复制思考过程")
+
+    def _copy_tool_calls_json(self):
+        """复制助手消息中的工具调用 JSON。"""
+        idx = self._menu_msg_index
+        if idx is None or not (1 <= idx < len(self.messages)):
+            return
+        tcs = self.messages[idx].get("tool_calls") or []
+        if not tcs:
+            messagebox.showinfo("提示", "该消息没有工具调用。")
+            return
+        try:
+            data = json.dumps(tcs, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            data = str(tcs)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(data)
+        self._flash_status("已复制工具调用 JSON")
+
     def _copy_all(self):
         text = self.chat_text
         self._set_all_folds_elide(text, False)
@@ -13035,6 +13720,26 @@ class AssistantApp:
         self._append(note, "time")
         self.blocks.append(("note", note))
 
+    def _menu_edit_assistant_continue(self):
+        """编辑助手消息内容，发送后从该消息继续生成（Beta 前缀续写）。"""
+        idx = getattr(self, "_menu_msg_index", None)
+        if idx is None or not (1 <= idx < len(self.messages)):
+            return
+        msg = self.messages[idx]
+        if msg.get("role") != "assistant" or not msg.get("content"):
+            return
+        if not self.cfg.get("beta_api"):
+            self._toast("「编辑助手消息并继续」需要 Beta API，请先在设置面板开启。")
+            return
+        self._edit_assistant_idx = idx
+        self._clear_placeholder()
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", msg.get("content", ""))
+        self.input_text.focus_set()
+        note = "[编辑助手] 已载入助手消息，修改后按 Enter 将从该消息继续生成（Beta）。\n"
+        self._append(note, "time")
+        self.blocks.append(("note", note))
+
     def _menu_regenerate_from(self):
         idx = self._menu_msg_index
         if idx is None or not (1 <= idx < len(self.messages)):
@@ -13045,10 +13750,14 @@ class AssistantApp:
         if j == 0:
             return
         text = self.messages[j].get("content", "")
+        saved = self._save_last_assistant_variant()
         self._resend_index = None  # 清残留重发索引，防 send() 二次误删
         del self.messages[j:]
         self.rebuild_view_from_messages()
-        note = "[重新生成] 已移除后续消息，正在重新生成。\n"
+        note = (
+            "[重新生成] 已移除后续消息（旧版已存入变体），正在重新生成。\n"
+            if saved else "[重新生成] 已移除后续消息，正在重新生成。\n"
+        )
         self._append(note, "time")
         self.blocks.append(("note", note))
         self.send(text=text)
@@ -13072,6 +13781,111 @@ class AssistantApp:
         self._snapshot_dirty = True  # 消息集变化需落盘（空闲 10s 或退出时写）
         self._maybe_save_snapshot()
         self._flash_status("已删除消息")
+
+    def _delete_message_at(self, idx):
+        """按消息索引删除（与右键删除同规则：assistant 连带后续 tool/assistant）。"""
+        if not (1 <= idx < len(self.messages)):
+            return
+        if self.busy:
+            return
+        role = self.messages[idx].get("role")
+        if role == "assistant":
+            nxt = idx + 1
+            while nxt < len(self.messages) and self.messages[nxt].get("role") in ("assistant", "tool"):
+                nxt += 1
+            del self.messages[idx:nxt]
+        else:
+            del self.messages[idx]
+
+    def _on_chat_click(self, event):
+        """多选模式下点击消息切换选中；普通模式放行默认行为。"""
+        self._mouse_down = True
+        self._hide_selection_bar()
+        if not getattr(self, "_multi_select_mode", False):
+            return None
+        try:
+            text = self.chat_text
+            idx = text.index(f"@{event.x},{event.y}")
+            msg_idx = self._msg_index_at(text, idx)
+            if msg_idx is None:
+                return "break"
+            if msg_idx in self._multi_selected:
+                self._multi_selected.discard(msg_idx)
+            else:
+                self._multi_selected.add(msg_idx)
+            self._update_multi_bar()
+            return "break"
+        except tk.TclError:
+            return "break"
+
+    def _toggle_multi_select(self):
+        """进入/退出多选模式。"""
+        self._multi_select_mode = not self._multi_select_mode
+        self._multi_selected.clear()
+        try:
+            if self._multi_select_mode:
+                self.multi_bar.pack(side="top", fill="x", before=self.chat_header)
+            else:
+                self.multi_bar.pack_forget()
+            self._update_multi_bar()
+            self._flash_status("已进入多选模式：点击消息选择，再次点击取消" if self._multi_select_mode else "已退出多选模式")
+        except Exception:
+            logging.exception("切换多选模式失败")
+
+    def _update_multi_bar(self):
+        try:
+            self.multi_bar_lbl.configure(text=f"已选 {len(self._multi_selected)} 条")
+        except Exception:
+            pass
+
+    def _delete_selected_messages(self):
+        if not self._multi_selected:
+            return
+        if self.busy:
+            messagebox.showinfo("提示", "请先停止当前生成。")
+            return
+        count = len(self._multi_selected)
+        if not messagebox.askyesno("批量删除", f"确认删除选中的 {count} 条消息？"):
+            return
+        for idx in sorted(self._multi_selected, reverse=True):
+            self._delete_message_at(idx)
+        self._multi_selected.clear()
+        self.rebuild_view_from_messages()
+        self._snapshot_dirty = True
+        self._maybe_save_snapshot()
+        self._flash_status(f"已删除 {count} 条消息")
+        self._update_multi_bar()
+
+    def _export_selected_messages(self):
+        if not self._multi_selected:
+            return
+        lines = []
+        for i, m in enumerate(self.messages):
+            if i not in self._multi_selected:
+                continue
+            role = m.get("role")
+            content = m.get("content") or ""
+            if role == "user":
+                lines.append(f"## 用户\n\n{content}")
+            elif role == "assistant":
+                if m.get("reasoning_content"):
+                    lines.append(f"## 助手（思考）\n\n```text\n{m['reasoning_content']}\n```")
+                lines.append(f"## 助手\n\n{content}")
+            elif role == "tool":
+                lines.append(f"> 工具结果：{content}")
+        text = "\n\n".join(lines)
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._flash_status("已复制选中消息（Markdown）")
+
+    def _star_selected_messages(self):
+        if not self._multi_selected:
+            return
+        for idx in list(self._multi_selected):
+            self._toggle_star(idx)
+        self._flash_status(f"已收藏 {len(self._multi_selected)} 条消息")
 
     def _mark_filelinks(self, text, fold_end, detail):
         """把工具结果中的本地绝对路径标记为可点击（打开文件/目录）。"""
@@ -13398,6 +14212,101 @@ class AssistantApp:
         self.input_text.focus_set()
         return "break"
 
+    def _insert_code_block(self, _event=None):
+        """Ctrl+Shift+C：插入 Markdown 代码块围栏，光标落在代码区。"""
+        self._clear_placeholder()
+        text = self.input_text
+        sel_range = text.tag_ranges("sel")
+        if sel_range:
+            sel = text.get("sel.first", "sel.last")
+            start = str(sel_range[0])
+            text.delete(start, sel_range[1])
+            text.insert(start, f"```\n{sel}\n```")
+            text.mark_set("insert", f"{start}+4c")
+        else:
+            text.insert("insert", "```\n\n```")
+            text.mark_set("insert", "insert-3c")
+        text.focus_set()
+        return "break"
+
+    def _insert_quote_block(self, _event=None):
+        """Ctrl+Alt+Q：把选中内容/光标处插入引用块（避免与全局 Ctrl+Shift+Q 冲突）。"""
+        self._clear_placeholder()
+        text = self.input_text
+        sel_range = text.tag_ranges("sel")
+        if sel_range:
+            sel = text.get("sel.first", "sel.last")
+            start = str(sel_range[0])
+            text.delete(start, sel_range[1])
+            quoted = "\n".join("> " + ln for ln in sel.splitlines() if ln.strip())
+            text.insert(start, f"{quoted}\n\n")
+            text.mark_set("insert", start)
+        else:
+            text.insert("insert", "> 引用内容\n")
+            text.mark_set("insert", "insert-1c")
+        text.focus_set()
+        return "break"
+
+    def _toggle_input_preview(self):
+        """发送前 Markdown 预览开关。"""
+        self._input_preview_shown = not self._input_preview_shown
+        if self._input_preview_shown:
+            self.input_preview.pack(side="top", fill="x", padx=14, pady=(8, 0), before=self.input_text)
+            self._update_input_preview()
+            try:
+                self.btn_preview.configure(text="隐藏预览")
+            except Exception:
+                pass
+        else:
+            self.input_preview.pack_forget()
+            try:
+                self.btn_preview.configure(text="预览")
+            except Exception:
+                pass
+
+    def _update_input_preview(self):
+        """用 mdparse 渲染输入框当前内容到预览区。"""
+        if not getattr(self, "_input_preview_shown", False):
+            return
+        try:
+            text = self.input_text.get("1.0", "end-1c")
+            preview = self.input_preview_text
+            preview.configure(state="normal")
+            preview.delete("1.0", "end")
+            if not text.strip():
+                preview.insert("1.0", "输入内容后将在此预览 Markdown 渲染效果")
+            else:
+                dtext, spans, links, _cb = mdparse.render_markdown(text)
+                preview.insert("1.0", dtext, "assistant")
+                for a, b, st in spans:
+                    try:
+                        preview.tag_add(st, f"1.0+{a}c", f"1.0+{b}c")
+                    except tk.TclError:
+                        pass
+                for a, b, _url in links:
+                    try:
+                        preview.tag_add("link", f"1.0+{a}c", f"1.0+{b}c")
+                    except tk.TclError:
+                        pass
+            preview.configure(state="disabled")
+        except Exception:
+            logging.exception("更新输入预览失败")
+
+    def _paste_plain_text(self, _event=None):
+        """粘贴为纯文本：剥离富文本/HTML，保留换行。"""
+        try:
+            clip = self.root.clipboard_get()
+        except tk.TclError:
+            return "break"
+        import re as _re
+        # 简单剥离常见富文本标签（Word/网页复制常见）
+        plain = _re.sub(r"<[^>]+>", "", clip)
+        plain = _re.sub(r"\r\n?", "\n", plain)
+        self._clear_placeholder()
+        self.input_text.insert("insert", plain)
+        self.input_text.focus_set()
+        return "break"
+
     # ---- 编辑器增强实现 ----
     _INPUT_DELIM_PAIRS = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}
 
@@ -13607,7 +14516,20 @@ class AssistantApp:
             label="粘贴", command=lambda: self.input_text.event_generate("<<Paste>>")
         )
         menu.add_command(
+            label="粘贴为纯文本", command=self._paste_plain_text
+        )
+        menu.add_command(
             label="撤销", command=lambda: self.input_text.event_generate("<<Undo>>")
+        )
+        menu.add_command(
+            label="重做", command=lambda: self.input_text.event_generate("<<Redo>>")
+        )
+        menu.add_separator()
+        menu.add_command(label="插入代码块", command=self._insert_code_block)
+        menu.add_command(label="插入引用块", command=self._insert_quote_block)
+        menu.add_command(
+            label="预览 Markdown" if not self._input_preview_shown else "隐藏预览",
+            command=self._toggle_input_preview,
         )
         menu.add_command(
             label="清空输入", command=lambda: self.input_text.delete("1.0", "end")
