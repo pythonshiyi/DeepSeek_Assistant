@@ -1,0 +1,24 @@
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+extend-exclude = [
+    "build",
+    "dist",
+    ".venv",
+    "data",
+    "evolutions",
+    "__pycache__",
+    ".pytest_cache",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true

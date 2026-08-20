@@ -197,7 +197,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.23.0"
+VERSION = "2.24.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -383,10 +383,12 @@ class AssistantApp:
         self._menu_msg_index = None
         self._hover_bar = None
         self._hover_msg_range = None
+        self._hover_last_time = 0.0
         self._sel_bar = None
         self._mouse_down = False
         self._multi_select_mode = False
         self._multi_selected = set()
+        self._files_search_seq = 0
         self._status_after = None
         previous_run_crashed()  # 维护干净退出标记状态（不再弹窗提示）
         self._follow_bottom = True  # 智能跟随状态：True=贴底跟随（仅手动滚动置 False）
@@ -2120,15 +2122,25 @@ class AssistantApp:
             pass
 
     def _on_files_search(self):
-        """文件面板搜索：按文件名过滤，结果以扁平列表展示。"""
-        try:
-            tree = self.files_tree
-            query = self.files_search_var.get().strip().lower()
+        """文件面板搜索：后台线程扫描，避免大目录卡 UI。"""
+        self._files_search_seq += 1
+        seq = self._files_search_seq
+        query = self.files_search_var.get().strip().lower()
+        tree = self.files_tree
+        if not query or query == "搜索文件…":
             tree.delete(*tree.get_children())
-            if not query or query == "搜索文件…":
-                self._refresh_files_panel()
-                return
+            self._refresh_files_panel()
+            return
+        tree.delete(*tree.get_children())
+        tree.insert("", "end", text="搜索中…", tags=("placeholder",))
+        threading.Thread(
+            target=self._files_search_worker, args=(query, seq), daemon=True
+        ).start()
+
+    def _files_search_worker(self, query, seq):
+        try:
             skip = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", "build", "dist"}
+            results = []
             count = 0
             for root in (WORKSPACE_DIR, DATA_DIR):
                 if not root or not os.path.isdir(root):
@@ -2139,13 +2151,32 @@ class AssistantApp:
                         if query in fn.lower():
                             full = os.path.join(dirpath, fn)
                             display = os.path.relpath(full, root)
-                            tree.insert("", "end", iid=full, text=display, tags=("file",))
+                            results.append((full, display))
                             count += 1
                             if count >= 500:
-                                tree.insert("", "end", text="…结果过多，已截断…", tags=("placeholder",))
-                                return
+                                results.append((None, "…结果过多，已截断…"))
+                                break
+                    if count >= 500:
+                        break
+                if count >= 500:
+                    break
+            self._ui_queue.put(("files_search_done", (seq, results)))
         except Exception:
-            logging.exception("文件面板搜索失败")
+            logging.exception("后台文件搜索失败")
+
+    def _files_search_apply(self, seq, results):
+        if seq != getattr(self, "_files_search_seq", 0):
+            return
+        try:
+            tree = self.files_tree
+            tree.delete(*tree.get_children())
+            for full, display in results:
+                if full is None:
+                    tree.insert("", "end", text=display, tags=("placeholder",))
+                else:
+                    tree.insert("", "end", iid=full, text=display, tags=("file",))
+        except tk.TclError:
+            pass
 
     def _files_entry_path(self, iid):
         """从树节点解析真实路径；最近产物节点 iid 直接存绝对路径。"""
@@ -10444,6 +10475,8 @@ class AssistantApp:
             self._show_search_results(payload)
         elif kind == "history_loaded":
             self._show_history_loaded(*payload)
+        elif kind == "files_search_done":
+            self._files_search_apply(*payload)
         elif kind == "knowledge_done":
             self._on_knowledge_done(payload)
         elif kind == "summary_done":
@@ -11266,7 +11299,14 @@ class AssistantApp:
         if kind == "content":
             payload = block[1]
             msg_idx = block[2] if len(block) > 2 else None
-            return self._insert_content(text, payload, "assistant", msg_idx, last_code_blocks, pos)
+            start = pos
+            new_pos = self._insert_content(text, payload, "assistant", msg_idx, last_code_blocks, pos)
+            if msg_idx is not None and msg_idx in getattr(self, "_multi_selected", set()):
+                try:
+                    text.tag_add("multi_sel", start, new_pos)
+                except tk.TclError:
+                    pass
+            return new_pos
         elif kind == "tool":
             name, args, result = block[1][0], block[1][1], block[1][2]
             duration = block[1][3] if len(block[1]) > 3 else None
@@ -13247,6 +13287,10 @@ class AssistantApp:
         """
         if getattr(self, "_mouse_down", False):
             return
+        now = time.monotonic()
+        if now - self._hover_last_time < 0.05:  # 节流：约 20fps，避免高频率扫描消息索引
+            return
+        self._hover_last_time = now
         try:
             text = self.chat_text
             idx = text.index(f"@{event.x},{event.y}")
@@ -13809,10 +13853,21 @@ class AssistantApp:
             msg_idx = self._msg_index_at(text, idx)
             if msg_idx is None:
                 return "break"
+            msg_range = self._msg_range_at(text, idx)
             if msg_idx in self._multi_selected:
                 self._multi_selected.discard(msg_idx)
+                if msg_range:
+                    try:
+                        text.tag_remove("multi_sel", msg_range[0][0], msg_range[0][1])
+                    except tk.TclError:
+                        pass
             else:
                 self._multi_selected.add(msg_idx)
+                if msg_range:
+                    try:
+                        text.tag_add("multi_sel", msg_range[0][0], msg_range[0][1])
+                    except tk.TclError:
+                        pass
             self._update_multi_bar()
             return "break"
         except tk.TclError:
@@ -13823,6 +13878,8 @@ class AssistantApp:
         self._multi_select_mode = not self._multi_select_mode
         self._multi_selected.clear()
         try:
+            if not self._multi_select_mode:
+                self.chat_text.tag_remove("multi_sel", "1.0", "end")
             if self._multi_select_mode:
                 self.multi_bar.pack(side="top", fill="x", before=self.chat_header)
             else:

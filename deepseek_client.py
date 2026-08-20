@@ -8915,6 +8915,27 @@ def _strictify_schema(schema):
     return st
 
 
+_BASE_TOOLS_CACHE = None
+_CUSTOM_TOOLS_CACHE = None
+_CUSTOM_TOOLS_ID = None
+
+
+def _cached_all_tools(custom_tools):
+    """缓存内置工具/自定义工具的深拷贝，避免每轮 chat() 全量 deepcopy 100+ 工具。"""
+    global _BASE_TOOLS_CACHE, _CUSTOM_TOOLS_CACHE, _CUSTOM_TOOLS_ID
+    if _BASE_TOOLS_CACHE is None or _BASE_TOOLS_CACHE[0] != id(TOOLS):
+        _BASE_TOOLS_CACHE = (id(TOOLS), copy.deepcopy(TOOLS))
+    base = _BASE_TOOLS_CACHE[1]
+    custom_tools = custom_tools or []
+    if not custom_tools:
+        return copy.deepcopy(base)
+    cid = id(custom_tools)
+    if _CUSTOM_TOOLS_CACHE is None or _CUSTOM_TOOLS_ID != cid:
+        _CUSTOM_TOOLS_CACHE = copy.deepcopy(custom_tools)
+        _CUSTOM_TOOLS_ID = cid
+    return copy.deepcopy(base + _CUSTOM_TOOLS_CACHE)
+
+
 def _strictify_tools(tools):
     """把所有 function 工具转换为 strict 模式（官方要求：全部 function 均需 strict=true）。"""
     out = []
@@ -9075,7 +9096,7 @@ class DeepSeekClient:
                 kwargs["reasoning_effort"] = effort
         if seed is not None:
             kwargs["seed"] = seed
-        all_tools = copy.deepcopy(TOOLS + (custom_tools or []))
+        all_tools = _cached_all_tools(custom_tools or [])
         # 兜底：array 参数缺 items 会导致 API 400（missing field 'items'），
         # 内置/自定义/插件工具一律补齐，防御用户自定义 schema 遗漏
         _patch_array_items(all_tools)

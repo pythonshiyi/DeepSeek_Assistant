@@ -5,7 +5,7 @@
 ## 0. 品牌与版本
 
 - 品牌：鲸语（APP_NAME），英文 WhaleTalk（APP_NAME_EN），见 main.py 顶部。**任何对外展示（窗口标题/启动界面/欢迎页/关于/exe 名/备份名/单实例锁名）一律使用品牌名，不出现官方品牌**；技术描述可写"基于 DeepSeek API"。
-- 版本：VERSION（当前 2.22.2），版本升级时同步 bump；备份脚本产物名 `WhaleTalk_v{version}_*.zip`；`build_exe.bat` 产物 `WhaleTalk.exe`；单实例锁 `Local\WhaleTalkAssistant`。
+- 版本：VERSION（当前 2.24.0），版本升级时同步 bump；备份脚本产物名 `WhaleTalk_v{version}_*.zip`；`build_exe.bat` 产物 `WhaleTalk.exe`；单实例锁 `Local\WhaleTalkAssistant`。
 
 ## 1. 项目概览
 
@@ -762,3 +762,30 @@ _finish                →  _re_render_stream(start, block_start)  # 结束后�
 **⑥ 状态栏**：context 条 140→120px、label 34→32（右段不挤压）。
 
 **验证**：新增 tests/test_ui_layout.py（13 项：LAYOUT 常量完整/有序、窗口几何记忆、输入对齐 padx 一致性、对话框档位吸附（min 逻辑 + 真实 Toplevel geometry）、紧凑阈值关系、minsize<紧凑阈值）；全量 312 项通过；四档真机冒烟全部对齐。
+
+## 18. v2.24.0 体验优化与聊天栏修复
+
+### 拖动选中高亮（重要修复）
+
+- **根因**：`<Motion>` 悬停浮条在鼠标拖动选区时仍会创建 Toplevel，浮条可能盖住光标并截获 `ButtonRelease`，导致选区无法正常完成/显示；同时 `msg_hover` 背景可能盖过 `sel` 选区。
+- **修复**：
+  - 新增 `_mouse_down` 状态：`ButtonPress-1` 置 True，`ButtonRelease-1` 置 False；拖动期间 `_on_chat_hover` 直接返回，不创建任何 Toplevel、不添加 `msg_hover`。
+  - `_configure_tags` 中显式配置 `sel` 标签并 `tag_raise("sel")`，保证选区高亮始终高于业务标签。
+  - 聊天 Text 配置 `inactiveselectbackground`，失焦时选区仍高亮。
+- 铁律：**任何鼠标拖动选择过程中禁止创建 Toplevel 浮层**；新增浮层必须考虑是否会在拖拽时干扰事件。
+
+### hover 快捷操作
+
+- `_on_chat_hover` 负责消息悬停高亮与浮条；`_mouse_down` 期间禁用。
+- `_on_chat_release` 在选区存在时显示「复制/引用/搜索」浮条。
+- 浮条均为 `overrideredirect` 非模态 Toplevel，不 `grab_set`。
+
+### 新增配置
+
+- `font_family`：正文字体族。
+- `message_density`：compact / comfort / loose，影响消息间距。
+- 均在 `config_defaults.py` 注册、`config_utils.normalize_config` 钳制、设置面板读写。
+
+### 测试约定
+
+- `test_perf.py` 中思考卡片默认收起（`visible=False`），点击可展开。
