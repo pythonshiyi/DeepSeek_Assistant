@@ -355,6 +355,7 @@ class AssistantApp:
         self._placeholder_active = False
         self._updating_list = False
         self._list_visible = []
+        self._session_tag_filter = ""
         self._restyle = []
         self._wheel_owner = None  # 当前接管全局滚轮的滚动面板（_scroll_panel 所有权模式）
         self._recent_cache = self._load_recent()  # 最近产物进程内缓存（_record_recent_output 只改内存）
@@ -1480,6 +1481,11 @@ class AssistantApp:
             search_card, textvariable=self.session_search_var
         )
         self.session_search_entry.pack(fill="x", padx=10, pady=(0, 8))
+        # 标签快速筛选条：点击标签过滤会话
+        self.session_tag_bar = tk.Frame(frame, bg=t["panel"])
+        self._restyle.append((self.session_tag_bar, "panel"))
+        self.session_tag_bar.pack(fill="x", padx=10, pady=(0, 6))
+        self._refresh_session_tags()
         # 搜索词变化防抖 200ms：每敲一个字符就全量重建 Listbox 会让列表卡顿
         self.session_search_var.trace_add(
             "write", lambda *a: self._schedule_session_list_refresh()
@@ -4522,13 +4528,52 @@ class AssistantApp:
         except Exception:
             pass
 
+    def _refresh_session_tags(self):
+        """重建侧栏标签快速筛选条。"""
+        try:
+            bar = getattr(self, "session_tag_bar", None)
+            if bar is None:
+                return
+            for w in bar.winfo_children():
+                w.destroy()
+            tags = sorted({t for s in self._sessions for t in (s.get("tags") or []) if t})
+            if not tags:
+                bar.pack_forget()
+                return
+            bar.pack(fill="x", padx=10, pady=(0, 6))
+            t = self._theme()
+            tk.Label(bar, text="标签:", bg=bar.cget("bg"), fg=t["text_sec"],
+                     font=(FONT_FAMILY, 8)).pack(side="left")
+            for tag in tags:
+                fg = t["accent"] if self._session_tag_filter == tag else t["text_sec"]
+                lb = tk.Label(bar, text=tag, bg=bar.cget("bg"), fg=fg,
+                              font=(FONT_FAMILY, 8, "bold"), cursor="hand2", padx=4, pady=1)
+                lb.pack(side="left", padx=2)
+                lb.bind("<Button-1>", lambda e, tag=tag: self._set_session_tag_filter(tag))
+                lb.bind("<Enter>", lambda e, b=lb: b.configure(bg=t.get("hover", t["surface"])))
+                lb.bind("<Leave>", lambda e, b=lb: b.configure(bg=bar.cget("bg")))
+            if self._session_tag_filter:
+                clear = tk.Label(bar, text="✕", bg=bar.cget("bg"), fg=t["error"],
+                                 font=(FONT_FAMILY, 8, "bold"), cursor="hand2", padx=2)
+                clear.pack(side="left", padx=2)
+                clear.bind("<Button-1>", lambda e: self._set_session_tag_filter(""))
+        except Exception:
+            logging.exception("刷新会话标签失败")
+
+    def _set_session_tag_filter(self, tag):
+        self._session_tag_filter = tag if tag != self._session_tag_filter else ""
+        self._refresh_session_tags()
+        self._refresh_session_list()
+
     def _refresh_session_list(self):
         self._updating_list = True
         try:
             query = self.session_search_var.get().strip().lower()
+            tagf = self._session_tag_filter or ""
             visible = [
                 s for s in self._sessions
-                if not query or self._session_search_hits(s, query)
+                if (not tagf or tagf in (s.get("tags") or []))
+                and (not query or self._session_search_hits(s, query))
             ]
             visible.sort(key=lambda s: not bool(s.get("top")))
             # 显示名与排序均未变化时跳过重建（避免每键全量 delete+insert+selection）
