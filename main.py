@@ -2820,7 +2820,7 @@ class AssistantApp:
         self._mk_button(self.multi_bar, "退出多选", self._toggle_multi_select, fsz=9).pack(side="left", padx=2)
         self.multi_bar.pack_forget()
         # 内嵌任务进度卡（聊天区右上角，替代左下角悬浮弹窗）
-        self.task_panel = InlineTaskPanel(self.chat_frame, theme=t)
+        self.task_panel = InlineTaskPanel(self.chat_frame, theme=t, on_detail=self.show_task_timeline)
         # 回到底部悬浮按钮：用户向上滚动离开底部时出现
         self.back_to_bottom_btn = tk.Label(
             self.chat_frame, text="↓ 回到底部", bg=t["accent"], fg=t["accent_text"],
@@ -5661,6 +5661,64 @@ class AssistantApp:
     def show_recent_outputs(self):
         """最近产物：查看 AI 创建/修改的文件。"""
         dialogs.show_recent_outputs(self)
+
+    def show_task_timeline(self):
+        """任务工作区可视化：展示本轮任务的目标/进度/工具/产物/耗时/费用/断点。"""
+        t = self._theme()
+        dialog, body, footer = self._dialog_shell(
+            "任务工作区", 720, 520,
+            subtitle="本轮工具执行时间线（目标 / 进度 / 产物 / 耗时 / 费用）",
+            minsize=(560, 400),
+        )
+        tools = []
+        artifacts = set()
+        ok_n = fail_n = 0
+        for b in self.blocks:
+            if b[0] == "tool" and len(b[1]) >= 2:
+                name, args, result = b[1][0], b[1][1], b[1][2]
+                duration = b[1][3] if len(b[1]) > 3 else None
+                failed = str(result or "").startswith(_dc.TOOL_RESULT_FAIL_PREFIXES)
+                tools.append((name, args, result, duration, failed))
+                ok_n += 0 if failed else 1
+                fail_n += 1 if failed else 0
+                for mm in PATH_RE.finditer(str(result or "")):
+                    p = mm.group(0).rstrip("。.,;: \t")
+                    if os.path.exists(p):
+                        artifacts.add(p)
+        u = self.last_usage or {}
+        try:
+            cost = stats.estimate_cost(u, self.model_combo.get().strip() or "unknown")
+        except Exception:
+            cost = 0.0
+        elapsed = max(0.0, time.monotonic() - getattr(self, "_stream_begin", time.monotonic()))
+        lines = []
+        lines.append(f"本轮统计：工具 {len(tools)} 个（✅ {ok_n} / ❌ {fail_n}）")
+        lines.append(f"耗时 {elapsed:.1f}s · 输入 {u.get('prompt', 0):,} / 输出 {u.get('completion', 0):,} token · 费用 ≈ ¥{cost:.2f}")
+        if artifacts:
+            lines.append(f"产物 {len(artifacts)} 个：")
+            for p in sorted(artifacts)[:10]:
+                lines.append(f"  · {p}")
+        lines.append("")
+        lines.append("── 工具时间线 ──")
+        for i, (name, args, result, duration, failed) in enumerate(tools, 1):
+            mark = "❌" if failed else "✅"
+            dur = f" · {duration:.1f}s" if duration is not None else ""
+            try:
+                args_s = json.dumps(args, ensure_ascii=False)[:80] if args else ""
+            except (TypeError, ValueError):
+                args_s = str(args)[:80]
+            first = str(result or "").splitlines()[0][:80] if result else ""
+            lines.append(f"{i}. {mark} {name}{dur} 参数: {args_s}")
+            lines.append(f"   结果: {first}")
+        if self.busy:
+            lines.append("")
+            lines.append("⏳ 任务仍在执行中…")
+        text = tk.Text(body, wrap="word", font=(MONO_FAMILY, 9), bg=t["input_bg"],
+                       fg=t["text"], relief="flat", padx=10, pady=8)
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", "\n".join(lines) if lines else "（暂无任务记录）")
+        text.configure(state="disabled")
+        self._footer_btn(footer, "关闭", dialog.destroy)
 
     def choose_working_dir(self):
         """工作目录选择：指定 AI 执行任务的"家"（自动加入权限允许目录）。"""

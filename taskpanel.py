@@ -343,8 +343,9 @@ class InlineTaskPanel:
     完成后 4 秒淡出。高度仅 ~28px，不遮挡会话信息条。
     """
 
-    def __init__(self, master, theme=None):
+    def __init__(self, master, theme=None, on_detail=None):
         self.master = master
+        self.on_detail = on_detail
         self.theme = theme or {}
         t = self.theme
         self.frame = tk.Frame(
@@ -366,6 +367,13 @@ class InlineTaskPanel:
             anchor="w", justify="left",
         )
         self.status_lbl.pack(side="left", padx=(0, 12), pady=5)
+        self.detail_btn = tk.Label(
+            self.frame, text="详情", bg=t.get("panel", "#ffffff"),
+            fg=t.get("accent", "#3478f6"), font=(FONT_FAMILY, 8, "bold"),
+            cursor="hand2", padx=4, pady=2,
+        )
+        self.detail_btn.pack(side="left", padx=(0, 6), pady=5)
+        self.detail_btn.bind("<Button-1>", lambda e: self._on_detail())
         self._count = 0
         self._started_at = 0.0
         self._hide_after = None
@@ -406,6 +414,13 @@ class InlineTaskPanel:
         self._cancel_hide()
         self._hide_after = self.master.after(4000, self._hide)
 
+    def _on_detail(self):
+        try:
+            if self.on_detail:
+                self.on_detail()
+        except Exception:
+            pass
+
     def _elapsed(self):
         return max(0.0, time.monotonic() - self._started_at)
 
@@ -434,6 +449,7 @@ class InlineTaskPanel:
             )
             self.title_lbl.configure(bg=t.get("panel", "#ffffff"), fg=t.get("accent", "#3478f6"))
             self.status_lbl.configure(bg=t.get("panel", "#ffffff"), fg=t.get("text_sec", "#8a9099"))
+            self.detail_btn.configure(bg=t.get("panel", "#ffffff"), fg=t.get("accent", "#3478f6"))
         except tk.TclError:
             pass
 
