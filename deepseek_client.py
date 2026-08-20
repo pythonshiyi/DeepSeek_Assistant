@@ -9262,6 +9262,7 @@ class DeepSeekClient:
                     assistant_msg = {
                         "role": "assistant",
                         "content": content if content else None,
+                        "time": datetime.now().strftime("%H:%M:%S"),
                     }
                     if reasoning:
                         assistant_msg["reasoning_content"] = reasoning

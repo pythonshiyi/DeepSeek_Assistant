@@ -10086,7 +10086,7 @@ class AssistantApp:
             if len(session_hist) > 200:
                 del session_hist[: len(session_hist) - 200]
         self._hist_index = None
-        self.messages.append({"role": "user", "content": text})
+        self.messages.append({"role": "user", "content": text, "time": datetime.now().strftime("%H:%M:%S")})
         self._maybe_auto_name(text)
         # 相关文件读取与 token 全量估算移入 worker 线程：恢复长会话后的首次发送
         # 在主线程做 tiktoken 全量编码会冻结 UI 1-2s
@@ -13344,6 +13344,10 @@ class AssistantApp:
             bar.overrideredirect(True)
             bar.attributes("-topmost", True)
             role = self.messages[msg_idx].get("role") if 0 <= msg_idx < len(self.messages) else None
+            msg_time = self.messages[msg_idx].get("time") if 0 <= msg_idx < len(self.messages) else ""
+            if msg_time:
+                tk.Label(bar, text=str(msg_time), bg=t["panel"], fg=t["text_sec"],
+                          font=(FONT_FAMILY, 8), padx=4, pady=2).pack(side="left")
             actions = []
             actions.append(("复制", lambda: (self._copy_hover_message(), self._hide_hover_bar())))
             actions.append(("编辑", lambda: (self._menu_edit_message(), self._hide_hover_bar())))
