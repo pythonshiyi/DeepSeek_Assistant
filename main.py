@@ -3281,6 +3281,7 @@ class AssistantApp:
         self.input_text.bind(
             "<KeyRelease>",
             lambda e: (
+                self._maybe_show_slash_menu(),
                 self._schedule_input_tokens(),
                 self._schedule_draft_save(),
                 self._update_input_preview(),
@@ -14621,6 +14622,45 @@ class AssistantApp:
         self._speak_thread = threading.Thread(target=_do_speak, daemon=True)
         self._speak_thread.start()
         self._flash_status("正在朗读…")
+
+    def _maybe_show_slash_menu(self):
+        """输入框以 `/` 开头时弹出命令菜单。"""
+        try:
+            text = self.input_text
+            content = text.get("1.0", "end-1c")
+            if not content.startswith("/") or " " in content:
+                self._hide_slash_menu()
+                return
+            cmd = content[1:].strip()
+            menu = tk.Menu(self.root, tearoff=0)
+            t = self._theme()
+            menu.configure(bg=t["panel"], fg=t["text"], activebackground=t.get("hover", t["surface"]),
+                          activeforeground=t["text"], bd=1, relief="flat")
+            commands = [
+                ("code", "代码块", self._insert_code_block),
+                ("quote", "引用块", self._insert_quote_block),
+                ("table", "表格模板", self._insert_table_template),
+                ("search", "搜索会话", lambda: self.toggle_search()),
+                ("clear", "清空输入", lambda: text.delete("1.0", "end")),
+            ]
+            for key, label, fn in commands:
+                menu.add_command(label=f"/{key}   {label}", command=fn)
+            try:
+                menu.tk_popup(text.winfo_rootx() + 10, text.winfo_rooty() + 30)
+            finally:
+                self.root.after(3000, lambda: _destroy_menu(menu))
+        except Exception:
+            logging.exception("显示命令菜单失败")
+
+    def _hide_slash_menu(self):
+        pass  # tk_popup 会自动处理；这里保留接口便于后续扩展
+
+    def _insert_table_template(self):
+        self._clear_placeholder()
+        text = self.input_text
+        text.insert("insert", "| 列1 | 列2 |\n| --- | --- |\n| 内容 | 内容 |")
+        text.mark_set("insert", "insert-6c")
+        text.focus_set()
 
     def _show_input_menu(self, event):
         t = self._theme()
