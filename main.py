@@ -3187,8 +3187,13 @@ class AssistantApp:
         card.pack(fill="both", expand=True, padx=8, pady=6)
         self._restyle.append((card, "panel"))
         self._restyle.append((card, "input_card"))
+        # ---- 双栏容器：左编辑 / 右实时预览（默认只显示编辑区） ----
+        self.input_split = tk.Frame(card, bg=t["panel"])
+        self.input_split.pack(side="top", fill="both", expand=True)
+        self._restyle.append((self.input_split, "panel"))
+
         self.input_text = tk.Text(
-            card,
+            self.input_split,
             height=4,
             wrap="word",
             font=(FONT_FAMILY, sizes["base"]),
@@ -3204,7 +3209,31 @@ class AssistantApp:
             pady=8,
             undo=True,
         )
-        self.input_text.pack(side="top", fill="both", expand=True)
+        self.input_text.pack(side="left", fill="both", expand=True)
+        # ---- 输入预览（右侧栏）：发送前用现有 Markdown 引擎渲染，默认隐藏 ----
+        self.input_preview = tk.Frame(self.input_split, width=360, bg=t.get("quote_bg", t["surface"]),
+                                      highlightthickness=1, highlightbackground=t["border"])
+        self._restyle.append((self.input_preview, "surface"))
+        self.preview_head = tk.Frame(self.input_preview, bg=t.get("quote_bg", t["surface"]))
+        self.preview_head.pack(fill="x", padx=8, pady=(4, 0))
+        self.input_preview_lbl = self._lbl(
+            self.preview_head, "Markdown 预览", role="label_sec",
+            bg="surface", font=(FONT_FAMILY, 8),
+        )
+        self.input_preview_lbl.pack(side="left")
+        self.input_preview_close = self._mk_button(self.preview_head, "✕ 关闭", self._toggle_input_preview, fsz=8)
+        self.input_preview_close.pack(side="right")
+        self.input_preview_text = tk.Text(
+            self.input_preview, height=6, wrap="word", state="disabled",
+            font=(FONT_FAMILY, sizes["base"]), bg=t["surface"], fg=t["text"],
+            relief="flat", bd=0, padx=10, pady=6,
+        )
+        self.input_preview_text.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        try:
+            self._configure_tags(self.input_preview_text, t, sizes)
+        except Exception:
+            logging.exception("预览文本样式初始化失败")
+        self.input_preview.pack_forget()
         # ---- 产物条：工具生成的最近文件常驻显示（打开/所在文件夹/复制），
         # 默认隐藏，工具产生新产物时自动出现，无需到目录翻找 ----
         self.recent_bar = tk.Frame(card, bg=t["panel"])
@@ -3222,7 +3251,7 @@ class AssistantApp:
         self.recent_bar_close = self._mk_button(self.recent_bar, "✕", self._hide_recent_bar, fsz=9)
         self.recent_bar_close.pack(side="left", padx=(6, 0))
         # before=input_text：产物条显示在输入框上方（后 pack 默认在下方）
-        self.recent_bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
+        self.recent_bar.pack(side="top", before=self.input_split, fill="x", padx=14, pady=(8, 0))
         self.recent_bar.pack_forget()  # 默认隐藏，有产物才显示
         # ---- 输入预览：发送前用现有 Markdown 引擎渲染，默认隐藏 ----
         self.input_preview = tk.Frame(card, bg=t.get("quote_bg", t["surface"]), highlightthickness=1,
@@ -5532,7 +5561,7 @@ class AssistantApp:
             for p in self._recent_cache:
                 if os.path.exists(p):
                     self.recent_bar_lbl.configure(text=f"📦 最近产物：{os.path.basename(p)}")
-                    self.recent_bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
+                    self.recent_bar.pack(side="top", before=self.input_split, fill="x", padx=14, pady=(8, 0))
                     return
             self._hide_recent_bar()
         except tk.TclError:
@@ -14801,21 +14830,33 @@ class AssistantApp:
         return "break"
 
     def _toggle_input_preview(self):
-        """发送前 Markdown 预览开关。"""
+        """发送前 Markdown 预览开关：双栏布局（左编辑 / 右预览），可一键关闭。"""
         self._input_preview_shown = not self._input_preview_shown
         if self._input_preview_shown:
-            self.input_preview.pack(side="top", fill="x", padx=14, pady=(8, 0), before=self.input_text)
-            self._update_input_preview()
             try:
-                self.btn_preview.configure(text="隐藏预览")
-            except Exception:
-                pass
+                self.input_preview.configure(width=360)
+                self.input_preview.pack_propagate(False)
+                self.input_preview.pack(side="right", fill="y", padx=(8, 0), pady=(8, 0))
+                self._update_input_preview()
+            except tk.TclError:
+                self._input_preview_shown = False
         else:
-            self.input_preview.pack_forget()
             try:
-                self.btn_preview.configure(text="预览")
+                self.input_preview.pack_forget()
+            except tk.TclError:
+                pass
+        for btn, on, off in ((self.btn_preview, "隐藏预览", "预览"),
+                             (self.btn_md_split, "退出分屏", "分屏")):
+            try:
+                btn.configure(text=on if self._input_preview_shown else off)
             except Exception:
                 pass
+
+    def _toggle_md_split_preview(self):
+        """分屏 = 与预览相同的双栏布局（不再弹独立窗口）。"""
+        if getattr(self, "_md_preview_win", None) is not None:
+            self._destroy_md_preview_win()
+        self._toggle_input_preview()
 
     def _update_input_preview(self):
         """用 mdparse 渲染输入框当前内容到预览区。"""
