@@ -439,8 +439,6 @@ class AssistantApp:
         self._hist_index = None
         self._hist_draft = ""
         self._draft_after = None
-        self._input_preview_shown = False
-        self._md_preview_win = None
         self.task_panel = None
         self.proc_panel = None
         self._current_inject_text = ""
@@ -3187,13 +3185,8 @@ class AssistantApp:
         card.pack(fill="both", expand=True, padx=8, pady=6)
         self._restyle.append((card, "panel"))
         self._restyle.append((card, "input_card"))
-        # ---- 双栏容器：左编辑 / 右实时预览（默认只显示编辑区） ----
-        self.input_split = tk.Frame(card, bg=t["panel"])
-        self.input_split.pack(side="top", fill="both", expand=True)
-        self._restyle.append((self.input_split, "panel"))
-
         self.input_text = tk.Text(
-            self.input_split,
+            card,
             height=4,
             wrap="word",
             font=(FONT_FAMILY, sizes["base"]),
@@ -3209,31 +3202,7 @@ class AssistantApp:
             pady=8,
             undo=True,
         )
-        self.input_text.pack(side="left", fill="both", expand=True)
-        # ---- 输入预览（右侧栏）：发送前用现有 Markdown 引擎渲染，默认隐藏 ----
-        self.input_preview = tk.Frame(self.input_split, width=360, bg=t.get("quote_bg", t["surface"]),
-                                      highlightthickness=1, highlightbackground=t["border"])
-        self._restyle.append((self.input_preview, "surface"))
-        self.preview_head = tk.Frame(self.input_preview, bg=t.get("quote_bg", t["surface"]))
-        self.preview_head.pack(fill="x", padx=8, pady=(4, 0))
-        self.input_preview_lbl = self._lbl(
-            self.preview_head, "Markdown 预览", role="label_sec",
-            bg="surface", font=(FONT_FAMILY, 8),
-        )
-        self.input_preview_lbl.pack(side="left")
-        self.input_preview_close = self._mk_button(self.preview_head, "✕ 关闭", self._toggle_input_preview, fsz=8)
-        self.input_preview_close.pack(side="right")
-        self.input_preview_text = tk.Text(
-            self.input_preview, height=6, wrap="word", state="disabled",
-            font=(FONT_FAMILY, sizes["base"]), bg=t["surface"], fg=t["text"],
-            relief="flat", bd=0, padx=10, pady=6,
-        )
-        self.input_preview_text.pack(fill="both", expand=True, padx=8, pady=(2, 8))
-        try:
-            self._configure_tags(self.input_preview_text, t, sizes)
-        except Exception:
-            logging.exception("预览文本样式初始化失败")
-        self.input_preview.pack_forget()
+        self.input_text.pack(side="top", fill="both", expand=True)
         # ---- 产物条：工具生成的最近文件常驻显示（打开/所在文件夹/复制），
         # 默认隐藏，工具产生新产物时自动出现，无需到目录翻找 ----
         self.recent_bar = tk.Frame(card, bg=t["panel"])
@@ -3250,29 +3219,9 @@ class AssistantApp:
         self.recent_bar_copy_btn.pack(side="left", padx=(6, 0))
         self.recent_bar_close = self._mk_button(self.recent_bar, "✕", self._hide_recent_bar, fsz=9)
         self.recent_bar_close.pack(side="left", padx=(6, 0))
-        # before=input_text：产物条显示在输入框上方（后 pack 默认在下方）
-        self.recent_bar.pack(side="top", before=self.input_split, fill="x", padx=14, pady=(8, 0))
+        # 产物条显示在输入框上方（后 pack 默认在下方）
+        self.recent_bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
         self.recent_bar.pack_forget()  # 默认隐藏，有产物才显示
-        # ---- 输入预览：发送前用现有 Markdown 引擎渲染，默认隐藏 ----
-        self.input_preview = tk.Frame(card, bg=t.get("quote_bg", t["surface"]), highlightthickness=1,
-                                      highlightbackground=t["border"])
-        self._restyle.append((self.input_preview, "surface"))
-        self.input_preview_lbl = self._lbl(
-            self.input_preview, "预览（发送前 Markdown 渲染效果）", role="label_sec",
-            bg="surface", font=(FONT_FAMILY, 8),
-        )
-        self.input_preview_lbl.pack(anchor="w", padx=10, pady=(6, 0))
-        self.input_preview_text = tk.Text(
-            self.input_preview, height=6, wrap="word", state="disabled",
-            font=(FONT_FAMILY, sizes["base"]), bg=t["surface"], fg=t["text"],
-            relief="flat", bd=0, padx=10, pady=6,
-        )
-        self.input_preview_text.pack(fill="both", expand=True, padx=8, pady=(2, 8))
-        try:
-            self._configure_tags(self.input_preview_text, t, sizes)
-        except Exception:
-            logging.exception("预览文本样式初始化失败")
-        self.input_preview.pack_forget()
         self._refresh_line_px()
         self._restore_input_height()
         self.input_text.bind("<Return>", self.on_enter)
@@ -3321,8 +3270,6 @@ class AssistantApp:
                 self._maybe_show_slash_menu(),
                 self._schedule_input_tokens(),
                 self._schedule_draft_save(),
-                self._update_input_preview(),
-                self._update_md_split_preview(),
             ),
         )
         foot = tk.Frame(card, bg=t["panel"])
@@ -3335,10 +3282,6 @@ class AssistantApp:
         self.input_hint_lbl.pack(side="left")
         self.btn_prompts = self._mk_button(foot, "⚡ 指令", self._show_prompt_menu, fsz=9)
         self.btn_prompts.pack(side="left", padx=(10, 0))
-        self.btn_preview = self._mk_button(foot, "预览", self._toggle_input_preview, fsz=9)
-        self.btn_preview.pack(side="left", padx=(6, 0))
-        self.btn_md_split = self._mk_button(foot, "分屏", self._toggle_md_split_preview, fsz=9)
-        self.btn_md_split.pack(side="left", padx=(6, 0))
         self.btn_dir = self._mk_button(foot, "📁 目录", self.choose_working_dir, fsz=9)
         self.btn_dir.pack(side="left", padx=(6, 0))
         self.btn_stop = self._mk_button(foot, "■ 停止", self.stop_generate, kind="danger", fsz=10)
@@ -5561,7 +5504,7 @@ class AssistantApp:
             for p in self._recent_cache:
                 if os.path.exists(p):
                     self.recent_bar_lbl.configure(text=f"📦 最近产物：{os.path.basename(p)}")
-                    self.recent_bar.pack(side="top", before=self.input_split, fill="x", padx=14, pady=(8, 0))
+                    self.recent_bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
                     return
             self._hide_recent_bar()
         except tk.TclError:
@@ -14829,140 +14772,6 @@ class AssistantApp:
         text.focus_set()
         return "break"
 
-    def _toggle_input_preview(self):
-        """发送前 Markdown 预览开关：双栏布局（左编辑 / 右预览），可一键关闭。"""
-        self._input_preview_shown = not self._input_preview_shown
-        if self._input_preview_shown:
-            try:
-                self.input_preview.configure(width=360)
-                self.input_preview.pack_propagate(False)
-                self.input_preview.pack(side="right", fill="y", padx=(8, 0), pady=(8, 0))
-                self._update_input_preview()
-            except tk.TclError:
-                self._input_preview_shown = False
-        else:
-            try:
-                self.input_preview.pack_forget()
-            except tk.TclError:
-                pass
-        for btn, on, off in ((self.btn_preview, "隐藏预览", "预览"),
-                             (self.btn_md_split, "退出分屏", "分屏")):
-            try:
-                btn.configure(text=on if self._input_preview_shown else off)
-            except Exception:
-                pass
-
-    def _toggle_md_split_preview(self):
-        """分屏 = 与预览相同的双栏布局（不再弹独立窗口）。"""
-        if getattr(self, "_md_preview_win", None) is not None:
-            self._destroy_md_preview_win()
-        self._toggle_input_preview()
-
-    def _update_input_preview(self):
-        """用 mdparse 渲染输入框当前内容到预览区。"""
-        if not getattr(self, "_input_preview_shown", False):
-            return
-        try:
-            text = self.input_text.get("1.0", "end-1c")
-            preview = self.input_preview_text
-            preview.configure(state="normal")
-            preview.delete("1.0", "end")
-            if not text.strip():
-                preview.insert("1.0", "输入内容后将在此预览 Markdown 渲染效果")
-            else:
-                dtext, spans, links, _cb = mdparse.render_markdown(text)
-                preview.insert("1.0", dtext, "assistant")
-                for a, b, st in spans:
-                    try:
-                        preview.tag_add(st, f"1.0+{a}c", f"1.0+{b}c")
-                    except tk.TclError:
-                        pass
-                for a, b, _url in links:
-                    try:
-                        preview.tag_add("link", f"1.0+{a}c", f"1.0+{b}c")
-                    except tk.TclError:
-                        pass
-            preview.configure(state="disabled")
-        except Exception:
-            logging.exception("更新输入预览失败")
-
-    def _toggle_md_split_preview(self):
-        """分屏 Markdown 预览窗：独立小窗实时渲染输入，类似所见即所得。"""
-        if getattr(self, "_md_preview_win", None) is not None:
-            self._destroy_md_preview_win()
-            return
-        try:
-            t = self._theme()
-            win = tk.Toplevel(self.root, bg=t["panel"])
-            win.title("Markdown 预览")
-            win.geometry(self._center_geometry(480, 520))
-            win.transient(self.root)
-            win.bind("<Escape>", lambda e: self._destroy_md_preview_win())
-            self._lbl(win, "Markdown 实时预览（所见即所得）", role="label_accent", bg="panel",
-                      font=(FONT_FAMILY, 11, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
-            body = tk.Frame(win, bg=t["panel"])
-            body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-            self._restyle.append((body, "panel"))
-            txt = tk.Text(body, wrap="word", state="disabled", font=(FONT_FAMILY, 10),
-                          bg=t["chat_bg"], fg=t["text"], relief="flat", padx=10, pady=8)
-            txt.pack(fill="both", expand=True)
-            self._configure_tags(txt, t, self._font_sizes())
-            self._md_preview_win = win
-            self._md_preview_text = txt
-            self._update_md_split_preview()
-            try:
-                self.btn_md_split.configure(text="关闭分屏")
-            except Exception:
-                pass
-        except Exception:
-            logging.exception("创建分屏预览失败")
-
-    def _destroy_md_preview_win(self):
-        win = getattr(self, "_md_preview_win", None)
-        if win is not None:
-            try:
-                if win.winfo_exists():
-                    win.destroy()
-            except Exception:
-                pass
-            self._md_preview_win = None
-            self._md_preview_text = None
-        try:
-            self.btn_md_split.configure(text="分屏")
-        except Exception:
-            pass
-
-    def _update_md_split_preview(self):
-        win = getattr(self, "_md_preview_win", None)
-        txt = getattr(self, "_md_preview_text", None)
-        if win is None or txt is None:
-            return
-        try:
-            if not win.winfo_exists():
-                self._md_preview_win = None
-                self._md_preview_text = None
-                return
-            src = self.input_text.get("1.0", "end-1c")
-            txt.configure(state="normal")
-            txt.delete("1.0", "end")
-            if not src.strip():
-                txt.insert("1.0", "输入内容后实时预览 Markdown 效果")
-            else:
-                dtext, spans, links, _cb = mdparse.render_markdown(src)
-                txt.insert("1.0", dtext, "assistant")
-                for a, b, st in spans:
-                    try:
-                        txt.tag_add(st, f"1.0+{a}c", f"1.0+{b}c")
-                    except tk.TclError:
-                        pass
-                for a, b, _url in links:
-                    try:
-                        txt.tag_add("link", f"1.0+{a}c", f"1.0+{b}c")
-                    except tk.TclError:
-                        pass
-            txt.configure(state="disabled")
-        except Exception:
-            pass
 
     def _paste_plain_text(self, _event=None):
         """粘贴为纯文本：剥离富文本/HTML，保留换行。"""
@@ -15266,10 +15075,6 @@ class AssistantApp:
         menu.add_command(label="插入代码块", command=self._insert_code_block)
         menu.add_command(label="插入引用块", command=self._insert_quote_block)
         menu.add_command(
-            label="预览 Markdown" if not self._input_preview_shown else "隐藏预览",
-            command=self._toggle_input_preview,
-        )
-        menu.add_command(
             label="清空输入", command=lambda: self.input_text.delete("1.0", "end")
         )
         try:
@@ -15377,7 +15182,6 @@ class AssistantApp:
         return "break"
 
     def on_close(self):
-        self._destroy_md_preview_win()
         self._hide_toast()
         self._hide_hover_bar()
         # 托盘线程异常退出后不再拦截，避免窗口被隐藏后无法恢复）
