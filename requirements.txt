@@ -9,6 +9,8 @@ pywin32>=306
 # 可选：PDF 处理（pdf_extract / pdf_create，未安装时工具提示安装）
 PyMuPDF>=1.24
 reportlab>=4.0
+# 可选：代码块语法高亮（未安装时代码块保持纯文本）
+pygments>=2.15
 # 可选：Office 文档读取（docx_read / pptx_read；python-docx 已用于 create_doc）
 python-pptx>=0.6.23
 # 可选：RSS 聚合（rss_fetch）

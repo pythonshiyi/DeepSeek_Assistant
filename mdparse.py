@@ -260,6 +260,51 @@ def _render_table(block):
     return "\n".join(out), [(0, head, "table_head")]
 
 
+def _pygments_spans(code, lang, base):
+    """可选语法高亮：返回 [(start, end, tag)]，pygments 缺失时返回空。"""
+    try:
+        from pygments import highlight as _pyg_highlight  # noqa: F401
+        from pygments import lexers, token as _tok
+    except Exception:
+        return []
+    try:
+        lexer = lexers.get_lexer_by_name(lang or "text")
+    except Exception:
+        return []
+    spans = []
+    try:
+        _pyg_highlight(code, lexer, _tok.Null)  # 触发默认注册（占位）
+    except Exception:
+        pass
+    pos = 0
+    try:
+        for _ttype, _ttext in lexer.get_tokens(code):
+            if not _ttext:
+                continue
+            tag = None
+            ttype = str(_ttype)
+            if "Keyword" in ttype:
+                tag = "pyg_keyword"
+            elif "String" in ttype:
+                tag = "pyg_string"
+            elif "Number" in ttype:
+                tag = "pyg_number"
+            elif "Comment" in ttype:
+                tag = "pyg_comment"
+            elif "Name.Function" in ttype:
+                tag = "pyg_func"
+            elif "Operator" in ttype:
+                tag = "pyg_operator"
+            elif "Name.Builtin" in ttype or "Name.Builtin.Pseudo" in ttype:
+                tag = "pyg_builtin"
+            if tag:
+                spans.append((base + pos, base + pos + len(_ttext), tag))
+            pos += len(_ttext)
+    except Exception:
+        return []
+    return spans
+
+
 def render_markdown(text, plain=False):
     """将 Markdown 文本渲染为可显示的纯文本 + 样式区间。
 
@@ -315,6 +360,8 @@ def render_markdown(text, plain=False):
             seg = block + "\n"
             s = out_len
             emit(seg, "code")
+            for a, b, tag in _pygments_spans(block, lang, s):
+                spans.append((a, b, tag))
             code_blocks.append((s, out_len, block, lang))
         elif kind == "hr":
             emit("━" * 36 + "\n", "hr")

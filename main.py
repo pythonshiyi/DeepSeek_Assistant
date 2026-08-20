@@ -688,6 +688,7 @@ class AssistantApp:
             tm.add_command(label="🧩 插件中心", accelerator="Ctrl+Shift+P", command=self.show_plugin_hub)
             tm.add_command(label="🧩 插件兼容性检查…", command=self.show_plugin_compat)
             tm.add_command(label="⭐ 插件评分…", command=self.show_plugin_rating)
+            tm.add_command(label="🔄 插件自动更新…", command=self.show_plugin_updates)
             tm.add_separator()
 
             # ── 账户与用量 ──
@@ -4274,6 +4275,19 @@ class AssistantApp:
             rmargin=14,
             spacing1=4,
         )
+        pyg_colors = {
+            "pyg_keyword": t["accent"],
+            "pyg_string": t.get("success", "#0fa878"),
+            "pyg_number": t.get("warning", "#e08f2e"),
+            "pyg_comment": t["text_sec"],
+            "pyg_func": t.get("tool", "#8b6bff"),
+            "pyg_operator": t["text"],
+            "pyg_builtin": t.get("code_fg", "#1f8a70"),
+        }
+        for _tag, _color in pyg_colors.items():
+            text.tag_configure(
+                _tag, foreground=_color, font=(MONO_FAMILY, sizes["mono"])
+            )
         text.tag_configure(
             "code_copy",
             background=t["code_bg"],
@@ -8681,6 +8695,117 @@ class AssistantApp:
         self._mk_button(bar, "保存评分", _save, kind="primary", fsz=9).pack(side="right")
         self._footer_btn(footer, "关闭", dialog.destroy)
 
+    def show_plugin_updates(self):
+        """插件自动更新：从市场索引对比已装插件版本，批量下载更新。"""
+        t = self._theme()
+        dialog, body, footer = self._dialog_shell(
+            "插件自动更新", 560, 400,
+            subtitle="从插件市场索引对比版本，一键更新已安装插件",
+        )
+        status = self._lbl(body, "正在检查更新…", role="label_sec", bg="panel")
+        status.pack(anchor="w", pady=(0, 6))
+        listbox = tk.Listbox(body, height=8, bg=t["input_bg"], fg=t["input_fg"],
+                             selectbackground=t["selection"], selectforeground=t["accent_text"],
+                             relief="flat", borderwidth=0, highlightthickness=0, exportselection=False)
+        listbox.pack(fill="both", expand=True)
+
+        def worker():
+            try:
+                url = str(self.cfg.get("plugin_market_url") or "").strip() or PLUGIN_MARKET_URL
+                resp = _dc._http_client().get(url, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                entries = (data.get("plugins") or data.get("items") or []) if isinstance(data, dict) else (data or [])
+                entries = [e for e in entries if isinstance(e, dict) and e.get("url")]
+                installed = plugins_mod.list_plugins(PLUGINS_DIR)
+                updates = []
+                for p in installed:
+                    name = str((p.get("meta") or {}).get("name") or "")
+                    ver = str((p.get("meta") or {}).get("version") or "")
+                    for e in entries:
+                        if str(e.get("name") or "") == name and str(e.get("version") or "") != ver:
+                            updates.append((e, ver))
+                            break
+                self._ui_queue.put(("plugin_updates_found", updates))
+            except Exception as e:
+                self._ui_queue.put(("plugin_updates_found", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._plugin_updates_dialog = dialog
+        self._plugin_updates_list = listbox
+        self._plugin_updates_status = status
+        self._plugin_updates_entries = []
+        self._footer_btn(footer, "关闭", dialog.destroy)
+
+    def _download_plugin_entry(self, entry):
+        """下载并安装单个市场插件（后台线程 → 队列 → 安装）。"""
+        def worker():
+            try:
+                import hashlib
+                import tempfile
+                from urllib.parse import urlparse
+                url = str(entry.get("url") or "")
+                resp = _dc._http_client().get(url, timeout=60)
+                resp.raise_for_status()
+                fn = os.path.basename(urlparse(url).path) or "plugin.wtplugin"
+                tmp = os.path.join(tempfile.gettempdir(), f"wtplugin_{int(time.time())}_{fn}")
+                with open(tmp, "wb") as f:
+                    f.write(resp.content)
+                sha = str(entry.get("sha256") or "").strip().lower()
+                if sha:
+                    h = hashlib.sha256()
+                    with open(tmp, "rb") as f:
+                        for chunk in iter(lambda: f.read(64 * 1024), b""):
+                            h.update(chunk)
+                    if h.hexdigest() != sha:
+                        os.remove(tmp)
+                        raise ValueError("SHA-256 校验失败")
+                self._ui_queue.put(("plugin_market_downloaded", (True, tmp, entry)))
+            except Exception as e:
+                self._ui_queue.put(("plugin_market_downloaded", (False, str(e), entry)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_plugin_updates_found(self, payload):
+        if isinstance(payload, str):
+            status = getattr(self, "_plugin_updates_status", None)
+            if status is not None:
+                try:
+                    status.configure(text=f"检查失败：{payload}")
+                except tk.TclError:
+                    pass
+            return
+        entries = payload or []
+        status = getattr(self, "_plugin_updates_status", None)
+        listbox = getattr(self, "_plugin_updates_list", None)
+        if status is None or listbox is None:
+            return
+        try:
+            if not entries:
+                status.configure(text="所有插件均为最新版本")
+                return
+            status.configure(text=f"发现 {len(entries)} 个可更新插件")
+            listbox.delete(0, "end")
+            for e, old_ver in entries:
+                listbox.insert("end", f"{e.get('name', '?')}  {old_ver} → {e.get('version', '?')}")
+            self._plugin_updates_entries = entries
+            if not getattr(self, "_plugin_update_bar", None):
+                bar = tk.Frame(self._plugin_updates_dialog, bg=self._theme()["panel"])
+                bar.pack(fill="x", side="bottom", padx=14, pady=(8, 10))
+                self._plugin_update_bar = bar
+                self._mk_button(bar, "全部更新", self._update_all_plugins, kind="primary", fsz=9).pack(side="right")
+        except tk.TclError:
+            pass
+
+    def _update_all_plugins(self):
+        entries = getattr(self, "_plugin_updates_entries", []) or []
+        if not entries:
+            return
+        if not messagebox.askyesno("插件更新", f"确认下载并更新 {len(entries)} 个插件？"):
+            return
+        for entry, _old in entries:
+            self._download_plugin_entry(entry)
+
     def show_tool_hub(self):
         """工具中心：正式页面（概览 / 工具设置 / 权限 三页签）。"""
         t = self._theme()
@@ -10789,6 +10914,8 @@ class AssistantApp:
                 messagebox.showerror(
                     "下载失败", f"更新包下载失败：{detail}\n可前往官网手动下载。"
                 )
+        elif kind == "plugin_updates_found":
+            self._on_plugin_updates_found(payload)
         elif kind == "plugin_market":
             ok, data = payload
             if ok:
