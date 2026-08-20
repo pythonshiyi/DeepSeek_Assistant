@@ -438,6 +438,7 @@ class AssistantApp:
         self._hist_draft = ""
         self._draft_after = None
         self._input_preview_shown = False
+        self._md_preview_win = None
         self.task_panel = None
         self.proc_panel = None
         self._current_inject_text = ""
@@ -3286,6 +3287,7 @@ class AssistantApp:
                 self._schedule_input_tokens(),
                 self._schedule_draft_save(),
                 self._update_input_preview(),
+                self._update_md_split_preview(),
             ),
         )
         foot = tk.Frame(card, bg=t["panel"])
@@ -3300,6 +3302,8 @@ class AssistantApp:
         self.btn_prompts.pack(side="left", padx=(10, 0))
         self.btn_preview = self._mk_button(foot, "预览", self._toggle_input_preview, fsz=9)
         self.btn_preview.pack(side="left", padx=(6, 0))
+        self.btn_md_split = self._mk_button(foot, "分屏", self._toggle_md_split_preview, fsz=9)
+        self.btn_md_split.pack(side="left", padx=(6, 0))
         self.btn_dir = self._mk_button(foot, "📁 目录", self.choose_working_dir, fsz=9)
         self.btn_dir.pack(side="left", padx=(6, 0))
         self.btn_stop = self._mk_button(foot, "■ 停止", self.stop_generate, kind="danger", fsz=10)
@@ -14480,6 +14484,84 @@ class AssistantApp:
         except Exception:
             logging.exception("更新输入预览失败")
 
+    def _toggle_md_split_preview(self):
+        """分屏 Markdown 预览窗：独立小窗实时渲染输入，类似所见即所得。"""
+        if getattr(self, "_md_preview_win", None) is not None:
+            self._destroy_md_preview_win()
+            return
+        try:
+            t = self._theme()
+            win = tk.Toplevel(self.root, bg=t["panel"])
+            win.title("Markdown 预览")
+            win.geometry(self._center_geometry(480, 520))
+            win.transient(self.root)
+            win.bind("<Escape>", lambda e: self._destroy_md_preview_win())
+            self._lbl(win, "Markdown 实时预览（所见即所得）", role="label_accent", bg="panel",
+                      font=(FONT_FAMILY, 11, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
+            body = tk.Frame(win, bg=t["panel"])
+            body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+            self._restyle.append((body, "panel"))
+            txt = tk.Text(body, wrap="word", state="disabled", font=(FONT_FAMILY, 10),
+                          bg=t["chat_bg"], fg=t["text"], relief="flat", padx=10, pady=8)
+            txt.pack(fill="both", expand=True)
+            self._configure_tags(txt, t, self._font_sizes())
+            self._md_preview_win = win
+            self._md_preview_text = txt
+            self._update_md_split_preview()
+            try:
+                self.btn_md_split.configure(text="关闭分屏")
+            except Exception:
+                pass
+        except Exception:
+            logging.exception("创建分屏预览失败")
+
+    def _destroy_md_preview_win(self):
+        win = getattr(self, "_md_preview_win", None)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.destroy()
+            except Exception:
+                pass
+            self._md_preview_win = None
+            self._md_preview_text = None
+        try:
+            self.btn_md_split.configure(text="分屏")
+        except Exception:
+            pass
+
+    def _update_md_split_preview(self):
+        win = getattr(self, "_md_preview_win", None)
+        txt = getattr(self, "_md_preview_text", None)
+        if win is None or txt is None:
+            return
+        try:
+            if not win.winfo_exists():
+                self._md_preview_win = None
+                self._md_preview_text = None
+                return
+            src = self.input_text.get("1.0", "end-1c")
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            if not src.strip():
+                txt.insert("1.0", "输入内容后实时预览 Markdown 效果")
+            else:
+                dtext, spans, links, _cb = mdparse.render_markdown(src)
+                txt.insert("1.0", dtext, "assistant")
+                for a, b, st in spans:
+                    try:
+                        txt.tag_add(st, f"1.0+{a}c", f"1.0+{b}c")
+                    except tk.TclError:
+                        pass
+                for a, b, _url in links:
+                    try:
+                        txt.tag_add("link", f"1.0+{a}c", f"1.0+{b}c")
+                    except tk.TclError:
+                        pass
+            txt.configure(state="disabled")
+        except Exception:
+            pass
+
     def _paste_plain_text(self, _event=None):
         """粘贴为纯文本：剥离富文本/HTML，保留换行。"""
         try:
@@ -14893,7 +14975,9 @@ class AssistantApp:
         return "break"
 
     def on_close(self):
-        # 关闭时最小化到托盘（托盘退出走 _quit_from_tray 绕过拦截；
+        self._destroy_md_preview_win()
+        self._hide_toast()
+        self._hide_hover_bar()
         # 托盘线程异常退出后不再拦截，避免窗口被隐藏后无法恢复）
         if (
             not getattr(self, "_quit_from_tray", False)
