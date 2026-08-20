@@ -686,6 +686,7 @@ class AssistantApp:
             # 中心入口（最高频导航按钮，置顶直连）
             tm.add_command(label="🛠 工具中心", accelerator="Ctrl+Shift+T", command=self.show_tool_hub)
             tm.add_command(label="🧩 插件中心", accelerator="Ctrl+Shift+P", command=self.show_plugin_hub)
+            tm.add_command(label="🧩 插件兼容性检查…", command=self.show_plugin_compat)
             tm.add_separator()
 
             # ── 账户与用量 ──
@@ -8600,6 +8601,37 @@ class AssistantApp:
         bar.pack(fill="x", side="bottom", pady=(8, 8))
         self._restyle.append((bar, "panel"))
         self._mk_button(bar, "生成插件", run, kind="primary", fsz=10).pack(side="right")
+
+    def show_plugin_compat(self):
+        """插件兼容性检查：扫描已安装插件，报告缺依赖/结构问题。"""
+        t = self._theme()
+        dialog, body, footer = self._dialog_shell(
+            "插件兼容性检查", 640, 480,
+            subtitle="扫描插件目录，检测结构/依赖/兼容性问题",
+        )
+        plugins = plugins_mod.list_plugins(PLUGINS_DIR)
+        lines = []
+        if not plugins:
+            lines.append("（尚未安装插件）")
+        for p in plugins:
+            name = str((p.get("meta") or {}).get("name") or "?")
+            ok, err = plugins_mod.validate_plugin(p)
+            lines.append(f"◆ {name}（{p.get('_file', '')}）")
+            if not ok:
+                lines.append(f"  ❌ 结构错误：{err}")
+            miss = plugins_mod.missing_requires(p)
+            if miss:
+                lines.append(f"  ⚠ 缺失依赖：{'、'.join(miss)}")
+            enables = "已启用" if p.get("enabled", True) else "已停用"
+            lines.append(f"  · 状态：{enables}")
+            lines.append("")
+        txt = tk.Text(body, wrap="word", font=(FONT_FAMILY, 9), bg=t["input_bg"],
+                      fg=t["text"], relief="flat", padx=10, pady=8)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", "\n".join(lines))
+        txt.configure(state="disabled")
+        self._footer_hint(footer, f"共 {len(plugins)} 个插件")
+        self._footer_btn(footer, "关闭", dialog.destroy)
 
     def show_tool_hub(self):
         """工具中心：正式页面（概览 / 工具设置 / 权限 三页签）。"""
