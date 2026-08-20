@@ -5741,6 +5741,7 @@ class AssistantApp:
         text.pack(fill="both", expand=True)
         text.insert("1.0", "\n".join(lines) if lines else "（暂无任务记录）")
         text.configure(state="disabled")
+        self._footer_btn(footer, "复制", lambda: (self.root.clipboard_clear(), self.root.clipboard_append("\n".join(lines)), self._flash_status("已复制任务复盘")))
         self._footer_btn(footer, "关闭", dialog.destroy)
 
     def choose_working_dir(self):

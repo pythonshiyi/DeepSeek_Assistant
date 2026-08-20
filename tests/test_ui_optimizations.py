@@ -41,3 +41,15 @@ class TestToolSchemaCache:
         names = {t["function"]["name"] for t in tools}
         assert "my_tool" in names
         assert "get_date" in names
+
+
+class TestCodeHighlightSpans:
+    def test_pygments_spans_present_when_available(self):
+        try:
+            import pygments  # noqa: F401
+        except ImportError:
+            return  # pygments 未安装时跳过
+        text, spans, _, _ = mdparse.render_markdown("```python\ndef f():\n    return 1\n```")
+        tags = {s[2] for s in spans}
+        # 至少出现 keyword/string/number 中的高亮 tag
+        assert tags & {"pyg_keyword", "pyg_number", "pyg_string", "pyg_func", "pyg_builtin"}
