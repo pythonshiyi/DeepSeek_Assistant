@@ -4123,11 +4123,11 @@ class AssistantApp:
     def _configure_tags(self, text, t, sizes):
         density = str(self.cfg.get("message_density", "comfort") or "comfort")
         if density == "compact":
-            _t1, _t3, _u1, _u3, _a1, _a3 = 3, 2, 1, 1, 1, 1
+            _t1, _t3, _u1, _u3, _a1, _a3 = 2, 1, 1, 1, 1, 1
         elif density == "loose":
             _t1, _t3, _u1, _u3, _a1, _a3 = 8, 6, 8, 8, 4, 4
         else:
-            _t1, _t3, _u1, _u3, _a1, _a3 = 6, 4, 4, 4, 2, 2
+            _t1, _t3, _u1, _u3, _a1, _a3 = 6, 5, 6, 6, 3, 4
         text.tag_configure(
             "time",
             foreground=t.get("note", t["thinking"]),
@@ -4139,9 +4139,9 @@ class AssistantApp:
             "user",
             foreground=t.get("bubble_user_text", t["text"]),
             background=t.get("bubble_user", t["quote_bg"]),
-            lmargin1=10,
-            lmargin2=10,
-            rmargin=14,
+            lmargin1=12,
+            lmargin2=16,
+            rmargin=20,
             spacing1=_u1,
             spacing3=_u3,
             justify="left",
@@ -4150,9 +4150,9 @@ class AssistantApp:
             "user_time",
             foreground=t["text_sec"],
             font=(FONT_FAMILY, sizes["small"]),
-            lmargin1=10,
-            lmargin2=10,
-            rmargin=14,
+            lmargin1=12,
+            lmargin2=16,
+            rmargin=20,
             spacing1=_u1,
             spacing3=_u3 // 2,
             justify="left",
@@ -4161,9 +4161,9 @@ class AssistantApp:
             "assistant",
             foreground=t["text"],
             background=t.get("bubble_assistant", t["panel"]),
-            lmargin1=8,
-            lmargin2=8,
-            rmargin=8,
+            lmargin1=10,
+            lmargin2=10,
+            rmargin=12,
             spacing1=_a1,
             spacing3=_a3,
         )
