@@ -105,6 +105,8 @@ DEFAULT_SHORTCUTS = {
     "toggle_fullscreen": "<F11>",
     "show_tool_hub": "<Control-Shift-t>",
     "show_plugin_hub": "<Control-Shift-p>",
+    "insert_code_block": "<Control-Shift-c>",
+    "insert_quote_block": "<Control-Alt-q>",
 }
 
 MAX_CONTEXT_TOKENS = 1_000_000

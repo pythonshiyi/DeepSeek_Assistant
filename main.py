@@ -1177,6 +1177,8 @@ class AssistantApp:
             "toggle_fullscreen": lambda e: (self.toggle_fullscreen(), "break"),
             "show_tool_hub": lambda e: (self.show_tool_hub(), "break"),
             "show_plugin_hub": lambda e: (self.show_plugin_hub(), "break"),
+            "insert_code_block": lambda e: (self._insert_code_block() if self.input_text.focus_get() == self.input_text else None, "break"),
+            "insert_quote_block": lambda e: (self._insert_quote_block() if self.input_text.focus_get() == self.input_text else None, "break"),
         }
         for action, seq in self._shortcut_bindings().items():
             handler = actions.get(action)
@@ -1224,6 +1226,8 @@ class AssistantApp:
             "toggle_fullscreen": "全屏",
             "show_tool_hub": "工具中心",
             "show_plugin_hub": "插件中心",
+            "insert_code_block": "插入代码块",
+            "insert_quote_block": "插入引用块",
         }
         entries = {}
         current = self._shortcut_bindings()
