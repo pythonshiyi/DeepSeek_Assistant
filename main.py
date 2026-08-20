@@ -3261,6 +3261,7 @@ class AssistantApp:
         self.input_text.bind("<Control-Shift-C>", self._insert_code_block)
         self.input_text.bind("<Control-Alt-q>", self._insert_quote_block)
         self.input_text.bind("<Control-Alt-Q>", self._insert_quote_block)
+        self.input_text.bind("<Control-Alt-v>", self._paste_image_from_clipboard)
         self.input_text.bind("<Control-Up>", lambda e: self._step_input_height(1))
         self.input_text.bind("<Control-Down>", lambda e: self._step_input_height(-1))
         # ---- 编辑器增强：Tab 缩进 / Shift+Tab 反缩进 / 括号自动配对 / Ctrl+Backspace 删词 ----
@@ -14655,6 +14656,30 @@ class AssistantApp:
     def _hide_slash_menu(self):
         pass  # tk_popup 会自动处理；这里保留接口便于后续扩展
 
+    def _paste_image_from_clipboard(self, _event=None):
+        """把剪贴板图片保存到工作区并插入 Markdown 图片引用。"""
+        try:
+            from PIL import ImageGrab, Image
+        except ImportError:
+            self._toast("粘贴图片需要 Pillow，请先安装：pip install Pillow")
+            return
+        try:
+            img = ImageGrab.grabclipboard()
+            if img is None:
+                self._toast("剪贴板没有图片")
+                return
+            img_dir = os.path.join(WORKSPACE_DIR, "images")
+            os.makedirs(img_dir, exist_ok=True)
+            path = os.path.join(img_dir, f"pasted_{datetime.now():%Y%m%d_%H%M%S}.png")
+            img.save(path, "PNG")
+            self._clear_placeholder()
+            self.input_text.insert("insert", f"![粘贴图片]({path})")
+            self.input_text.focus_set()
+            self._flash_status(f"已插入图片引用：{path}")
+        except Exception:
+            logging.exception("粘贴剪贴板图片失败")
+            self._toast("粘贴图片失败，请截图后重试（或用 Ctrl+Shift+Q 剪贴板即问）")
+
     def _insert_table_template(self):
         self._clear_placeholder()
         text = self.input_text
@@ -14685,6 +14710,9 @@ class AssistantApp:
         )
         menu.add_command(
             label="粘贴为纯文本", command=self._paste_plain_text
+        )
+        menu.add_command(
+            label="粘贴图片", command=self._paste_image_from_clipboard
         )
         menu.add_command(
             label="撤销", command=lambda: self.input_text.event_generate("<<Undo>>")
