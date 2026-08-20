@@ -67,7 +67,16 @@ class PerfBase(unittest.TestCase):
         text.configure(state="normal")
         text.delete("1.0", "end")
         text.configure(state="disabled")
+        # 清理所有会话文本的折叠/链接缓存，避免跨测试状态残留导致 fold 数量漂移
+        for _s in list(self.app._sessions):
+            _t = _s.get("text")
+            if _t is not None:
+                self.app._fold_ranges[_t] = []
+                self.app._fold_nums[_t] = []
+                self.app._code_copy_ranges[_t] = []
+                self.app._filelink_ranges[_t] = []
         self.app._fold_ranges[text] = []
+        self.app._fold_nums[text] = []
         self.app._link_ranges[text] = []
         self.app._stream_thinking_fold = None
         self.app._stream_start = None
