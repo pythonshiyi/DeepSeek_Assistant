@@ -91,6 +91,8 @@ import stores
 from session_utils import safe_sid as _safe_sid, session_id as _session_id_impl
 import dialogs
 import wecom_aibot
+import api_server
+import tool_sdk
 from splash import SplashScreen
 from taskpanel import InlineTaskPanel
 from processpanel import ProcessPanel
@@ -747,6 +749,7 @@ class AssistantApp:
             self._menus.append(sysm)
             sysm.add_command(label="🔧 失败模式库…", command=self.show_failures)
             sysm.add_command(label="📋 行动审计…", command=self.show_action_log)
+            sysm.add_command(label="🧑‍💻 开发者工具（API / Tool SDK）…", command=self.show_developer_tools)
             sysm.add_command(label="🔗 推送与数据库配置…", command=self.show_external_config)
             sysm.add_command(label="📱 IM 通道配置…", command=self.show_im_config)
             sysm.add_command(label="🖼 从剪贴板图片提取文字 (OCR)…", command=self._ocr_clipboard)
@@ -8840,6 +8843,156 @@ class AssistantApp:
         txt.insert("1.0", "\n".join(reversed(lines)) if lines else "（暂无行动审计记录）")
         txt.configure(state="disabled")
         self._footer_hint(footer, f"审计文件：{path}")
+        self._footer_btn(footer, "关闭", dialog.destroy)
+
+    def show_developer_tools(self):
+        """开发者工具：本地 API 沙箱 + Tool SDK（模板/校验/文档）。"""
+        t = self._theme()
+        dialog, body, footer = self._dialog_shell(
+            "开发者工具", 660, 560,
+            subtitle="本地 HTTP API 沙箱 + 可扩展 Tool SDK（自定义工具模板/校验/文档）",
+            minsize=(540, 480),
+        )
+        nb = ttk.Notebook(body)
+        nb.pack(fill="both", expand=True)
+
+        # ---------- API 沙箱 ----------
+        api_frame = tk.Frame(nb, bg=t["panel"])
+        nb.add(api_frame, text="API 沙箱")
+        self._lbl(api_frame, "在 127.0.0.1 提供受 token 保护的本地接口，供自动化/脚本调用：",
+                  role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(8, 4))
+        row = tk.Frame(api_frame, bg=t["panel"])
+        row.pack(fill="x", padx=4, pady=2)
+        self._lbl(row, "端口：", role="label_sec", bg="panel").pack(side="left")
+        port_var = tk.StringVar(value="8745")
+        ttk.Entry(row, textvariable=port_var, width=8).pack(side="left", padx=(4, 0))
+        self._lbl(row, "  Token（留空自动生成）：", role="label_sec", bg="panel").pack(side="left", padx=(8, 0))
+        token_var = tk.StringVar()
+        ttk.Entry(row, textvariable=token_var, width=26).pack(side="left", padx=(4, 0))
+        api_status = self._lbl(api_frame, "未启动", role="label_sec", bg="panel")
+        api_status.pack(anchor="w", padx=4, pady=(4, 0))
+        api_hint = tk.Text(api_frame, height=8, bg=t["input_bg"], fg=t["input_fg"], relief="flat",
+                           font=(MONO_FAMILY, 8), padx=8, pady=6)
+        api_hint.pack(fill="both", expand=True, padx=4, pady=(8, 8))
+        api_hint.insert("1.0",
+                        "GET  /health\nGET  /v1/tools\nPOST /v1/chat   {messages: [...], model?}\n\n"
+                        "请求头：Authorization: Bearer <token>\n仅监听 127.0.0.1，不暴露到局域网。")
+        api_hint.configure(state="disabled")
+
+        def _tools_provider():
+            try:
+                names = [x["function"]["name"] for x in TOOLS]
+                names += [x["function"]["name"] for x in load_user_tools(USER_TOOLS_PATH)]
+                return names
+            except Exception:
+                return []
+
+        def _chat_provider(messages, model=None):
+            client = self.ensure_client()
+            use_model = str(model or "").strip() or client.model
+            resp = client.client.chat.completions.create(
+                model=use_model,
+                messages=messages,
+                max_tokens=min(8192, int(self.cfg.get("max_tokens", 16384) or 16384)),
+                stream=False,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            return (resp.choices[0].message.content or "")
+
+        def _toggle_api():
+            if api_server.is_running():
+                api_server.stop_server()
+                api_status.configure(text="未启动")
+                return
+            try:
+                port = int(port_var.get() or "8745")
+            except ValueError:
+                messagebox.showwarning("提示", "端口必须是数字")
+                return
+            token = token_var.get().strip()
+            port2, token2, err = api_server.start_server(port, token, _tools_provider, _chat_provider)
+            if err:
+                messagebox.showerror("启动失败", err)
+                return
+            api_status.configure(text=f"运行中  http://127.0.0.1:{port2}  Token: {token2}")
+            token_var.set(token2)
+            self._flash_status("本地 API 沙箱已启动")
+
+        bar = tk.Frame(api_frame, bg=t["panel"])
+        bar.pack(fill="x", padx=4, pady=(0, 8))
+        self._mk_button(bar, "启动/停止", _toggle_api, fsz=9, kind="primary").pack(side="left")
+
+        # ---------- Tool SDK ----------
+        sdk_frame = tk.Frame(nb, bg=t["panel"])
+        nb.add(sdk_frame, text="Tool SDK")
+        row2 = tk.Frame(sdk_frame, bg=t["panel"])
+        row2.pack(fill="x", padx=4, pady=(8, 0))
+        flds = {}
+        for i, (key, label, width) in enumerate([
+            ("name", "工具名", 18), ("desc", "描述", 28),
+            ("endpoint", "端点 URL", 34), ("params", "参数(逗号分隔)", 24),
+            ("method", "方法", 6),
+        ]):
+            self._lbl(row2, f"{label}：", role="label_sec", bg="panel").grid(row=0, column=i * 2, sticky="w", padx=(0, 4))
+            var = tk.StringVar()
+            ent = ttk.Entry(row2, textvariable=var, width=width)
+            ent.grid(row=0, column=i * 2 + 1, sticky="we", padx=(0, 8))
+            flds[key] = var
+        sdk_log = tk.Text(sdk_frame, height=10, bg=t["input_bg"], fg=t["input_fg"], relief="flat",
+                          font=(MONO_FAMILY, 8), padx=8, pady=6)
+        sdk_log.pack(fill="both", expand=True, padx=4, pady=(8, 8))
+        sdk_log.configure(state="disabled")
+
+        def _sdk_log(msg):
+            sdk_log.configure(state="normal")
+            sdk_log.insert("end", msg + "\n")
+            sdk_log.see("end")
+            sdk_log.configure(state="disabled")
+
+        def _generate():
+            tool = tool_sdk.generate_tool_template(
+                flds["name"].get(), flds["desc"].get(),
+                flds["endpoint"].get(), flds["params"].get(), flds["method"].get() or "POST")
+            if tool is None:
+                _sdk_log("❌ 工具名不能为空")
+                return
+            ok, err = tool_sdk.validate_tool(tool)
+            if not ok:
+                _sdk_log(f"❌ 校验失败：{err}")
+                return
+            ok2, err2 = tool_sdk.append_tool(USER_TOOLS_PATH, tool)
+            if ok2:
+                from user_tools import clear_cache
+                clear_cache()
+                _sdk_log(f"✅ 已写入 {USER_TOOLS_PATH}\n   {json.dumps(tool, ensure_ascii=False, indent=2)}")
+            else:
+                _sdk_log(f"❌ 写入失败：{err2}")
+
+        def _validate_all():
+            errs = tool_sdk.validate_user_tools(USER_TOOLS_PATH)
+            if not errs:
+                _sdk_log("✅ 自定义工具全部通过校验")
+            else:
+                for name, err in errs:
+                    _sdk_log(f"❌ {name}: {err}")
+
+        def _copy_docs():
+            try:
+                from user_tools import load_user_tools
+                docs = tool_sdk.render_tool_docs(load_user_tools(USER_TOOLS_PATH))
+            except Exception as e:
+                docs = f"生成文档失败：{e}"
+            self.root.clipboard_clear()
+            self.root.clipboard_append(docs)
+            self._flash_status("已复制自定义工具文档（Markdown）")
+
+        sdk_bar = tk.Frame(sdk_frame, bg=t["panel"])
+        sdk_bar.pack(fill="x", padx=4, pady=(0, 8))
+        self._mk_button(sdk_bar, "生成并写入", _generate, fsz=9, kind="primary").pack(side="left")
+        self._mk_button(sdk_bar, "校验全部", _validate_all, fsz=9).pack(side="left", padx=(6, 0))
+        self._mk_button(sdk_bar, "复制文档", _copy_docs, fsz=9).pack(side="left", padx=(6, 0))
+
+        self._footer_hint(footer, "API 沙箱仅本机使用；Token 请保密")
         self._footer_btn(footer, "关闭", dialog.destroy)
 
     def copy_share_text(self):
