@@ -11294,27 +11294,45 @@ class AssistantApp:
             # 索引失效（重渲染/会话切换后残留的折叠记录）：静默忽略，避免事件层冒泡
             pass
 
+    def _set_folds_visible(self, folds, visible):
+        """批量设置折叠卡片可见性（head 逐个替换，隐藏/显示 tag 批量一次）。"""
+        text = self.chat_text
+        pairs = []
+        for f in list(folds):
+            try:
+                f["visible"] = visible
+                arrow = "▼" if visible else "▶"
+                new_head = f"{arrow} {f['title']}\n"
+                text.delete(f["t0"], f"{f['t0']}+1c")
+                text.insert(f["t0"], arrow, (f["ttag"],))
+                f["head"] = new_head
+                if not visible:
+                    pairs.extend((f["t1"], f["p1"]))
+            except tk.TclError:
+                continue
+        try:
+            if pairs:
+                text.tag_add("fold_hidden", *pairs)
+            else:
+                text.tag_remove("fold_hidden", "1.0", "end")
+        except tk.TclError:
+            pass
+
     def _collapse_all_folds(self):
         """全部折叠（思考/工具卡片）。"""
-        text = self.chat_text
-        for f in list(self._fold_ranges.get(text, [])):
-            if f.get("visible", True):
-                self._toggle_fold(text, f)
+        self._set_folds_visible(self._fold_ranges.get(self.chat_text, []), False)
         self._flash_status("已全部折叠")
 
     def _collapse_thinking_folds(self):
         """生成结束后默认收起思考过程卡片，减少长回复视觉噪音。"""
         text = self.chat_text
-        for f in list(self._fold_ranges.get(text, [])):
-            if f.get("style") == "thinking" and f.get("visible", True):
-                self._toggle_fold(text, f)
+        thinking = [f for f in self._fold_ranges.get(text, []) if f.get("style") == "thinking"]
+        if thinking:
+            self._set_folds_visible(thinking, False)
 
     def _expand_all_folds(self):
         """全部展开（思考/工具卡片）。"""
-        text = self.chat_text
-        for f in list(self._fold_ranges.get(text, [])):
-            if not f.get("visible", True):
-                self._toggle_fold(text, f)
+        self._set_folds_visible(self._fold_ranges.get(self.chat_text, []), True)
         self._flash_status("已全部展开")
 
     def _set_all_folds_elide(self, text, elide):
