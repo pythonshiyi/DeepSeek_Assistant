@@ -9116,6 +9116,7 @@ class AssistantApp:
                 messagebox.showwarning("提示", "端口必须是数字")
                 return
             token = token_var.get().strip()
+            self._capture_client_params()  # 主线程捕获客户端参数，供 API 工作线程安全复用
             port2, token2, err = api_server.start_server(port, token, _tools_provider, _chat_provider)
             if err:
                 messagebox.showerror("启动失败", err)
@@ -9123,7 +9124,6 @@ class AssistantApp:
             api_status.configure(text=f"运行中  http://127.0.0.1:{port2}  Token: {token2}")
             token_var.set(token2)
             self._flash_status("本地 API 沙箱已启动")
-
         bar = tk.Frame(api_frame, bg=t["panel"])
         bar.pack(fill="x", padx=4, pady=(0, 8))
         self._mk_button(bar, "启动/停止", _toggle_api, fsz=9, kind="primary").pack(side="left")
