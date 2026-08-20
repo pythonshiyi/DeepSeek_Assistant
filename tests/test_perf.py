@@ -61,6 +61,9 @@ class PerfBase(unittest.TestCase):
     def setUp(self):
         self.app.busy = False
         self.app.stop_event = None
+        self.app._pending = {"thinking": "", "content": ""}
+        self.app._pending_tools = []
+        self.app._pending_tool_durations = []
         self.app.messages = [{"role": "system", "content": self.app.cfg["system_prompt"]}]
         self.app.blocks = []
         text = self.app.chat_text
@@ -84,6 +87,9 @@ class PerfBase(unittest.TestCase):
 
     def _simulate_round(self, turn_no):
         """模拟一轮完整生成：思考 → 工具 → 内容。"""
+        self.app._fold_ranges[self.app.chat_text] = []
+        self.app._fold_nums[self.app.chat_text] = []
+        self.app._cancel_paged_render()
         self.app._begin_assistant()
         for chunk in (f"思考{turn_no}a", f"思考{turn_no}b", f"思考{turn_no}c"):
             self.app._push_reasoning(chunk)
