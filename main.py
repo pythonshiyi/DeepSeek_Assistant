@@ -687,6 +687,7 @@ class AssistantApp:
             tm.add_command(label="🛠 工具中心", accelerator="Ctrl+Shift+T", command=self.show_tool_hub)
             tm.add_command(label="🧩 插件中心", accelerator="Ctrl+Shift+P", command=self.show_plugin_hub)
             tm.add_command(label="🧩 插件兼容性检查…", command=self.show_plugin_compat)
+            tm.add_command(label="⭐ 插件评分…", command=self.show_plugin_rating)
             tm.add_separator()
 
             # ── 账户与用量 ──
@@ -8631,6 +8632,53 @@ class AssistantApp:
         txt.insert("1.0", "\n".join(lines))
         txt.configure(state="disabled")
         self._footer_hint(footer, f"共 {len(plugins)} 个插件")
+        self._footer_btn(footer, "关闭", dialog.destroy)
+
+    def show_plugin_rating(self):
+        """插件评分：本地评分 + 备注（0-5 分）。"""
+        t = self._theme()
+        dialog, body, footer = self._dialog_shell(
+            "插件评分", 520, 420,
+            subtitle="为已安装插件打分（本地保存，0-5 分）",
+        )
+        plugins = plugins_mod.list_plugins(PLUGINS_DIR)
+        listbox = tk.Listbox(body, height=8, bg=t["input_bg"], fg=t["input_fg"],
+                             selectbackground=t["selection"], selectforeground=t["accent_text"],
+                             relief="flat", borderwidth=0, highlightthickness=0, exportselection=False)
+        listbox.pack(fill="both", expand=True, pady=(4, 8))
+        slugs = []
+        for p in plugins:
+            name = str((p.get("meta") or {}).get("name") or "?")
+            slug = str(p.get("slug") or "")
+            summary = plugins_mod.plugin_rating_summary(PLUGINS_DIR, slug) or {}
+            avg = summary.get("avg", "-") if summary else "-"
+            cnt = summary.get("count", 0) if summary else 0
+            listbox.insert("end", f"{name}（平均 {avg} · {cnt} 次）")
+            slugs.append(slug)
+        row = tk.Frame(body, bg=t["panel"])
+        row.pack(fill="x")
+        self._lbl(row, "评分(0-5)：", role="label_sec", bg="panel").pack(side="left")
+        score_var = tk.StringVar(value="5")
+        ttk.Entry(row, textvariable=score_var, width=4).pack(side="left", padx=(4, 0))
+        self._lbl(row, "  备注（可选）：", role="label_sec", bg="panel").pack(side="left", padx=(8, 0))
+        review_var = tk.StringVar()
+        ttk.Entry(row, textvariable=review_var).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        def _save():
+            sel = listbox.curselection()
+            if not sel or sel[0] >= len(slugs):
+                self._toast("请先选择一个插件")
+                return
+            ok, err = plugins_mod.save_rating(PLUGINS_DIR, slugs[sel[0]], score_var.get(), review_var.get().strip())
+            if ok:
+                self._flash_status("评分已保存")
+                dialog.destroy()
+            else:
+                messagebox.showerror("保存失败", err)
+
+        bar = tk.Frame(body, bg=t["panel"])
+        bar.pack(fill="x", pady=(8, 0))
+        self._mk_button(bar, "保存评分", _save, kind="primary", fsz=9).pack(side="right")
         self._footer_btn(footer, "关闭", dialog.destroy)
 
     def show_tool_hub(self):

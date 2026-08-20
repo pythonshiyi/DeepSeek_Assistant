@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tool_sdk
 import api_server
+import plugins
 
 
 class TestToolSDK:
@@ -59,3 +60,16 @@ class TestAPIServer:
                 assert r.status == 200
         finally:
             api_server.stop_server()
+
+
+class TestPluginRating:
+    def test_save_and_summary(self, tmp_path):
+        plugins_dir = str(tmp_path)
+        ok, err = plugins.save_rating(plugins_dir, "my_plug", 5, "好用")
+        assert ok, err
+        ok2, _ = plugins.save_rating(plugins_dir, "my_plug", 4)
+        assert ok2
+        summary = plugins.plugin_rating_summary(plugins_dir, "my_plug")
+        assert summary is not None
+        assert summary["count"] == 2
+        assert summary["avg"] == 4.5

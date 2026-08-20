@@ -310,3 +310,55 @@ def missing_requires(plugin):
         except (ImportError, ValueError):
             missing.append(pkg)
     return missing
+
+
+def _ratings_path(plugins_dir):
+    return os.path.join(plugins_dir or "", "ratings.json")
+
+
+def load_ratings(plugins_dir):
+    """读取本地插件评分：{slug: {score, count, reviews: [...]}}。"""
+    try:
+        path = _ratings_path(plugins_dir)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        logger.exception("读取插件评分失败")
+    return {}
+
+
+def save_rating(plugins_dir, slug, score, review=""):
+    """写入/追加一条评分（0-5 分）。返回 (ok, error)。"""
+    try:
+        score = max(0, min(5, int(score)))
+    except (TypeError, ValueError):
+        return False, "评分必须是 0-5 的整数"
+    try:
+        ratings = load_ratings(plugins_dir)
+        entry = ratings.setdefault(slug, {"score": 0, "count": 0, "reviews": []})
+        if review:
+            entry["reviews"].append(str(review)[:500])
+            entry["reviews"] = entry["reviews"][-50:]
+        entry["count"] = int(entry.get("count", 0)) + 1
+        prev = int(entry.get("score", 0))
+        entry["score"] = prev + score
+        path = _ratings_path(plugins_dir)
+        atomic = _write_json(path, ratings)
+        if not atomic:
+            return False, "评分文件写入失败"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def plugin_rating_summary(plugins_dir, slug):
+    """返回插件平均分与评分次数。"""
+    ratings = load_ratings(plugins_dir)
+    entry = ratings.get(slug)
+    if not entry or not int(entry.get("count", 0)):
+        return None
+    avg = round(int(entry.get("score", 0)) / int(entry["count"]), 1)
+    return {"avg": avg, "count": int(entry["count"])}
