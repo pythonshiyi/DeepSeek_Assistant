@@ -20,11 +20,13 @@ class CappedList(list):
     """有上限的 list：append/extend 后自动裁剪超出部分。
 
     摊还 O(1)：超限时一次删掉超出的部分（del 头删为 O(n)，逐条删是 O(n²)）。
+    on_trim：发生裁剪时的回调（无参），用于向用户提示早期内容被裁剪。
     """
 
-    def __init__(self, items=(), maxlen=MAX_BLOCKS):
+    def __init__(self, items=(), maxlen=MAX_BLOCKS, on_trim=None):
         super().__init__(items)
         self.maxlen = maxlen
+        self.on_trim = on_trim
         self._trim()
 
     def append(self, item):
@@ -34,6 +36,11 @@ class CappedList(list):
     def _trim(self):
         if len(self) > self.maxlen:
             del self[: len(self) - self.maxlen]
+            if self.on_trim is not None:
+                try:
+                    self.on_trim()
+                except Exception:
+                    pass
 
     def extend(self, items):
         super().extend(items)

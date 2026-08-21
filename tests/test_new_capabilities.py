@@ -15,6 +15,7 @@ import main as m
 import permissions
 import stats
 import tokens
+from uiutils import CappedList
 
 
 class TestCronMatch(unittest.TestCase):
@@ -834,6 +835,190 @@ class TestToolsDefinitionEstimate(unittest.TestCase):
         self.app.messages[-1]["content"] = "今天天气怎么样"
         v2 = self.app._tools_definition_tokens()
         self.assertNotEqual(v1, v2)
+
+
+class TestChatViewOptimization(unittest.TestCase):
+    """聊天体验优化：早期折叠 / 重建增量跳过 / 分帧中断补渲染 / 裁剪提示 / hover 精确清理。"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import tkinter as tk
+
+            _probe = tk.Tk()
+            _probe.destroy()
+        except Exception:
+            raise unittest.SkipTest("tkinter 不可用")
+        cls.tmpdir = tempfile.mkdtemp(prefix="dsa_view_")
+        m.CONFIG_PATH = os.path.join(cls.tmpdir, "config.json")
+        m.HISTORY_DIR = cls.tmpdir
+        m.SNAPSHOT_PATH = os.path.join(cls.tmpdir, "snap.json")
+        m.SESSIONS_DIR = os.path.join(cls.tmpdir, "sessions")
+        m.STATS_PATH = os.path.join(cls.tmpdir, "stats.json")
+        m.PROMPTS_PATH = os.path.join(cls.tmpdir, "prompts.json")
+        m.USER_TOOLS_PATH = os.path.join(cls.tmpdir, "ut.json")
+        m.ARCHIVES_DIR = os.path.join(cls.tmpdir, "archives")
+        m.CLEAN_EXIT_FLAG = os.path.join(cls.tmpdir, ".clean_exit")
+        os.makedirs(m.SESSIONS_DIR, exist_ok=True)
+        os.makedirs(m.ARCHIVES_DIR, exist_ok=True)
+        with open(m.CLEAN_EXIT_FLAG, "w", encoding="utf-8") as f:
+            f.write("ok")
+        with open(m.CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"welcomed": True, "restore_session": False}, f)
+        cls.root = tk.Tk()
+        cls.root.withdraw()
+        cls.app = m.AssistantApp(cls.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.app.on_close()
+        except Exception:
+            pass
+        try:
+            cls.root.destroy()
+        except Exception:
+            pass
+
+    def setUp(self):
+        self.app.messages = [{"role": "system", "content": self.app.cfg["system_prompt"]}]
+        self.app.blocks = CappedList()
+        self.app._current.pop("_early_expanded", None)
+        self.app._current.pop("_early_snapshot", None)
+        self.app._current.pop("_trim_note_shown", None)
+        self.app._current.pop("render_incomplete", None)
+        self.app._paged_render = None
+        self.app._paged_render_after = None
+
+    def test_fold_early_default_threshold(self):
+        self.assertEqual(int(m.DEFAULT_CONFIG.get("fold_early_threshold", 0)), 1200)
+
+    def test_fold_early_bounds_document(self):
+        """超阈值：只保留最近 threshold 块 + 折叠提示；早期内容入快照。"""
+        self.app.cfg["fold_early_threshold"] = 1200
+        blocks = CappedList(
+            [("note", f"早期内容 {i}\n", "time") for i in range(1500)]
+            + [("plain", "\n")]
+        )
+        folded = self.app._fold_early_view(blocks)
+        self.assertEqual(folded[0][0], "note")
+        self.assertIn("早期内容已折叠", folded[0][1])
+        self.assertEqual(len(folded), 1 + 1200)  # 提示 + 最近 1200 块
+        self.assertTrue(self.app._current["_early_snapshot"])
+        # 展开后不再折叠
+        self.app._current["_early_expanded"] = True
+        self.assertIs(self.app._fold_early_view(blocks), blocks)
+
+    def test_fold_early_under_threshold_unchanged(self):
+        self.app.cfg["fold_early_threshold"] = 1200
+        blocks = CappedList([("note", "x\n", "time"), ("plain", "\n")])
+        self.assertIs(self.app._fold_early_view(blocks), blocks)
+        self.assertNotIn("_early_snapshot", self.app._current)
+
+    def test_rebuild_incremental_skip(self):
+        """未改动会话重建 → 增量比较命中，跳过全量重渲染。"""
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "你好", "time": "10:00:01"},
+            {"role": "assistant", "content": "你好！有什么可以帮你？", "time": "10:00:02"},
+        ]
+        self.app.messages = msgs
+        with mock.patch.object(self.app, "_render_all") as render:
+            self.app.rebuild_view_from_messages()
+            self.assertTrue(render.called)  # 首次必然渲染
+        # 相同内容再次重建：时间戳/格式一致 → 跳过
+        with mock.patch.object(self.app, "_render_all") as render:
+            self.app.rebuild_view_from_messages()
+            self.assertFalse(render.called)
+
+    def test_rebuild_content_format_matches_streaming(self):
+        """重建的 content/thinking 块与流式块同构（无尾换行，时间戳一致）。"""
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi", "time": "10:00:01"},
+            {"role": "assistant", "content": "ok", "reasoning_content": "想一下", "time": "10:00:02"},
+        ]
+        self.app.messages = msgs
+        self.app.rebuild_view_from_messages()
+        kinds = [b[0] for b in self.app.blocks]
+        self.assertIn("content", kinds)
+        content_blk = next(b for b in self.app.blocks if b[0] == "content")
+        self.assertEqual(content_blk[1], "ok")  # 无尾换行，与流式一致
+        thinking_blk = next(b for b in self.app.blocks if b[0] == "thinking")
+        self.assertEqual(thinking_blk[1], "想一下")
+        header_blk = next(b for b in self.app.blocks if b[0] == "note" and "助手" in b[1])
+        self.assertIn("10:00:02", header_blk[1])
+        user_hdr = next(b for b in self.app.blocks if b[0] == "note" and "我" in b[1])
+        self.assertIn("10:00:01", user_hdr[1])
+
+    def test_cappedlist_trim_callback(self):
+        from uiutils import CappedList as _CL
+
+        calls = []
+        c = _CL(maxlen=3, on_trim=lambda: calls.append(1))
+        for i in range(5):
+            c.append(i)
+        self.assertEqual(len(c), 3)
+        self.assertEqual(c, [2, 3, 4])
+        self.assertEqual(len(calls), 2)  # 第 4、5 次 append 触发裁剪回调
+
+    def test_trim_note_once(self):
+        """blocks 裁剪回调：提示只出现一次。"""
+        self.app._on_blocks_trimmed()
+        self.app._on_blocks_trimmed()
+        notes = [b for b in self.app.blocks if b[0] == "note" and "视图上限" in b[1]]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(self.app._current.get("_trim_note_shown"))
+
+    def test_render_incomplete_flag_on_cancel(self):
+        """分帧渲染被放弃 → 会话标记未完成；同步渲染完成 → 清除。"""
+        # 块数超过 PAGED_RENDER_SIZE（250）：首帧不会同步完成，标记保持 True
+        blocks = CappedList([("note", f"x{i}\n", "time") for i in range(251)])
+        self.app._render_blocks_paged(self.app.chat_text, blocks, [])
+        self.assertTrue(self.app._current.get("render_incomplete"))
+        self.app._cancel_paged_render()
+        self.assertTrue(self.app._current.get("render_incomplete"))
+        # 同步渲染完成清除标记
+        self.app._render_all(paged=False)
+        self.assertFalse(self.app._current.get("render_incomplete"))
+
+    def test_show_session_text_schedules_completion(self):
+        """切回未完成渲染的会话 → 自动调度补渲染。"""
+        self.app._current["render_incomplete"] = True
+        with mock.patch.object(self.app.root, "after") as after:
+            self.app._show_session_text(self.app._current)
+            scheduled = [a[0] for a in after.call_args_list if a[0] and a[0][0] == 30]
+            self.assertTrue(scheduled)
+
+    def test_hover_clear_precise_range(self):
+        """hover 高亮按上次区间精确移除（不触发全文档扫描）。"""
+        text = self.app.chat_text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", "第一行\n第二行\n")
+        text.tag_add("msg_hover", "1.0", "2.0")
+        self.app._hover_msg_range = ("1.0", "2.0")
+        self.app._clear_msg_hover(text)
+        self.assertEqual(text.tag_ranges("msg_hover"), ())
+        text.configure(state="disabled")
+
+    def test_stop_button_only_during_generation(self):
+        """停止按钮仅在生成中出现（C 位），完成即消失；发送钮常驻。"""
+        app = self.app
+        # 初始：停止未管理，发送已管理
+        self.assertEqual(app.btn_stop.winfo_manager(), "")
+        self.assertEqual(app.btn_send.winfo_manager(), "pack")
+        # 生成中：停止出现，且 pack 顺序在发送之前（更靠右 = C 位）
+        app._set_busy(True)
+        self.assertEqual(app.btn_stop.winfo_manager(), "pack")
+        foot = app.btn_send.master
+        order = list(foot.pack_slaves())
+        self.assertLess(order.index(app.btn_stop), order.index(app.btn_send))
+        # 完成：停止消失，发送保持，呼吸动画终止
+        app._set_busy(False)
+        self.assertEqual(app.btn_stop.winfo_manager(), "")
+        self.assertEqual(app.btn_send.winfo_manager(), "pack")
+        self.assertIsNone(app._stop_pulse_after)
 
 
 if __name__ == "__main__":

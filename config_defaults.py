@@ -151,7 +151,7 @@ DEFAULT_CONFIG = {
     "json_output": False,
     "beta_api": False,
     "peak_warning": True,
-    "fold_early_threshold": 0,
+    "fold_early_threshold": 1200,  # 早期消息折叠阈值（块数，超过折叠为可点击展开提示；0=关闭）
     "current_profile": "",
     "notify_on_done": True,  # 初始完成通知开启
     "ssrf_trusted": [],

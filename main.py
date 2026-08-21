@@ -199,7 +199,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.26.1"
+VERSION = "2.26.2"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -311,11 +311,30 @@ class AssistantApp:
 
     @property
     def blocks(self):
-        return self._ensure_current()["blocks"]
+        s = self._ensure_current()
+        b = s["blocks"]
+        if isinstance(b, CappedList) and b.on_trim is None:
+            b.on_trim = self._on_blocks_trimmed
+        return b
 
     @blocks.setter
     def blocks(self, value):
+        if isinstance(value, CappedList) and value.on_trim is None:
+            value.on_trim = self._on_blocks_trimmed
         self._ensure_current()["blocks"] = value
+
+    def _on_blocks_trimmed(self):
+        """blocks 超上限被裁剪（折叠开启后极罕见）：给出可见提示，不再静默丢失。"""
+        try:
+            session = self._current
+            if session.get("_trim_note_shown"):
+                return
+            session["_trim_note_shown"] = True
+            note = "[提示] 会话内容极长，最早的消息已超出视图上限（数据仍完整保留，可导出查看）。\n"
+            self._append(note, "time")
+            self.blocks.append(("note", note, "time"))
+        except Exception:
+            pass
 
     def __init__(self, root):
         global FONT_FAMILY
@@ -3301,31 +3320,47 @@ class AssistantApp:
         self.btn_dir.pack(side="left", padx=(6, 0))
         self.btn_attach = self._mk_button(foot, "🖼 图片", self._attach_images_dialog, fsz=9)
         self.btn_attach.pack(side="left", padx=(6, 0))
-        self.btn_stop = self._mk_button(foot, "■ 停止", self.stop_generate, kind="danger", fsz=10)
-        self.btn_stop.configure(state="disabled")
-        self.btn_stop.pack(side="right")
-        self.btn_send = self._mk_button(foot, "发送", self.send, kind="primary", fsz=10)
-        self.btn_send.pack(side="right")
-        # 圆形发送键：声呐青圆底 + 纸飞机，hover 放大微动效（替换上面的文字按钮）
-        self.btn_send.destroy()
-        self._send_canvas = tk.Canvas(
-            foot, width=30, height=30, bg=t["panel"], highlightthickness=0, bd=0,
+        # ---- 右侧操作钮：发送（C 位常驻）+ 停止（仅生成中出现，红色脉冲）----
+        # 圆形发送键：声呐青圆底 + 纸飞机，hover 放大微动效
+        self.btn_send = tk.Canvas(
+            foot, width=34, height=34, bg=t["panel"], highlightthickness=0, bd=0,
             cursor="hand2",
         )
-        self._restyle.append((self._send_canvas, "panel"))
-        self._send_circle = self._send_canvas.create_oval(
-            2, 2, 28, 28, fill=t["accent"], outline="", tags="c"
+        self._restyle.append((self.btn_send, "panel"))
+        self._send_circle = self.btn_send.create_oval(
+            3, 3, 31, 31, fill=t["accent"], outline="", tags="c"
         )
-        self._send_icon = self._send_canvas.create_text(
-            15, 15, text="➤", fill=t["accent_text"], font=(FONT_FAMILY, 11, "bold"), tags="t"
+        self._send_icon = self.btn_send.create_text(
+            17, 17, text="➤", fill=t["accent_text"], font=(FONT_FAMILY, 13, "bold"), tags="t"
         )
-        self._send_canvas.tag_bind("c", "<Button-1>", lambda e: self.send())
-        self._send_canvas.tag_bind("t", "<Button-1>", lambda e: self.send())
-        self._send_canvas.tag_bind("c", "<Enter>", lambda e: self._send_btn_hover(True))
-        self._send_canvas.tag_bind("t", "<Enter>", lambda e: self._send_btn_hover(True))
-        self._send_canvas.tag_bind("c", "<Leave>", lambda e: self._send_btn_hover(False))
-        self._send_canvas.tag_bind("t", "<Leave>", lambda e: self._send_btn_hover(False))
-        self.btn_send = self._send_canvas
+        self.btn_send.tag_bind("c", "<Button-1>", lambda e: self.send())
+        self.btn_send.tag_bind("t", "<Button-1>", lambda e: self.send())
+        self.btn_send.tag_bind("c", "<Enter>", lambda e: self._send_btn_hover(True))
+        self.btn_send.tag_bind("t", "<Enter>", lambda e: self._send_btn_hover(True))
+        self.btn_send.tag_bind("c", "<Leave>", lambda e: self._send_btn_hover(False))
+        self.btn_send.tag_bind("t", "<Leave>", lambda e: self._send_btn_hover(False))
+        # 圆形停止键：红色底 + 白色停止方块，仅在 AI 生成中出现（占据 C 位），
+        # 生成结束自动消失，让出发送键回归主位
+        self.btn_stop = tk.Canvas(
+            foot, width=34, height=34, bg=t["panel"], highlightthickness=0, bd=0,
+            cursor="hand2",
+        )
+        self._restyle.append((self.btn_stop, "panel"))
+        self._stop_circle = self.btn_stop.create_oval(
+            3, 3, 31, 31, fill=t["error"], outline="", tags="c"
+        )
+        self._stop_icon = self.btn_stop.create_rectangle(
+            12, 12, 22, 22, fill=t["accent_text"], outline="", tags="t"
+        )
+        self.btn_stop.tag_bind("c", "<Button-1>", lambda e: self.stop_generate())
+        self.btn_stop.tag_bind("t", "<Button-1>", lambda e: self.stop_generate())
+        self.btn_stop.tag_bind("c", "<Enter>", lambda e: self._stop_btn_hover(True))
+        self.btn_stop.tag_bind("t", "<Enter>", lambda e: self._stop_btn_hover(True))
+        self.btn_stop.tag_bind("c", "<Leave>", lambda e: self._stop_btn_hover(False))
+        self.btn_stop.tag_bind("t", "<Leave>", lambda e: self._stop_btn_hover(False))
+        self._stop_visible = False
+        self._stop_pulse_after = None
+        # 默认只显示发送（C 位）；生成中由 _set_busy 换入停止钮
         self.btn_send.pack(side="right", padx=(6, 0), pady=1)
 
     def _search_bar(self):
@@ -3413,10 +3448,80 @@ class AssistantApp:
         try:
             t = self._theme()
             fill = t["accent_hover"] if on else t["accent"]
-            self._send_canvas.itemconfig(self._send_circle, fill=fill)
-            self._send_canvas.itemconfig(
-                self._send_icon, font=(FONT_FAMILY, 12 if on else 11, "bold")
+            self.btn_send.itemconfig(self._send_circle, fill=fill)
+            self.btn_send.itemconfig(
+                self._send_icon, font=(FONT_FAMILY, 13 if on else 12, "bold")
             )
+        except tk.TclError:
+            pass
+
+    def _stop_btn_hover(self, on):
+        """圆形停止键 hover：底色加深。"""
+        try:
+            t = self._theme()
+            base = t["error"]
+            # 简化调色：浅色主题取 error，深色取固定加深值，hover 统一变暗
+            fill = "#b93245" if on else base
+            if str(t.get("name", "")).startswith("深海"):
+                fill = "#d14a66" if on else base
+            self.btn_stop.itemconfig(self._stop_circle, fill=fill)
+        except tk.TclError:
+            pass
+
+    def _update_action_buttons(self):
+        """生成中：停止钮出现在 C 位（红、脉冲）；空闲：停止钮隐藏，发送钮回归 C 位。"""
+        try:
+            if self.busy:
+                if not getattr(self, "_stop_visible", False):
+                    self.btn_stop.pack(side="right", before=self.btn_send, padx=(0, 6), pady=1)
+                    self._stop_visible = True
+                self._start_stop_pulse()
+            else:
+                if getattr(self, "_stop_visible", False):
+                    self.btn_stop.pack_forget()
+                    self._stop_visible = False
+                self._stop_pulse()
+        except tk.TclError:
+            pass
+
+    def _start_stop_pulse(self):
+        """停止钮呼吸动画：生成期间轻微明暗交替，提示可中断。"""
+        try:
+            if self._stop_pulse_after is not None:
+                return
+            t = self._theme()
+            dark = "#b93245" if not str(t.get("name", "")).startswith("深海") else "#d14a66"
+            steps = [t["error"], dark, t["error"]]
+
+            def _tick(i=0):
+                try:
+                    if not getattr(self, "_stop_visible", False) or not self.busy:
+                        self._stop_pulse_after = None
+                        return
+                    if i < len(steps):
+                        self.btn_stop.itemconfig(self._stop_circle, fill=steps[i])
+                    if i >= len(steps):
+                        self._stop_pulse_after = None
+                        return
+                    self._stop_pulse_after = self.root.after(420, lambda: _tick(i + 1))
+                except tk.TclError:
+                    self._stop_pulse_after = None
+
+            _tick()
+        except tk.TclError:
+            pass
+
+    def _stop_pulse(self):
+        """停止呼吸动画终止：恢复常色。"""
+        if self._stop_pulse_after is not None:
+            try:
+                self.root.after_cancel(self._stop_pulse_after)
+            except Exception:
+                pass
+            self._stop_pulse_after = None
+        try:
+            t = self._theme()
+            self.btn_stop.itemconfig(self._stop_circle, fill=t["error"])
         except tk.TclError:
             pass
 
@@ -3705,8 +3810,13 @@ class AssistantApp:
             self.input_text.configure(fg=t["text_sec"])
         if getattr(self, "_send_circle", None) is not None:
             try:
-                self._send_canvas.itemconfig(self._send_circle, fill=t["accent"])
-                self._send_canvas.itemconfig(self._send_icon, fill=t["accent_text"])
+                self.btn_send.itemconfig(self._send_circle, fill=t["accent"])
+                self.btn_send.itemconfig(self._send_icon, fill=t["accent_text"])
+            except tk.TclError:
+                pass
+        if getattr(self, "_stop_circle", None) is not None:
+            try:
+                self.btn_stop.itemconfig(self._stop_circle, fill=t["error"])
             except tk.TclError:
                 pass
         self.btn_theme.configure(text="☀️ 浅色" if t is THEMES["dark"] else "🌙 深色")
@@ -4402,6 +4512,7 @@ class AssistantApp:
 
         def _on_chat_wheel(event):
             try:
+                self._last_wheel_ts = time.monotonic()  # 滚动中暂停 hover 浮条更新
                 if abs(event.delta) >= 120:
                     # 标准鼠标滚轮：每格滚动 3 行（Tk 默认步长），避免滚轮过于费力
                     text.yview_scroll(-3 * int(event.delta / 120), "units")
@@ -4742,6 +4853,19 @@ class AssistantApp:
             else:
                 self._show_welcome_page()
         self._update_chat_header()
+        # 上次分帧渲染未完成（中断/放弃）：切回时自动补渲染，消除「上面内容不加载」
+        if session.get("render_incomplete") and not self.busy:
+            target = session
+
+            def _complete_render():
+                # 期间可能已切到别的会话：仅当目标仍为当前会话且仍缺渲染时补
+                if self._current is target and target.get("render_incomplete"):
+                    self._render_all()
+
+            try:
+                self.root.after(30, _complete_render)
+            except Exception:
+                pass
 
     def _maybe_auto_name(self, text):
         session = self._current
@@ -9874,12 +9998,16 @@ class AssistantApp:
     def _append(self, text, tag=None):
         self._maybe_hide_welcome()
         if self._paged_render is not None:
-            # 分帧进行中：挂起追加，分帧完成后补插（同步补全渲染会冻结 UI 0.5-数秒）
-            self._pending_appends.append((text, tag))
+            # 分帧进行中：挂起追加（记录目标控件，分帧完成时按归属写入，
+            # 防止期间切换会话把内容插进错误的会话视图）
+            self._pending_appends.append((text, tag, self.chat_text))
             return
-        self.chat_text.configure(state="normal")
-        self.chat_text.insert("end", text, tag)
-        self.chat_text.configure(state="disabled")
+        self._append_to(self.chat_text, text, tag)
+
+    def _append_to(self, widget, text, tag=None):
+        widget.configure(state="normal")
+        widget.insert("end", text, tag)
+        widget.configure(state="disabled")
         self._ensure_follow()
 
     def _append_message_block(self, header, body, tag):
@@ -10806,6 +10934,7 @@ class AssistantApp:
     def _begin_assistant(self, resume=False):
         # 新一轮生成开始：无论此前浏览位置，强制回到底部跟随（发送=新交互）
         self._follow_bottom = True
+        self._stream_header_ts = None  # 视图助手头部时间戳（_finish 回填消息 time 用）
         # _finish 总会追加 ("plain","\n") 结尾，blocks[-1] 恒为 plain，
         # 续写判定须跳过 plain 找最近的实质块
         last_real = (
@@ -10818,6 +10947,7 @@ class AssistantApp:
             self._stream_block_start = len(self.blocks) - 1
         else:
             now = datetime.now().strftime("%H:%M:%S")
+            self._stream_header_ts = now
             header = f"[{now}] 助手\n"
             self._append(header, "time")
             self.blocks.append(("note", header))
@@ -11427,6 +11557,11 @@ class AssistantApp:
                 # 与 worker 的压缩/裁剪互斥：防「len 读取」与「del 切片」之间漂移
                 if self.messages and self.messages[-1].get("role") == "assistant":
                     msg_idx = len(self.messages) - 1
+                    # 时间戳对齐：消息 time 与视图头部一致 → 重建可命中增量跳过优化
+                    hdr_ts = getattr(self, "_stream_header_ts", None)
+                    if hdr_ts:
+                        self.messages[-1]["time"] = hdr_ts
+            self._stream_header_ts = None
             for i in range(block_start, len(self.blocks)):
                 blk = self.blocks[i]
                 if blk[0] == "content" and len(blk) > 2 and blk[2] is None:
@@ -11924,11 +12059,13 @@ class AssistantApp:
             pos = self._render_block(text, block, last_code_blocks, pos)
 
     def _fold_early_view(self, blocks):
-        """长会话惰性折叠：早期消息块折叠为一条提示（配置默认 0=关闭）。
+        """长会话惰性折叠：只保留最近的 threshold 个消息块，更早部分折叠为提示。
 
         只构造渲染视图，不修改 self.blocks 本身；折叠前块存入会话
-        `_early_snapshot`，点击提示后设置 `_early_expanded`（本次会话
+        `_early_snapshot`（标记用），点击提示后设置 `_early_expanded`（本次会话
         不再折叠）并全量重渲染。
+        文档体积被钳制在 ~threshold 块：长会话滚动轻量、切换重建快；
+        早期内容不丢失（可点击展开，数据仍在 messages/blocks 中）。
         """
         if self._current.get("_early_expanded"):
             return blocks
@@ -11937,9 +12074,10 @@ class AssistantApp:
             self._current.pop("_early_snapshot", None)
             return blocks
         keep = max(2, threshold)
-        self._current["_early_snapshot"] = list(blocks[:keep])
-        hint = f"⋯ 早期内容已折叠（{keep} 个消息块）⋯ 点击此处展开 ⋯\n"
-        return [("note", hint, "fold_hint")] + blocks[keep:]
+        folded_count = len(blocks) - keep
+        self._current["_early_snapshot"] = list(blocks[:folded_count])
+        hint = f"⋯ 早期内容已折叠（{folded_count} 个消息块）⋯ 点击此处展开 ⋯\n"
+        return [("note", hint, "fold_hint")] + blocks[-keep:]
 
     def _on_fold_early_click(self, _event=None):
         if self._current.pop("_early_snapshot", None) is None:
@@ -12004,12 +12142,23 @@ class AssistantApp:
         else:
             self._render_blocks(text, blocks, self._current["last_code_blocks"])
             text.configure(state="disabled")
+            self._current["render_incomplete"] = False  # 同步渲染完成
             self._follow_bottom = True
             text.see("end")
             self._sync_thinking_fold(text)
 
     def _cancel_paged_render(self):
-        """取消进行中的分帧渲染（新渲染/关闭/编辑前必须调用，防游标错位）。"""
+        """取消进行中的分帧渲染（新渲染/关闭/编辑前必须调用，防游标错位）。
+
+        若确有未完成的分帧渲染被放弃，给所属会话打「渲染未完成」标记：
+        _show_session_text 切回该会话时自动补渲染，避免 Text 与 blocks 分叉
+        （长会话部分渲染残留 = 用户看到的"上面的对话不加载"）。
+        """
+        state = self._paged_render
+        if state is not None:
+            owner = self._session_of_text(state.get("text"))
+            if owner is not None:
+                owner["render_incomplete"] = True
         self._paged_render = None
         if getattr(self, "_paged_render_after", None) is not None:
             try:
@@ -12019,6 +12168,7 @@ class AssistantApp:
             self._paged_render_after = None
 
     def _render_blocks_paged(self, text, blocks, last_code_blocks):
+        self._current["render_incomplete"] = True  # 分帧进行中：切走/中断可据此补渲染
         self._paged_render = {
             "text": text,
             "blocks": blocks,
@@ -12027,6 +12177,13 @@ class AssistantApp:
             "idx": 0,
         }
         self._paged_step()
+
+    def _session_of_text(self, text):
+        """按 Text 控件反查所属会话（分帧渲染可能属于非当前会话）。"""
+        for s in self._sessions:
+            if s.get("text") is text:
+                return s
+        return None
 
     def _paged_step(self):
         state = self._paged_render
@@ -12051,6 +12208,10 @@ class AssistantApp:
                 self._paged_render = None
                 self._paged_render_after = None
                 text.configure(state="disabled")
+                # 渲染完成：清除未完成标记（分帧可能属于非当前会话，按控件反查）
+                owner = self._session_of_text(text)
+                if owner is not None:
+                    owner["render_incomplete"] = False
                 # 分帧期间用户可能已切换会话：跟随只对渲染目标生效，别把新会话拉到底
                 if text is self.chat_text:
                     self._ensure_follow()
@@ -12081,8 +12242,17 @@ class AssistantApp:
             self.after(20, self._do_search)
         if self._pending_appends:
             todo, self._pending_appends = self._pending_appends, []
-            for t, tg in todo:
-                self._append(t, tg)
+            for item in todo:
+                t, tg = item[0], item[1]
+                w = item[2] if len(item) > 2 else None
+                try:
+                    if w is not None and w.winfo_exists():
+                        # 写入归属会话的控件（期间可能已切换会话）
+                        self._append_to(w, t, tg)
+                    else:
+                        self._append(t, tg)
+                except Exception:
+                    self._append(t, tg)
 
     def check_balance(self):
         cfg = self.save_widgets_to_config()
@@ -12251,7 +12421,8 @@ class AssistantApp:
         self.busy = busy
         # 发送按钮始终可用：生成中点击 = 打断当前生成并立即发送（README「发送即打断」）
         self.btn_send.configure(state="normal")
-        self.btn_stop.configure(state="normal" if busy else "disabled")
+        # 停止按钮只在生成中出现（C 位红钮 + 呼吸动画），完成即消失
+        self._update_action_buttons()
         if busy:
             note = "[正在生成...]\n"
             self._append(note, "time")
@@ -12719,7 +12890,10 @@ class AssistantApp:
             if role == "system":
                 continue
             if role == "user":
-                header = f"[{datetime.now():%H:%M:%S}] 用户\n"
+                # 时间戳优先用消息自带 time（确定性重建 → 增量跳过优化可命中）；
+                # 旧数据缺 time 时回退当前时间
+                ts = str(msg.get("time") or "") or datetime.now().strftime("%H:%M:%S")
+                header = f"[{ts}] 我\n"  # 与流式 _append_message_block("我",...) 一致
                 target.append(("note", header))
                 user_body = (msg.get("content") or "") + "\n"
                 for p in (msg.get("images") or []):
@@ -12730,12 +12904,16 @@ class AssistantApp:
                 target.append(("user", user_body))
                 target.append(("plain", "\n"))
             elif role == "assistant":
-                header = f"[{datetime.now():%H:%M:%S}] 助手\n"
+                ts = str(msg.get("time") or "") or datetime.now().strftime("%H:%M:%S")
+                header = f"[{ts}] 助手\n"
                 target.append(("note", header))
                 if msg.get("reasoning_content"):
-                    target.append(("thinking", msg["reasoning_content"] + "\n"))
+                    # 与流式 thinking 块一致（无尾换行）
+                    target.append(("thinking", msg["reasoning_content"]))
                 if msg.get("content"):
-                    target.append(("content", msg["content"] + "\n", i))
+                    # 与流式块一致（content 不带尾换行，后续 plain 块补 \n）：
+                    # 保证「未改动会话重建 → 增量跳过」可命中
+                    target.append(("content", msg["content"], i))
                 target.append(("plain", "\n"))
             elif role == "tool":
                 target.append(("toolresult", str(msg.get("content") or "")))
@@ -13863,13 +14041,17 @@ class AssistantApp:
 
         拖动选择期间（_mouse_down=True）禁止弹出任何 Toplevel，避免浮条
         拦截鼠标事件导致选区无法正常显示/完成。
+        开销优化：滚动刚结束前（150ms）跳过浮条更新（滚动时鼠标在动，
+        逐帧重建 Toplevel 是长对话滚动卡顿的主要来源之一）。
         """
         if getattr(self, "_mouse_down", False):
             return
         now = time.monotonic()
-        if now - self._hover_last_time < 0.05:  # 节流：约 20fps，避免高频率扫描消息索引
+        if now - self._hover_last_time < 0.1:  # 节流：100ms（滚动/移动开销控制）
             return
         self._hover_last_time = now
+        if now - getattr(self, "_last_wheel_ts", 0.0) < 0.15:
+            return  # 滚动中：不更新浮条/高亮，滚停后自动恢复
         try:
             text = self.chat_text
             idx = text.index(f"@{event.x},{event.y}")
@@ -13898,10 +14080,14 @@ class AssistantApp:
             self._hide_hover_bar()
 
     def _clear_msg_hover(self, text):
-        """移除消息悬停高亮。"""
+        """移除消息悬停高亮（仅按上次区间精确移除，避免全文档扫描）。"""
         try:
             if text is not None:
-                text.tag_remove("msg_hover", "1.0", "end")
+                rng = self._hover_msg_range
+                if rng:
+                    text.tag_remove("msg_hover", rng[0], rng[1])
+                else:
+                    text.tag_remove("msg_hover", "1.0", "end")
         except tk.TclError:
             pass
         self._hover_msg_range = None
@@ -13911,7 +14097,7 @@ class AssistantApp:
         try:
             cache_idx = getattr(self, "_hover_bar_idx", None)
             cache_pos = getattr(self, "_hover_bar_pos", None)
-            if cache_idx == msg_idx and cache_pos and abs(cache_pos[0] - x) < 8 and abs(cache_pos[1] - y) < 8:
+            if cache_idx == msg_idx and cache_pos and abs(cache_pos[0] - x) < 16 and abs(cache_pos[1] - y) < 16:
                 return
             self._hide_hover_bar()
             t = self._theme()

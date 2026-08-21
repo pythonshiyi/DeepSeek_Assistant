@@ -76,6 +76,7 @@
 - 会话导入导出：JSON/JSONL 导入，MD/TXT/HTML/JSONL 四格式导出（含图片附件引用）
 - 回复变体、继续生成（Beta）、FIM 补全、JSON 结构化输出
 - 1M 上下文：双阈值自动压缩 + LLM 摘要 + 裁剪内容归档，长对话不卡不贵
+- 长对话体验：早期消息自动折叠为「点击展开」提示（默认最近 ~400 条全量渲染），滚动丝滑、切换即时
 - 输入体验：token 实时估算、草稿持久化、剪贴板即问、输入历史、快捷键
 
 ### 🤖 Agent 智能体
@@ -144,7 +145,7 @@ python main.py
 1. 在 https://platform.deepseek.com 申请 API Key
 2. 启动后在顶部 "API Key" 输入框粘贴并保存（或编辑 `config.json`）
 
-主要配置项（config.json）：`model`（`deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`，亦支持任意 OpenAI 兼容模型）、`scenario`、`thinking`、`max_tokens`、`system_prompt`（保持固定可最大化缓存命中）、上下文压缩阈值、`monthly_budget`、`privacy_mode`、`theme`、`vision_self_review`（视觉自审开关）、`call_api_allowed_hosts`（内网白名单）等；权限/推送/数据库/邮件为独立配置文件（permissions.json / webhooks.json / db_config.json / email_config.json）。
+主要配置项（config.json）：`model`（`deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`，亦支持任意 OpenAI 兼容模型）、`scenario`、`thinking`、`max_tokens`、`system_prompt`（保持固定可最大化缓存命中）、上下文压缩阈值、`fold_early_threshold`（早期消息折叠阈值，默认 1200 块，0=关闭）、`monthly_budget`、`privacy_mode`、`theme`、`vision_self_review`（视觉自审开关）、`call_api_allowed_hosts`（内网白名单）等；权限/推送/数据库/邮件为独立配置文件（permissions.json / webhooks.json / db_config.json / email_config.json）。
 
 ## ⌨️ 常用快捷键
 
