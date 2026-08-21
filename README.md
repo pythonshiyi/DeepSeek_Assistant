@@ -1,4 +1,4 @@
-# 🐋 鲸语 WhaleTalk · AI 对话助手 / AI Desktop Assistant
+# 🐋 鲸语 WhaleTalk · AI 桌面智能体 / AI Desktop Agent
 
 [![CI](https://github.com/pythonshiyi/WhaleTalk/actions/workflows/ci.yml/badge.svg)](https://github.com/pythonshiyi/WhaleTalk/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/pythonshiyi/WhaleTalk?color=blue)](https://github.com/pythonshiyi/WhaleTalk/releases)
@@ -8,9 +8,9 @@
 
 > **中文为主 · English follows**（完整中文介绍 + 英文简介）
 
-**鲸语 WhaleTalk** 是一款为 DeepSeek V4 API 深度优化的 Windows 桌面 AI 对话助手——不只是聊天窗口，而是一个**能自主完成任务、能扩展能力、能自我进化**的 AI 工作台。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
+**鲸语 WhaleTalk** 是一款为 DeepSeek V4 API 深度优化的 Windows 桌面 AI 智能体——不只是聊天窗口，而是一个**能看、能听、能干、能扩展、能自我进化**的 AI 工作台：看得见屏幕与图片（多模态），听得见语音，说得出人话（TTS），动得了鼠标键盘与浏览器，写得了代码文档，联得了数据库邮件 IM，记得住你的偏好，还会自己造插件。**鲸语是独立产品品牌，与 DeepSeek 官方无任何关联**。
 
-*WhaleTalk is a Windows desktop AI assistant deeply optimized for the DeepSeek V4 API — not just a chat window, but an AI workbench that executes tasks autonomously, extends itself with plugins, and evolves its own codebase. WhaleTalk is an independent product brand with no affiliation to DeepSeek.*
+*WhaleTalk is a Windows desktop AI agent deeply optimized for the DeepSeek V4 API — not just a chat window, but an AI workbench that sees, hears, acts, extends itself, and evolves. WhaleTalk is an independent product brand with no affiliation to DeepSeek.*
 
 > 🌐 **官网 / Website：https://whaletalk.top/**
 
@@ -30,10 +30,11 @@
 
 ## 项目介绍
 
-鲸语以「**深度适配 DeepSeek V4**」为设计原点，把 V4 的 Agent 能力、1M 上下文、峰谷定价、前缀缓存等特性转化为真正可用的桌面体验：
+鲸语以「**深度适配 DeepSeek V4**」为设计原点，把 V4 的 Agent 能力、多模态视觉、1M 上下文、峰谷定价、前缀缓存等特性转化为真正可用的桌面体验：
 
+- **感知层**：👁 多模态视觉（图片输入/图表解读/报错诊断/前端还原/批量分析）、🎙 语音输入输出、📋 剪贴板、🖥 屏幕截图
 - **对话层**：流式思考与回答、Markdown 实时渲染、多会话管理、上下文智能压缩
-- **执行层**：100+ 内置工具（搜索/代码/文件/数据/浏览器/邮件/多媒体），权限模型与审批流
+- **执行层**：109 个内置工具（搜索/代码/文件/数据/浏览器/邮件/多媒体/桌面 RPA），权限模型与审批流
 - **扩展层**：插件体系（工具/技能/流程/场景），AI 造插件，零代码扩展能力
 - **进化层**：自我审查、改进提案、经验复盘——越用越聪明
 
@@ -43,13 +44,28 @@
 
 | | 亮点 | 说明 |
 |---|---|---|
+| 👁 | **多模态视觉闭环** | 支持视觉模型 `deepseek-v4-flash-vision-exp`：聊天可直接发图（按钮/拖拽/剪贴板粘贴），`screen_see` 截图看图一步完成——AI 看得见屏幕，操作后自查验证，真正"眼手并用" |
 | 🧩 | **插件体系（.wtplugin）** | 工具/技能/流程/场景组合成单个 JSON 文件，导入即用、可分享；**插件工坊**里描述需求，AI 自动生成并安装插件 |
-| 🤖 | **100+ Agent 工具** | 联网搜索（多引擎聚合）、代码执行、文件操作、数据库、浏览器、邮件、多媒体……自动编排、失败自愈 |
+| 🤖 | **109 个 Agent 工具** | 联网搜索（多引擎聚合）、代码执行、文件操作、数据库、浏览器、邮件、桌面 RPA、图像生成/理解……自动编排、失败自愈 |
 | 🧬 | **自我进化** | 鲸语能阅读自己的代码、提交改进提案、自我审查并产出报告——由你决定是否采纳 |
 | ✍ | **公众号自动写作** | 多信源采集 → 选题 → 三阶段写作 → 质量门禁 → 存草稿箱（只产草稿，发布权在你） |
 | 💰 | **成本工程** | 前缀缓存命中率 ~99%、思考成本剥离、峰谷错峰执行、预算控制——用最少的钱干最多的活 |
 
 ## 📦 功能特性
+
+### 👁 多模态与图像理解
+
+- **视觉模型支持**：`deepseek-v4-flash-vision-exp`（模型下拉可选，纯文本能力与 Flash 正式版持平）
+- **聊天直接发图**：输入区「🖼 图片」按钮 / 拖拽图片 / Ctrl+Alt+V 粘贴剪贴板图片，可一次附加多张（JPEG/PNG/GIF/WebP，单张 ≤32MB）；发送时自动切换视觉模型，无需手动操作
+- **看屏幕（视觉 Agent 闭环）**：`screen_see` 截图 + 看图一步完成——AI 看清界面后点击/输入/验证，桌面与浏览器自动化"看得见、能自查"；智能模式内置"操作后视觉自检"准则
+- **截图即服务**：
+  - `chart_read`：图表截图 → 结构化数据 + 解读
+  - `screenshot_to_html`：UI 截图 → HTML/CSS 前端还原
+  - `debug_screenshot`：报错截图 → 错误识别 + 诊断修复建议
+  - `scan_read`：扫描件/文档图片 → Markdown（图表/公式/手写/印刷混排）
+- **批量视觉分析**：`image_batch` 文件夹内图片小并发逐张理解 → 汇总报告
+- **自我审图（可选）**：开启 `vision_self_review` 后，AI 生成图片/图表/截图会自动"看图→审阅→修改/重生成"，形成创作自检闭环（默认关闭控成本）
+- `image_understand`：任意图片自动理解，当前模型不支持视觉时自动改用视觉模型
 
 ### 💬 对话体验
 
@@ -57,19 +73,21 @@
 - 流式 Markdown 渲染：粗体/代码/链接/表格即时呈现，未闭合标记智能暂缓
 - 思考模式全档位（none/low/medium/high/xhigh/max + auto 智能路由）
 - 多会话管理：置顶/标签/搜索/收藏/分支对话/临时会话/历史会话库懒加载
-- 会话导入导出：JSON/JSONL 导入，MD/TXT/HTML/JSONL 四格式导出
+- 会话导入导出：JSON/JSONL 导入，MD/TXT/HTML/JSONL 四格式导出（含图片附件引用）
 - 回复变体、继续生成（Beta）、FIM 补全、JSON 结构化输出
 - 1M 上下文：双阈值自动压缩 + LLM 摘要 + 裁剪内容归档，长对话不卡不贵
 - 输入体验：token 实时估算、草稿持久化、剪贴板即问、输入历史、快捷键
 
 ### 🤖 Agent 智能体
 
-- **100+ 内置工具**，按 14 组分类管理，可单独启停
+- **109 个内置工具**，按 14 组分类管理，可单独启停
   - 信息：多引擎联网搜索（num/翻页/时间/站点过滤，引擎健康度自动降级）、GitHub 仓库搜索（org:/language: 原生语法）、实时热点（Hacker News）、网页全文抓取（含被墙站点代理通道）、RSS 订阅（精选预置源）
   - 执行：沙箱 Python、终端命令、进程管理、pip 安装、代码工程创建
   - 数据：SQLite/MySQL/PostgreSQL、CSV/Excel、图表、KV 存储、WebDAV
-  - 文档：PDF 提取/生成、Word/PPT 读取、二维码、音视频处理、图片生成/理解/OCR
-  - 通讯：邮件收发、桌面通知、Webhook 推送/接收
+  - 文档：PDF 提取/生成、Word/PPT 读取、二维码、音视频处理
+  - 媒体：图像生成/理解/处理、屏幕截图与 OCR、语音转文字、TTS
+  - 桌面：RPA（点击/输入/快捷键/滚动/截图）、浏览器可视操作
+  - 通讯：邮件收发、桌面通知、Webhook 推送/接收、IM（Telegram/企业微信）
   - 协作：并行子代理、任务检查点（断点续跑）、流程编排、工作流
   - 环境：系统资源自检（CPU/内存/磁盘/网络连通性）
 - **通用 API 调用**（call_api）：对接任意开放 API，支持自定义请求头/JSON 体（超时 180s/响应 500KB，内网白名单配置）
@@ -100,11 +118,6 @@
 - 长期记忆 + 知识库（本地 RAG 语义检索）+ 项目任务记录
 - 用量统计与预算控制：按天/模型累计 token 与费用、缓存命中省钱报告
 
-### 🎙️ 多媒体
-
-- 语音：TTS 朗读、语音转文字（离线 whisper）、图片理解、屏幕截图/OCR
-- 图像：生成（OpenAI 兼容）、处理（缩放/裁剪/水印）、多模态理解
-
 ### 🎨 个性化与体验
 
 - 主题：浅色 / 纯黑；字号/行距/面板布局可调，屏幕自适应（1080p/2K/4K）
@@ -131,7 +144,7 @@ python main.py
 1. 在 https://platform.deepseek.com 申请 API Key
 2. 启动后在顶部 "API Key" 输入框粘贴并保存（或编辑 `config.json`）
 
-主要配置项（config.json）：`model`（deepseek-v4-flash / deepseek-v4-pro，亦支持任意 OpenAI 兼容模型）、`scenario`、`thinking`、`max_tokens`、`system_prompt`（保持固定可最大化缓存命中）、上下文压缩阈值、`monthly_budget`、`privacy_mode`、`theme`、`call_api_allowed_hosts`（内网白名单）等；权限/推送/数据库/邮件为独立配置文件（permissions.json / webhooks.json / db_config.json / email_config.json）。
+主要配置项（config.json）：`model`（`deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`，亦支持任意 OpenAI 兼容模型）、`scenario`、`thinking`、`max_tokens`、`system_prompt`（保持固定可最大化缓存命中）、上下文压缩阈值、`monthly_budget`、`privacy_mode`、`theme`、`vision_self_review`（视觉自审开关）、`call_api_allowed_hosts`（内网白名单）等；权限/推送/数据库/邮件为独立配置文件（permissions.json / webhooks.json / db_config.json / email_config.json）。
 
 ## ⌨️ 常用快捷键
 
@@ -143,6 +156,8 @@ python main.py
 | Ctrl+K | 命令面板 |
 | Ctrl+Shift+T / Ctrl+Shift+P | 工具中心 / 插件中心 |
 | Ctrl+Shift+Q | 剪贴板即问 |
+| **Ctrl+Alt+V** | **粘贴剪贴板图片（视觉输入）** |
+| **🖼 图片按钮** | **选择本地图片附加发送（可拖拽）** |
 | Ctrl+↑/↓ | 调整输入框高度 |
 | F11 | 全屏 |
 | Alt+F/E/V/T/A/S/H | 顶级菜单直达 |
@@ -151,7 +166,8 @@ python main.py
 
 - **API Key**：Windows DPAPI 加密存储（fail-closed，明文永不落盘）
 - **权限模型**：行动能力默认全关；目录白名单 + 系统目录阻止列表；路径 resolve 防穿越；命令白名单/黑名单；审批流 + 审计日志（10MB 轮转）
-- **SSRF 防护**：URL 抓取/API 调用拦截内网与云元数据地址，DNS 重绑定防护；本地服务可通过显式白名单放行
+- **SSRF 防护**：URL 抓取/API 调用拦截内网与云元数据地址，DNS 重绑定防护；本地服务可通过显式白名单放行（图片 URL 输入同样校验）
+- **图片安全**：图片内联单张 ≤32MB、总量受限；批量分析强制目录边界校验（防路径穿越越界读取）
 - **沙箱执行**：run_python 静态 AST 检查 + 隔离模式运行
 - **搜索结果过滤**：危险链接（javascript:/file:/回环）一律剔除
 - **隐私模式**：一键开启后不保存任何快照/统计/日志
@@ -170,6 +186,7 @@ python main.py
 | 401 认证失败 | API Key 错误，检查 key |
 | 402 余额不足 | 前往充值页面充值 |
 | 429 限流 | 工具已自动重试 3 次，仍失败请降低请求频率 |
+| 发图报"模型不支持图片" | 已自动切换视觉模型；若仍失败请检查端点是否支持 `deepseek-v4-flash-vision-exp` |
 | Agent 循环 | 同工具重复调用 3 次自动终止；可调低 max_tool_rounds |
 | 深色标题栏不变黑 | Win10 需系统「应用模式」为深色；Win11 22H2+ 自动生效 |
 | 可选功能不可用 | 工具中心 → 依赖状态查看缺失项与安装命令 |
@@ -186,19 +203,21 @@ python main.py
 
 ## English Introduction
 
-### 🐋 WhaleTalk — AI Desktop Assistant (DeepSeek V4)
+### 🐋 WhaleTalk — AI Desktop Agent (DeepSeek V4, Multimodal)
 
-WhaleTalk (Chinese: 鲸语, "Whale Song") is a **Windows desktop AI chat assistant** built and deeply optimized around the **DeepSeek V4 API** — an AI workbench that executes tasks, extends itself, and evolves. **WhaleTalk is an independent product brand with no affiliation to DeepSeek.**
+WhaleTalk (Chinese: 鲸语, "Whale Song") is a **Windows desktop AI agent** built and deeply optimized around the **DeepSeek V4 API** — an AI workbench that **sees, hears, acts, extends itself, and evolves**. **WhaleTalk is an independent product brand with no affiliation to DeepSeek.**
 
 ### Highlights
 
+- **👁 Multimodal vision**: full support for the `deepseek-v4-flash-vision-exp` vision model. Attach images directly in chat (button / drag & drop / Ctrl+Alt+V clipboard paste, up to 32MB each), and the app auto-switches to the vision model for you. The **`screen_see`** tool combines screenshot + understanding in one call, closing the "see → act → verify" loop for desktop and browser automation.
+- **🖼 Screenshot-as-a-service**: `chart_read` (chart → structured data + insights), `screenshot_to_html` (UI screenshot → HTML/CSS), `debug_screenshot` (error screenshot → diagnosis + fix), `scan_read` (scanned documents → Markdown), `image_batch` (folder-level batch vision analysis). Optional `vision_self_review` lets the agent self-critique its own generated images/charts and iterate (off by default to control cost).
 - **🧩 Plugin system (`.wtplugin`)**: tools, skills, workflows, and scenarios bundled into a single shareable JSON file. The **Plugin Workshop** lets the AI generate and install a plugin from a natural-language request. Built-in gallery with 3 sample plugins.
-- **🤖 100+ Agent tools**: multi-engine web search (num/paging/time/site filters, engine health auto-degradation), GitHub search (org:/language: syntax), Hacker News realtime, page fetching (incl. blocked-site proxy channel), RSS presets, sandboxed Python, terminals, files, databases, browser automation, email, media, system self-check (CPU/memory/disk/network), and more — orchestrated automatically with self-healing on failure. A universal **call_api** tool connects to any public API (custom headers/JSON, 180s timeout, 500KB response, explicit intranet whitelist). Auto-reflection persists failed-task lessons into long-term memory so the AI avoids known pitfalls across sessions.
+- **🤖 109 Agent tools**: multi-engine web search (num/paging/time/site filters, engine health auto-degradation), GitHub search (org:/language: syntax), Hacker News realtime, page fetching (incl. blocked-site proxy channel), RSS presets, sandboxed Python, terminals, files, databases, browser automation, email, desktop RPA (click/type/hotkeys/screenshots), image generation/understanding/OCR, speech-to-text, TTS, system self-check (CPU/memory/disk/network), and more — orchestrated automatically with self-healing on failure. A universal **call_api** tool connects to any public API. Auto-reflection persists failed-task lessons into long-term memory so the AI avoids known pitfalls across sessions.
 - **🧬 Self-evolution**: reads its own codebase, writes improvement proposals (never touching original files), self-review reports with one-click adoption and rollback.
 - **✍ WeChat Writer**: multi-source collection → topic selection → 3-stage writing → quality gate → local drafts (publication stays in your hands).
 - **💰 Cost engineering**: ~99% prefix-cache hit rate, thinking-cost stripping, off-peak scheduling, budget control.
 - **Plugins, automation**: cron scheduling with catch-up, workflows, system tray, auto-start, daily briefings.
-- **Security**: DPAPI-encrypted API keys, default-deny permission model with approval flow and audit logs, SSRF protection with explicit local-service whitelist, sandboxed Python, privacy mode.
+- **Security**: DPAPI-encrypted API keys, default-deny permission model with approval flow and audit logs, SSRF protection with explicit local-service whitelist, sandboxed Python, image size/boundary enforcement, privacy mode.
 - **UI**: light/pure-black themes, screen-adaptive layout, command palette, F11 fullscreen, startup maximized.
 
 ### Quick Start
@@ -208,11 +227,11 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Requires **Python 3.9+ and Windows 10/11**. Get an API Key at https://platform.deepseek.com and paste it into the top field on first launch.
+Requires **Python 3.9+ and Windows 10/11**. Get an API Key at https://platform.deepseek.com and paste it into the top field on first launch. Select `deepseek-v4-flash-vision-exp` from the model dropdown to enable image input.
 
 ### Tech Stack
 
-Python (Tkinter) · DeepSeek V4 API (OpenAI-compatible streaming) · tiktoken · PyInstaller · pystray · httpx · optional: playwright, faster-whisper, PyMuPDF, reportlab, psutil, curl_cffi
+Python (Tkinter) · DeepSeek V4 API (OpenAI-compatible streaming, multimodal) · tiktoken · PyInstaller · pystray · httpx · optional: playwright, faster-whisper, PyMuPDF, reportlab, psutil, curl_cffi
 
 ---
 
