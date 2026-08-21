@@ -154,6 +154,12 @@ _LONG_TOOL_NAMES = frozenset({
     "search_web",
     "search_github",
     "search_realtime",
+    "screen_see",
+    "chart_read",
+    "screenshot_to_html",
+    "debug_screenshot",
+    "scan_read",
+    "image_batch",
 })
 
 
@@ -1551,6 +1557,96 @@ TOOLS = [
                     "question": {"type": "string", "description": "可选：要问的问题（默认描述图片内容）"},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "screen_see",
+            "description": "截图并让视觉模型解读当前屏幕（一步完成 截图+看图）。RPA/浏览器操作后自查首选：看清界面后决定下一步（点击/输入/验证）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "可选：要看什么（默认描述屏幕内容）"},
+                    "area": {"type": "string", "description": "可选：区域 left,top,right,bottom（默认全屏）"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "chart_read",
+            "description": "图表截图 → 结构化数据 + 解读（折线/柱状/饼图/散点等，适合读报表/仪表盘截图）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "图表图片文件绝对路径"},
+                    "question": {"type": "string", "description": "可选：针对图表的具体问题"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "screenshot_to_html",
+            "description": "UI/网页截图 → 还原为 HTML+CSS 页面（前端还原），可保存到文件",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "截图文件绝对路径"},
+                    "out_path": {"type": "string", "description": "可选：输出 HTML 绝对路径（默认仅返回代码）"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "debug_screenshot",
+            "description": "报错/异常截图 → 识别错误并给出诊断与修复建议（错误码/文案/行号/原因/修复）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "报错截图文件绝对路径"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_read",
+            "description": "扫描件/文档图片读取（图表、公式、手写、印刷混排），返回 Markdown 结构化内容",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "扫描件/文档图片绝对路径"},
+                    "question": {"type": "string", "description": "可选：要提取/回答的内容"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_batch",
+            "description": "批量视觉分析文件夹内图片：逐张理解后汇总报告（小并发，适合图库/截图/素材批量整理）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string", "description": "图片所在目录绝对路径"},
+                    "question": {"type": "string", "description": "可选：每张图要回答的问题（默认描述）"},
+                    "pattern": {"type": "string", "description": "可选：文件通配符（默认 *.png，支持 *.jpg）"},
+                    "max": {"type": "integer", "description": "可选：最多分析张数（1-200，默认 100）"},
+                },
+                "required": ["folder"],
             },
         },
     },
@@ -5673,6 +5769,7 @@ PATTERNS_FILE = None         # DATA_DIR/patterns.json（成功模式配方，run
 IMAGE_GEN_BASE = None        # 图片生成端点（默认 = base_url）
 IMAGE_GEN_KEY = None         # 图片生成 API Key（默认 = api_key）
 IMAGE_GEN_MODEL = "gpt-image-1"
+VISION_SELF_REVIEW = False   # 视觉自审（由 main 注入）：工具产出图片时自动审图
 RSS_SOURCES_FILE = None      # DATA_DIR/rss_sources.json（RSS 订阅列表）
 KV_CACHE_DIR = None          # DATA_DIR/kv_cache（diskcache 存储目录）
 WEBDAV_CONFIG_FILE = None    # DATA_DIR/webdav_config.json（WebDAV 连接）
@@ -6375,6 +6472,219 @@ def screen_capture(path="", area=""):
         return f"已截屏保存至 {out}（{size / 1024:.0f} KB），可用 ocr_image / image_understand 分析"
     except Exception as e:
         return f"错误：截屏失败: {e}"
+
+
+# ---------- 视觉 Agent 能力（多模态闭环）：看图 / 自审 / 批量 ----------
+# 图片路径匹配：优先绝对路径（允许路径含空格，遇括号/引号/换行即止），
+# 其次相对路径（单 token，不含空格）。
+_IMAGE_FILE_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/][^（）()\"'\r\n]*?|"
+    r"[\\/][^（）()\"'\r\n]*?|"
+    r"[^\s（）()\"'\r\n]+)\.(?:png|jpe?g|gif|webp)",
+    re.I,
+)
+_IMAGE_PATH_TRAIL = "，。、,;；：:()（）\"'` \t\r\n"
+
+
+def _extract_image_path(text):
+    """从工具结果文本中提取已存在的图片文件路径（自审用，找不到返回 None）。
+
+    兼容路径含空格与中文路径；候选串尾的标点会被剥离后再校验存在性。
+    """
+    text = str(text or "")
+    ws = permissions.WORKSPACE_DIR
+    for raw in re.findall(_IMAGE_FILE_PATH_RE, text):
+        for cand in (raw, raw.rstrip(_IMAGE_PATH_TRAIL)):
+            if not cand:
+                continue
+            if os.path.isfile(cand):
+                return cand
+            # 相对候选 → 相对工作区再试（工具一般返回绝对路径，这是兜底）
+            if ws and not os.path.isabs(cand):
+                joined = os.path.join(ws, cand)
+                if os.path.isfile(joined):
+                    return joined
+    # 兜底：按空白拆分逐 token 校验（防正则漏网，如路径前带空格/标点）
+    for tok in re.split(r"\s+", text):
+        tok = tok.rstrip(_IMAGE_PATH_TRAIL)
+        if not tok:
+            continue
+        if re.search(r"\.(?:png|jpe?g|gif|webp)$", tok, re.I):
+            if os.path.isfile(tok):
+                return tok
+            if ws and not os.path.isabs(tok) and os.path.isfile(os.path.join(ws, tok)):
+                return os.path.join(ws, tok)
+    return None
+
+
+# 产出图片文件、可触发视觉自审的工具（VISION_SELF_REVIEW 开启时自动审图）
+_IMAGE_PRODUCING_TOOLS = frozenset({
+    "image_generate",
+    "chart_data",
+    "screen_capture",
+    "rpa_screenshot",
+    "web_screenshot",
+    "image_process",
+    "qrcode",
+})
+
+
+def _capture_screen_png(area=""):
+    """截取当前屏幕到工作区截图目录，返回 PNG 路径；失败返回 None。"""
+    try:
+        from PIL import ImageGrab
+
+        bbox = None
+        if str(area or "").strip():
+            try:
+                parts = [int(x.strip()) for x in str(area).split(",")]
+                if len(parts) == 4:
+                    bbox = tuple(parts)
+            except (TypeError, ValueError):
+                bbox = None
+        img = ImageGrab.grab(bbox=bbox)
+        base = os.path.join(permissions.WORKSPACE_DIR or ".", "screenshots")
+        os.makedirs(base, exist_ok=True)
+        out = os.path.join(base, f"screen_see_{datetime.now():%Y%m%d_%H%M%S}.png")
+        img.save(out, "PNG")
+        permissions.audit("screen_see", out, "屏幕截图（视觉解读）")
+        return out
+    except Exception:
+        return None
+
+
+def screen_see(question="", area=""):
+    """截图并让视觉模型解读当前屏幕（一步完成 截图+看图）。
+
+    RPA/浏览器操作后自查首选：看清界面后决定下一步操作（点击/输入/验证）。
+    """
+    q = str(question or "请描述当前屏幕内容，重点关注界面元素、按钮、文字与状态。").strip()
+    try:
+        from PIL import ImageGrab  # noqa: F401  # 提前校验依赖，给出明确安装提示
+    except ImportError:
+        return "错误：屏幕截图需要 Pillow，请先安装：pip install Pillow"
+    path = _capture_screen_png(area)
+    if not path:
+        return "错误：屏幕截图失败"
+    return image_understand(path, question=q)
+
+
+def chart_read(path, question=""):
+    """图表截图 → 结构化数据 + 解读（折线/柱状/饼图/散点等）。"""
+    if not str(path or "").strip():
+        return "错误：path 必填"
+    q = str(question or "").strip()
+    if q:
+        q += "；"
+    q += (
+        "请解读这张图表：1) 标题与图表类型；2) 坐标轴/图例/数据点，尽量精确给出数值；"
+        "3) 关键趋势与结论。数据可用 Markdown 表格输出时请表格化。"
+    )
+    return image_understand(path, question=q)
+
+
+def screenshot_to_html(path, out_path=""):
+    """UI/网页截图 → 还原为 HTML+CSS 页面（可保存到文件）。"""
+    if not str(path or "").strip():
+        return "错误：path 必填"
+    q = (
+        "请把这张截图还原成等价的 HTML+CSS 页面：像素级还原布局、配色、文字、间距与元素位置，"
+        "输出完整可用的 HTML（CSS 内联，<html> 到 </html> 全量代码），只输出代码，不要解释。"
+    )
+    result = image_understand(path, question=q)
+    if str(out_path or "").strip():
+        # 视觉调用失败（错误文案）时绝不写入目标文件，原样返回错误
+        if not result or str(result).startswith("错误"):
+            return result or "错误：图片理解未返回内容"
+        out = permissions.resolve(out_path)
+        if not out:
+            return "错误：输出路径无效"
+        if not out.lower().endswith(".html"):
+            out += ".html"
+        ok, reason = permissions.check_filesystem(out, write=True)
+        if not ok:
+            return reason
+        code = re.sub(r"^```(?:html|htm)?\s*|\s*```$", "", result.strip(), flags=re.I)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(code)
+        permissions.audit("screenshot_to_html", out, str(path)[:80])
+        return f"已根据截图生成 HTML 保存至 {out}\n\n{result}"
+    return result
+
+
+def debug_screenshot(path):
+    """报错/异常截图 → 识别错误并给出诊断与修复建议。"""
+    if not str(path or "").strip():
+        return "错误：path 必填"
+    q = (
+        "这是报错/异常截图。请：1) 识别错误类型与关键信息（报错文案、错误码、行号、堆栈线索）；"
+        "2) 分析可能原因；3) 给出具体的修复建议（需要时可提到相关文件/函数）。"
+    )
+    return image_understand(path, question=q)
+
+
+def scan_read(path, question=""):
+    """扫描件/文档图片读取（图表、公式、手写、印刷体混排）。"""
+    if not str(path or "").strip():
+        return "错误：path 必填"
+    q = str(question or "").strip()
+    if q:
+        q += "；"
+    q += (
+        "这是扫描件/文档图片。请完整提取其中的文字、图表、公式与数据，保持原有结构，"
+        "用 Markdown 呈现；手写内容按可辨识程度尽量转写，不确定处标注。"
+    )
+    return image_understand(path, question=q)
+
+
+def image_batch(folder, question="", pattern="*.png", max=100):
+    """批量视觉分析文件夹内图片：逐张理解后汇总报告（小并发）。"""
+    if not str(folder or "").strip():
+        return "错误：folder 必填"
+    base = permissions.resolve(folder)
+    if not base or not os.path.isdir(base):
+        return f"错误：目录不存在：{folder}"
+    ok, reason = permissions.check_filesystem(base, write=False)
+    if not ok:
+        return reason
+    try:
+        m = int(max or 100)
+    except (TypeError, ValueError):
+        m = 100
+    limit = 1 if m < 1 else 200 if m > 200 else m
+    # 防路径穿越：pattern 含 .. 等分隔符时，glob 可能越过允许目录返回外部文件。
+    # 收集后用规范化路径强校验「必须位于 base 之内」，越界文件一律丢弃。
+    import glob
+
+    base_norm = os.path.normpath(base)
+    files = []
+    for f in sorted(glob.glob(os.path.join(base, str(pattern or "*.png")))):
+        try:
+            inside = os.path.commonpath([base_norm, os.path.normpath(f)]) == base_norm
+        except ValueError:
+            inside = False
+        if inside and os.path.isfile(f) and f.lower().endswith(IMAGE_EXTENSIONS):
+            files.append(f)
+    if not files:
+        return f"错误：目录 {base} 内没有匹配「{pattern}」的图片"
+    files = files[:limit]
+    q = str(question or "请描述这张图片的主要内容，并用一句话概括。").strip()
+    results = [None] * len(files)
+
+    def _one(i, p):
+        results[i] = image_understand(p, question=q)
+
+    import concurrent.futures as _cf
+
+    with _cf.ThreadPoolExecutor(max_workers=min(4, len(files))) as ex:
+        futures = [ex.submit(_one, i, p) for i, p in enumerate(files)]
+        for _f in _cf.as_completed(futures):
+            pass
+    lines = []
+    for i, p in enumerate(files):
+        lines.append(f"### {os.path.basename(p)}\n{results[i] or '（分析失败）'}")
+    lines.append(f"\n—— 共分析 {len(files)} 张图片 ——")
+    return "\n\n".join(lines)
 
 
 # Whisper 模型实例缓存：按模型名复用，避免每次调用重新加载（large-v3 可耗时数十秒）
@@ -8732,6 +9042,12 @@ TOOL_CALL_MAP = {
     "extract_archive": extract_archive,
     "batch_rename": batch_rename,
     "image_understand": image_understand,
+    "screen_see": screen_see,
+    "chart_read": chart_read,
+    "screenshot_to_html": screenshot_to_html,
+    "debug_screenshot": debug_screenshot,
+    "scan_read": scan_read,
+    "image_batch": image_batch,
     "screen_capture": screen_capture,
     "speech_to_text": speech_to_text,
     "knowledge_index": knowledge_index,
@@ -8813,14 +9129,14 @@ ACTIVATE_TOOL = {
 _TOOL_INDEX_CACHE = None
 _TOOL_INDEX_KEY = None
 
-# 能力地图分类（精确感知：类别 + 完整工具名 + 核心动作）。103 个工具全覆盖。
+# 能力地图分类（精确感知：类别 + 完整工具名 + 核心动作）。全部内置工具全覆盖。
 TOOL_GROUPS = [
     ("🌐 浏览器与网页", ["browser_navigate", "web_screenshot", "fetch_url", "fetch_blocked", "search_web", "search_realtime", "search_github", "webdav", "download_file", "rss_fetch"]),
     ("💻 编程与执行", ["run_python", "run_command", "pip_install", "run_tests", "write_code_project", "subagent_run", "verify_output", "start_process", "stop_process", "list_processes", "environment_info", "system_status"]),
     ("📁 文件与目录", ["read_file", "write_file", "edit_file", "list_dir", "search_local", "delete_file", "archive_files", "extract_archive", "batch_rename", "clipboard_get", "clipboard_set"]),
     ("📊 数据与文档", ["read_csv", "write_csv", "read_excel", "write_excel", "chart_data", "database_query", "database_query_mysql", "database_query_postgres", "database_execute", "create_doc", "docx_read", "pptx_read", "pdf_extract", "pdf_create", "epub_read", "mobi_read", "doc_read", "archive_list", "secret_store", "kv_store"]),
     ("📧 邮件与消息", ["send_email", "read_email", "email_summary", "agent_mail", "msg_read", "im_send", "telegram_poll_updates", "send_webhook", "publish_draft", "run_wechat_writer", "daily_brief"]),
-    ("🎨 媒体与图像", ["image_process", "image_understand", "image_generate", "ocr_image", "screen_capture", "speech_to_text", "tts_save", "media_ffmpeg", "qrcode"]),
+    ("🎨 媒体与图像", ["image_process", "image_understand", "screen_see", "chart_read", "screenshot_to_html", "debug_screenshot", "scan_read", "image_batch", "image_generate", "ocr_image", "screen_capture", "speech_to_text", "tts_save", "media_ffmpeg", "qrcode"]),
     ("🖱 桌面自动化", ["rpa_screen_size", "rpa_click", "rpa_type", "rpa_hotkey", "rpa_move", "rpa_scroll", "rpa_screenshot", "notify_desktop"]),
     ("⏰ 定时与任务", ["schedule_task", "list_schedules", "cancel_schedule", "task_checkpoint_save", "task_checkpoint_load", "run_workflow"]),
     ("🧠 记忆与知识", ["write_memory", "read_memory", "query_memory_graph", "knowledge_index", "knowledge_search"]),
@@ -8895,6 +9211,12 @@ _TOOL_ACTION_PHRASES = {
     "daily_brief": "每日简报",
     "image_process": "图像处理（缩放/裁剪/滤镜/格式转换）",
     "image_understand": "多模态看图理解",
+    "screen_see": "截图并让视觉模型解读当前屏幕",
+    "chart_read": "图表截图→结构化数据+解读",
+    "screenshot_to_html": "UI截图→HTML/CSS前端还原",
+    "debug_screenshot": "报错截图→诊断修复建议",
+    "scan_read": "扫描件/文档图片读取（图表/公式/手写）",
+    "image_batch": "批量视觉分析文件夹图片并汇总",
     "image_generate": "文生图",
     "ocr_image": "图片文字识别 OCR",
     "screen_capture": "屏幕截图",
@@ -9289,6 +9611,9 @@ class DeepSeekClient:
                 "content": (
                     "你是一个拥有 100+ 项专业能力的桌面 AI 智能体，能力地图如下（你确实拥有这些能力，"
                     "不要拒绝用户请求）。能力定义未加载时，先调用 activate_tools 激活再使用。\n\n"
+                    "视觉自检准则：执行截图/浏览器/RPA 操作、或生成图片/图表后，"
+                    "用 screen_see / image_understand 查看结果并自查是否达到目标；未达标则继续修正"
+                    "（点击/输入/重新生成），完成后才向用户汇报。\n\n"
                     + build_tool_index()
                 ),
             }
@@ -9743,6 +10068,27 @@ class DeepSeekClient:
                     text = str(result)
                     if len(text) > _RESULT_INTO_CONTEXT_MAX:
                         text = _persist_long_result(name, text)
+                    # 视觉自审（config vision_self_review 开启且为视觉模型）：工具产出图片时，
+                    # 自动调用视觉模型审图，把审阅意见附在结果里，模型据此迭代（B 自我审图闭环）。
+                    if (
+                        VISION_SELF_REVIEW
+                        and name in _IMAGE_PRODUCING_TOOLS
+                        and is_vision_model(self.model)
+                    ):
+                        img_path = _extract_image_path(text)
+                        if img_path:
+                            try:
+                                review = image_understand(
+                                    img_path,
+                                    question=(
+                                        "（自动审图）请审阅这张图片：评估清晰度、构图、文字是否完整准确、"
+                                        "是否完全满足创作/数据要求；若发现问题，给出具体、可执行的修改建议。"
+                                    ),
+                                )
+                                if review and not review.startswith("错误"):
+                                    text = text + "\n\n【AI 自审】\n" + review
+                            except Exception:
+                                logger.exception("视觉自审失败: %s", img_path)
                     work.append(
                         {"role": "tool", "tool_call_id": tc["id"], "content": text}
                     )

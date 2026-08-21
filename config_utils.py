@@ -193,6 +193,7 @@ def normalize_config(cfg):
     cfg["image_api_key"] = str(cfg.get("image_api_key", "") or "").strip()
     cfg["image_base_url"] = str(cfg.get("image_base_url", "") or "").strip()
     cfg["image_model"] = str(cfg.get("image_model", "gpt-image-1")).strip() or "gpt-image-1"
+    cfg["vision_self_review"] = as_bool(cfg.get("vision_self_review", False))
     cfg["minimize_to_tray"] = as_bool(cfg.get("minimize_to_tray", False))
     cfg["autostart"] = as_bool(cfg.get("autostart", False))
     cfg["strict_tools"] = as_bool(cfg.get("strict_tools", False))

@@ -199,7 +199,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.25.0"
+VERSION = "2.26.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -5238,8 +5238,10 @@ class AssistantApp:
                       "pdf_extract", "pdf_create", "docx_read", "pptx_read",
                       "run_wechat_writer")),
         ("媒体感知", (
-            "image_process", "image_understand", "ocr_image", "screen_capture",
-            "tts_save", "speech_to_text", "image_generate", "qrcode", "media_ffmpeg",
+            "image_process", "image_understand", "screen_see", "chart_read",
+            "screenshot_to_html", "debug_screenshot", "scan_read", "image_batch",
+            "ocr_image", "screen_capture", "tts_save", "speech_to_text",
+            "image_generate", "qrcode", "media_ffmpeg",
         )),
         ("浏览器", ("browser_navigate", "web_screenshot")),
         ("通信通知", ("send_email", "read_email", "send_webhook", "notify_desktop", "clipboard_get", "clipboard_set")),
@@ -7475,6 +7477,17 @@ class AssistantApp:
             if hint:
                 self._lbl(img_frame, hint, role="label_sec", bg="panel", font=(FONT_FAMILY, 9)).pack(anchor="w")
             img_vars[key] = var
+        vision_review_var = tk.BooleanVar(value=bool(self.cfg.get("vision_self_review", False)))
+        ttk.Checkbutton(
+            img_frame,
+            text="视觉自审：生成图片/图表/截图后自动调用视觉模型审图并迭代（需视觉模型，会增加 token 消耗）",
+            variable=vision_review_var,
+        ).pack(anchor="w", pady=(10, 2))
+        self._lbl(
+            img_frame,
+            "开启后，工具产出图片时 AI 会自动「看图→审阅→修改/重生成」，形成创作自检闭环；默认关闭以控成本。",
+            role="label_sec", bg="panel", font=(FONT_FAMILY, 8), wraplength=540, justify="left",
+        ).pack(anchor="w")
 
         def save():
             def _enc_secret(v):
@@ -7549,6 +7562,7 @@ class AssistantApp:
                 self.cfg["image_api_key"] = img_vars["image_api_key"].get().strip()
                 self.cfg["image_base_url"] = img_vars["image_base_url"].get().strip()
                 self.cfg["image_model"] = img_vars["image_model"].get().strip() or "gpt-image-1"
+                self.cfg["vision_self_review"] = bool(vision_review_var.get())
                 save_config(self.cfg)
                 self._capture_client_params()
                 self._flash_status("外部服务配置已保存（接收端端口需重启生效）")
@@ -9751,6 +9765,8 @@ class AssistantApp:
             _dc.IMAGE_GEN_KEY = self.cfg.get("image_api_key", "") or self._client_key
             _dc.IMAGE_GEN_BASE = self.cfg.get("image_base_url", "") or self.cfg.get("base_url", "")
             _dc.IMAGE_GEN_MODEL = self.cfg.get("image_model", "gpt-image-1")
+            # v2 能力层：视觉自审开关（工具产出图片时自动审图）
+            _dc.VISION_SELF_REVIEW = bool(self.cfg.get("vision_self_review", False))
             # run_workflow 回调（线程安全：只投递 UI 队列）
             _dc.set_send_callback(lambda text: self._ui_queue.put(("timer_task", text)))
             _dc.set_busy_provider(lambda: self.busy)
@@ -14977,7 +14993,9 @@ class AssistantApp:
         self._clear_placeholder()
         # 图片文件 → 附加为视觉输入（真实图片，非文本）
         img_paths = [p for p in paths if p.lower().endswith(_dc.IMAGE_EXTENSIONS)]
+        img_attached = 0
         if img_paths:
+            img_attached = len(img_paths[:10])
             self._attach_image_paths(img_paths[:10])
         txt_paths = [p for p in paths if not p.lower().endswith(_dc.IMAGE_EXTENSIONS)]
         if not txt_paths:
@@ -15000,7 +15018,8 @@ class AssistantApp:
         self.input_text.insert("1.0", "\n\n".join(parts))
         self.input_text.focus_set()
         if img_paths:
-            self._flash_status(f"已附加 {len(img_paths)} 张图片 + {len(txt_paths)} 个文件", 3000)
+            extra = "" if img_attached >= len(img_paths) else f"（最多附加 10 张）"
+            self._flash_status(f"已附加 {img_attached} 张图片{extra} + {len(txt_paths)} 个文件", 3000)
         else:
             self._flash_status(f"已附加 {len(paths)} 个文件")
         return "break"

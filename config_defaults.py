@@ -167,6 +167,7 @@ DEFAULT_CONFIG = {
     "image_api_key": "",      # 图片生成 API Key
     "image_base_url": "",     # 图片生成端点（默认 = base_url）
     "image_model": "gpt-image-1",
+    "vision_self_review": False,  # 视觉自审：工具产出图片时自动调用视觉模型审图（需视觉模型；默认关控成本）
     "window_geometry": "",    # 窗口大小位置记忆（如 1280x820+100+50）
     "minimize_to_tray": True,   # 初始关闭时最小化到系统托盘（需 pystray；不可用时回滚）
     "autostart": True,          # 初始开机自启（注册表 Run 键；失败自动回滚）

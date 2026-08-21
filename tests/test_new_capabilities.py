@@ -477,5 +477,118 @@ class TestVisionModel(unittest.TestCase):
                 client.chat(msgs, tools_enabled=False)
 
 
+class TestVisionTools(unittest.TestCase):
+    """视觉 Agent 工具：screen_see / chart_read / screenshot_to_html / debug_screenshot / scan_read / image_batch。"""
+
+    VISION_TOOLS = {
+        "screen_see", "chart_read", "screenshot_to_html",
+        "debug_screenshot", "scan_read", "image_batch",
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dsa_vision_")
+        permissions.init(os.path.join(self.tmp, "perm.json"), self.tmp)
+        self.png = os.path.join(self.tmp, "x.png")
+        with open(self.png, "wb") as f:
+            f.write(_make_png_bytes())
+
+    def test_tools_registered(self):
+        for n in self.VISION_TOOLS:
+            self.assertIn(n, dc.TOOL_CALL_MAP, n)
+            self.assertTrue(any(t["function"]["name"] == n for t in dc.TOOLS), n)
+            self.assertIn(n, dc._TOOL_ACTION_PHRASES, n)
+            self.assertIn(n, dc._LONG_TOOL_NAMES, n)
+        # 视觉自审白名单覆盖图片产出工具
+        self.assertIn("image_generate", dc._IMAGE_PRODUCING_TOOLS)
+        self.assertIn("chart_data", dc._IMAGE_PRODUCING_TOOLS)
+        self.assertIn("web_screenshot", dc._IMAGE_PRODUCING_TOOLS)
+        # 默认关闭（控成本）
+        self.assertFalse(dc.VISION_SELF_REVIEW)
+
+    def test_chart_read_delegates_to_vision(self):
+        with mock.patch.object(dc, "image_understand", return_value="折线图：营收 100→150") as mu:
+            r = dc.chart_read(self.png)
+        self.assertIn("折线图", r)
+        self.assertTrue(mu.called)
+        self.assertEqual(mu.call_args[0][0], self.png)
+
+    def test_chart_read_requires_path(self):
+        self.assertIn("path 必填", dc.chart_read(""))
+
+    def test_debug_screenshot(self):
+        with mock.patch.object(dc, "image_understand", return_value="错误：KeyError 'x'") as mu:
+            r = dc.debug_screenshot(self.png)
+        self.assertIn("KeyError", r)
+        self.assertTrue(mu.called)
+
+    def test_scan_read(self):
+        with mock.patch.object(dc, "image_understand", return_value="扫描文档内容…"):
+            r = dc.scan_read(self.png)
+        self.assertIn("扫描文档内容", r)
+
+    def test_screenshot_to_html_saves_file(self):
+        html = "<html><body>Hello</body></html>"
+        with mock.patch.object(dc, "image_understand", return_value="```html\n" + html + "\n```"):
+            r = dc.screenshot_to_html(self.png, out_path=os.path.join(self.tmp, "out.html"))
+        self.assertIn("已根据截图生成 HTML", r)
+        saved = os.path.join(self.tmp, "out.html")
+        self.assertTrue(os.path.exists(saved))
+        with open(saved, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), html)
+
+    def test_screenshot_to_html_returns_code_only(self):
+        with mock.patch.object(dc, "image_understand", return_value="<html>..</html>"):
+            r = dc.screenshot_to_html(self.png)
+        self.assertIn("<html>", r)
+
+    def test_image_batch_summary(self):
+        with open(os.path.join(self.tmp, "y.png"), "wb") as f:
+            f.write(_make_png_bytes())
+        with mock.patch.object(dc, "image_understand", return_value="内容A"):
+            r = dc.image_batch(self.tmp, question="描述")
+        self.assertIn("x.png", r)
+        self.assertIn("y.png", r)
+        self.assertIn("共分析 2 张图片", r)
+
+    def test_image_batch_no_images(self):
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty)
+        self.assertIn("没有匹配", dc.image_batch(empty))
+
+    def test_image_batch_bad_dir(self):
+        self.assertIn("目录不存在", dc.image_batch(os.path.join(self.tmp, "nope")))
+
+    def test_extract_image_path(self):
+        self.assertEqual(dc._extract_image_path(f"已生成图片保存至 {self.png}（1 KB）"), self.png)
+        self.assertIsNone(dc._extract_image_path("没有图片路径"))
+
+    def test_extract_image_path_with_space(self):
+        sp = os.path.join(self.tmp, "my folder")
+        os.makedirs(sp, exist_ok=True)
+        p = os.path.join(sp, "x.png")
+        with open(p, "wb") as f:
+            f.write(_make_png_bytes())
+        self.assertEqual(dc._extract_image_path(f"已生成图片保存至 {p}（1 KB）"), p)
+
+    def test_image_batch_respects_max(self):
+        with open(os.path.join(self.tmp, "y.png"), "wb") as f:
+            f.write(_make_png_bytes())
+        with mock.patch.object(dc, "image_understand", return_value="内容"):
+            r = dc.image_batch(self.tmp, max=1)
+        self.assertIn("共分析 1 张图片", r)
+
+    def test_image_batch_blocks_traversal(self):
+        # pattern 含 .. 越界：越界文件必须被丢弃（不允许读取 base 之外）
+        with mock.patch.object(dc, "image_understand", return_value="内容"):
+            r = dc.image_batch(self.tmp, pattern="..\\..\\*.png")
+        self.assertIn("没有匹配", r)
+
+    def test_screenshot_to_html_does_not_write_on_error(self):
+        with mock.patch.object(dc, "image_understand", return_value="错误：图片不存在：x"):
+            r = dc.screenshot_to_html(self.png, out_path=os.path.join(self.tmp, "bad.html"))
+        self.assertIn("错误", r)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "bad.html")))
+
+
 if __name__ == "__main__":
     unittest.main()

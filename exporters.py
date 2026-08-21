@@ -3,6 +3,19 @@
 import html
 import json
 import logging
+import os
+
+
+def _image_ref_lines(msg):
+    """user 消息的图片附件 → 导出可读的 [图片] 引用行列表。"""
+    lines = []
+    for p in msg.get("images") or []:
+        p = str(p)
+        if p.lower().startswith(("http://", "https://")):
+            lines.append(f"[图片] {p}")
+        else:
+            lines.append(f"[图片] {os.path.basename(p)}")
+    return lines
 
 
 def build_markdown(messages, usage_total, session_start, cfg,
@@ -26,7 +39,11 @@ def build_markdown(messages, usage_total, session_start, cfg,
         if role == "system":
             continue
         if role == "user":
-            lines += ["", "## 用户", "", m.get("content") or ""]
+            content = (m.get("content") or "")
+            img_lines = _image_ref_lines(m)
+            if img_lines:
+                content = content + "\n" + "\n".join(img_lines)
+            lines += ["", "## 用户", "", content]
         elif role == "assistant":
             if m.get("reasoning_content"):
                 lines += ["", "## 助手（思考过程）", "", "```text", m["reasoning_content"], "```"]
@@ -87,6 +104,10 @@ def export_html(messages, path, title="鲸语 WhaleTalk 会话记录", model="",
         if role == "system":
             continue
         if role == "user":
+            content = (m.get("content") or "")
+            img_lines = _image_ref_lines(m)
+            if img_lines:
+                content = content + "\n" + "\n".join(img_lines)
             parts.append("<div class='time'>用户</div>")
             parts.append(f"<div class='msg user'>{_render_md_inline(content)}</div>")
         elif role == "assistant":
