@@ -199,7 +199,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.26.0"
+VERSION = "2.26.1"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -4632,10 +4632,27 @@ class AssistantApp:
     def _tools_definition_tokens(self):
         """本次请求实际注入的工具定义估算 token（DeepSeek 计入 prompt_tokens）。
 
-        缓存到 _tools_def_cache：工具集只随配置变化，避免每轮重复估算。
+        按当前工作模式真实估算（而非"全部工具原始 schema"的最坏值）：
+        - 完全智能（smart_tools）：能力地图（index_msg）+ activate_tools + 关键词预激活
+          工具的压缩版——与 chat() 首轮实际注入一致
+        - 纯对话：0
+        - 标准模式（显式子集）：启用工具集的原始 schema
+        缓存键含当前输入文本片段（预激活结果随输入变化）。
         """
+        text_key = ""
+        if self.cfg.get("full_auto"):
+            for mm in reversed(self.messages):
+                if mm.get("role") == "user":
+                    c = mm.get("content") or ""
+                    if isinstance(c, list):
+                        c = " ".join(
+                            str(b.get("text", "")) for b in c
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    text_key = str(c)[:120]
+                    break
         key = (self.cfg.get("full_auto"), self.cfg.get("pure_chat"),
-               tuple(self.cfg.get("enabled_tools") or []))
+               tuple(self.cfg.get("enabled_tools") or []), text_key)
         cache = getattr(self, "_tools_def_cache", None)
         if cache and cache[0] == key:
             return cache[1]
@@ -4643,11 +4660,25 @@ class AssistantApp:
             names, enabled = self._mode_tools_for_request(self.cfg)
             if not enabled:
                 val = 0
+            elif self.cfg.get("full_auto"):
+                # smart 模式：真实注入 = 能力地图 + 点菜工具 + 预激活工具压缩版
+                activated = set()
+                if text_key:
+                    _dc._preactivate_from_messages(
+                        [{"role": "user", "content": text_key}], activated
+                    )
+                by_name = {t["function"]["name"]: t for t in TOOLS}
+                specs = [by_name[n] for n in activated if n in by_name]
+                parts = []
+                if specs:
+                    parts.append(json.dumps(
+                        [_dc.ACTIVATE_TOOL] + _dc.compact_tools_list(specs),
+                        ensure_ascii=False,
+                    ))
+                parts.append(_dc.build_tool_index())
+                val = sum(tokens.estimate_text_tokens(p) for p in parts)
             else:
-                if names is None:
-                    names = [t["function"]["name"] for t in TOOLS] + [
-                        t["function"]["name"] for t in load_user_tools(USER_TOOLS_PATH)
-                    ]
+                # 标准模式：启用工具集（按 chat() 的注入方式估算）
                 by_name = {t["function"]["name"]: t for t in TOOLS}
                 specs = [by_name[n] for n in names if n in by_name]
                 customs = [

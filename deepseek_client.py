@@ -9108,9 +9108,10 @@ ACTIVATE_TOOL = {
     "function": {
         "name": "activate_tools",
         "description": (
-            "加载你拥有但尚未加载的能力定义。你的全部能力见系统消息中的能力地图。"
-            "当你决定使用某个工具时先调用本工具激活它，激活后即可正常调用。"
-            "只需激活本次要用到的工具，不要全部激活。"
+            "加载你拥有但尚未加载的能力定义。你的全部能力见系统消息中的能力地图"
+            "（按分类分组，每组有组名如「数据与文档」「媒体与图像」）。"
+            "传入工具名激活单个工具，传入组名一次激活整组。"
+            "只需激活本次要用到的工具/组，不要全部激活。"
         ),
         "parameters": {
             "type": "object",
@@ -9118,7 +9119,7 @@ ACTIVATE_TOOL = {
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "要激活的工具名列表（来自能力地图）",
+                    "description": "要激活的工具名或组名列表（来自能力地图）",
                 }
             },
             "required": ["tools"],
@@ -9142,6 +9143,77 @@ TOOL_GROUPS = [
     ("🧠 记忆与知识", ["write_memory", "read_memory", "query_memory_graph", "knowledge_index", "knowledge_search"]),
     ("🔧 系统与基础", ["get_date", "get_weather", "ask_user", "request_permission", "call_api", "project_info", "read_project_file", "create_evolution", "verify_files", "usage_report", "create_plugin"]),
 ]
+
+# 组名 -> 成员工具名（activate_tools 支持按组激活：传组名一次激活整组）。
+# 键含两种形式：原文（含 emoji）与去掉 emoji 的裸组名（如「数据与文档」）。
+_TOOL_GROUP_NAME_MAP = {}
+for _cat, _members in TOOL_GROUPS:
+    _TOOL_GROUP_NAME_MAP[_cat] = list(_members)
+    _bare = _cat.split(" ", 1)[-1] if " " in _cat else _cat
+    if _bare != _cat:
+        _TOOL_GROUP_NAME_MAP[_bare] = list(_members)
+
+
+def _expand_activation(wanted, available_names, activated):
+    """展开 activate_tools 的请求：支持工具名与组名（组名展开为整组工具）。"""
+    for n in wanted:
+        n = str(n).strip()
+        if not n:
+            continue
+        group = _TOOL_GROUP_NAME_MAP.get(n)
+        if group is not None:
+            for m in group:
+                if m in available_names:
+                    activated.add(m)
+        elif n in available_names:
+            activated.add(n)
+    return activated
+
+
+# 关键词预激活（chat 层兜底）：扫描最近 user 消息，命中常见意图关键词时
+# 预激活对应工具，让常见任务免点菜直接可用（仅提前加载定义，不改变权限）。
+_PREACTIVATE_HINTS = [
+    (("搜索", "搜一下", "查一下", "新闻", "资讯", "最新"), ["search_web", "search_realtime", "fetch_url"]),
+    (("天气", "气温", "台风", "预报"), ["get_weather"]),
+    (("下载",), ["download_file", "fetch_url"]),
+    (("邮件", "发邮件", "收件箱"), ["send_email", "read_email", "email_summary"]),
+    (("文件", "读取", "读一下", "打开"), ["read_file", "list_dir", "search_local"]),
+    (("写", "保存", "创建", "生成"), ["write_file", "create_doc", "write_code_project"]),
+    (("图片", "图像", "截图", "看图", "图表"), ["image_understand", "screen_see", "image_process", "chart_read", "chart_data", "ocr_image"]),
+    (("表格", "excel", "csv", "报表"), ["read_excel", "write_excel", "read_csv", "chart_data"]),
+    (("代码", "编程", "python", "bug", "脚本", "函数"), ["run_python", "read_file", "run_tests"]),
+    (("定时", "提醒", "计划", "日程"), ["schedule_task"]),
+    (("数据库", "sql", "mysql", "postgres"), ["database_query", "database_query_mysql", "database_query_postgres"]),
+    (("网页", "url", "抓取", "爬"), ["fetch_url", "browser_navigate", "web_screenshot"]),
+    (("搜索文件", "检索", "找文件"), ["search_local", "list_dir"]),
+    (("记忆", "记住", "偏好"), ["write_memory", "read_memory", "query_memory_graph"]),
+]
+
+
+def _message_text(m):
+    """提取消息的纯文本（兼容图片内联的内容块）。"""
+    c = m.get("content")
+    if isinstance(c, list):
+        return " ".join(
+            str(b.get("text", "")) for b in c
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return str(c or "")
+
+
+def _preactivate_from_messages(messages, activated):
+    """chat 层关键词预激活：扫描最近的 user 消息，命中意图词即预激活对应工具。"""
+    for m in reversed(messages):
+        if not (isinstance(m, dict) and m.get("role") == "user"):
+            continue
+        text = _message_text(m)[:800]
+        if not text.strip():
+            continue
+        for kws, tools in _PREACTIVATE_HINTS:
+            if any(kw in text for kw in kws):
+                activated.update(tools)
+        return activated  # 只扫最近一条 user 消息
+    return activated
 
 # 核心动作短语（能力感知关键：一行说清「能做什么」）
 _TOOL_ACTION_PHRASES = {
@@ -9261,12 +9333,18 @@ def build_tool_index(tools=None):
     """生成能力地图：分类 + 完整工具名 + 核心动作短语（AI 准确感知全部能力）。"""
     global _TOOL_INDEX_CACHE, _TOOL_INDEX_KEY
     tools = tools if tools is not None else TOOLS
-    key = id(tools)
+    # 缓存键用内容指纹（工具名 + 描述），而非 id(tools)：传入深拷贝/重建列表时
+    # id 会变导致缓存失效 → index_msg 内容漂移 → 前缀缓存不命中（成本翻几十倍）。
+    key = tuple(sorted(
+        (t["function"]["name"], t["function"].get("description", ""))
+        for t in (tools or [])
+    ))
     if _TOOL_INDEX_CACHE is not None and _TOOL_INDEX_KEY == key:
         return _TOOL_INDEX_CACHE
     by_name = {t["function"]["name"]: t for t in (tools or [])}
     lines = [
-        "你拥有以下全部能力（工具），共 %d 项。需要某能力时，调用 activate_tools([\"工具名\",...]) 激活，激活后立即可用；"
+        "你拥有以下全部能力（工具），共 %d 项。需要某能力时，调用 activate_tools([\"工具名或组名\",...]) 激活，激活后立即可用；"
+        "组名如「数据与文档」「媒体与图像」（见下方分类），传组名一次激活整组。"
         "未激活前也具备该能力，只是定义尚未加载。简单对话可以不激活任何工具。" % len(by_name)
     ]
     for cat, members in TOOL_GROUPS:
@@ -9287,14 +9365,22 @@ def build_tool_index(tools=None):
 
 
 def compact_tool_schema(tool):
-    """压缩工具 schema 描述（省 token）：去掉兜底废话、截断长描述。"""
+    """压缩工具 schema 描述（省 token）：去掉兜底废话、截断长描述。
+
+    只压缩 description；name / type / required / enum / properties 结构一律保留，
+    保证 strict 模式与工具解析不受影响。
+    """
     t = json.loads(json.dumps(tool))
     fn = t["function"]
     desc = fn.get("description", "")
+    # 兜底废话正则：更多冗余括号模式（重复短语/许可性/依赖提示等）
     for pat in (
         r"（[^）]*可能不严格[^）]*）", r"（[^）]*依赖[^）]*）",
         r"（[^）]*可选[^）]*）", r"（[^）]*保证生效[^）]*）",
         r"（[^）]*默认为[^）]*）", r"（[^）]*默认 [^）]*）",
+        r"（[^）]*需审批[^）]*）", r"（[^）]*需用户[^）]*）",
+        r"（[^）]*敏感[^）]*）", r"（[^）]*Beta[^）]*）",
+        r"（[^）]*可选依赖[^）]*）", r"（[^）]*需安装[^）]*）",
     ):
         desc = re.sub(pat, "", desc)
     desc = re.sub(r"\s+", " ", desc).strip()
@@ -9307,8 +9393,8 @@ def compact_tool_schema(tool):
             d = re.sub(r"^可选[：:]\s*", "", d)
             d = re.sub(r"（[^）]*）", "", d)
             d = re.sub(r"\s+", " ", d).strip()
-            if len(d) > 60:
-                d = d[:60].rstrip("，。；;:：, ") + "…"
+            if len(d) > 40:
+                d = d[:40].rstrip("，。；;:：, ") + "…"
             p["description"] = d
     return t
 
@@ -9602,6 +9688,10 @@ class DeepSeekClient:
             smart_avail = True
         smart_avail = bool(smart_tools and tools_enabled and smart_avail)
         activated = set(preset_tools or ())  # 预激活（关键词预筛）+ AI 点菜
+        if smart_avail:
+            # chat 层关键词预激活兜底：所有调用方（main/api_server/子代理等）受益，
+            # 命中常见意图直接免点菜可用（仅提前加载定义，不改变权限）
+            _preactivate_from_messages(work, activated)
         smart_round = smart_avail  # 索引阶段：点菜工具 + 预激活工具并注入
         index_msg = None
         _index_shown = False
@@ -9821,9 +9911,12 @@ class DeepSeekClient:
                             try:
                                 args = json.loads(tc.get("args") or "{}")
                                 wanted = args.get("tools") or []
-                                for n in wanted:
-                                    if any(t["function"]["name"] == n for t in all_tools):
-                                        activated.add(str(n))
+                                # 支持工具名与组名（组名一次激活整组）
+                                _expand_activation(
+                                    wanted,
+                                    {t["function"]["name"] for t in all_tools},
+                                    activated,
+                                )
                             except (TypeError, ValueError):
                                 pass
                             work.append(

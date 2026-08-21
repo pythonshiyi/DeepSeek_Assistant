@@ -14,6 +14,7 @@ import deepseek_client as dc
 import main as m
 import permissions
 import stats
+import tokens
 
 
 class TestCronMatch(unittest.TestCase):
@@ -588,6 +589,251 @@ class TestVisionTools(unittest.TestCase):
             r = dc.screenshot_to_html(self.png, out_path=os.path.join(self.tmp, "bad.html"))
         self.assertIn("错误", r)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "bad.html")))
+
+
+class TestToolCostOptimization(unittest.TestCase):
+    """工具定义成本优化：按组激活 / 关键词预激活 / 内容指纹缓存 / 压缩保结构。"""
+
+    # ---- 流式 mock 辅助（与 test_agent_tools 同构）----
+    @staticmethod
+    def _stream(content="", finish_reason=None, tool_calls=None):
+        def _delta():
+            return type("D", (), {
+                "reasoning_content": None,
+                "content": content or None,
+                "tool_calls": tool_calls,
+            })()
+
+        class S(list):
+            usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                    "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1})()
+
+        c = type("C", (), {
+            "delta": _delta(),
+            "finish_reason": finish_reason,
+            "choices": [type("CC", (), {"delta": _delta(), "finish_reason": finish_reason})()],
+        })()
+        return S([c])
+
+    @staticmethod
+    def _tool(tc_id, name, args="{}"):
+        return type("T", (), {
+            "index": 0,
+            "id": tc_id,
+            "function": type("F", (), {"name": name, "arguments": args})(),
+        })()
+
+    def test_group_name_map_both_forms(self):
+        """组名映射：emoji 原文与裸组名都可用。"""
+        emoji = dc._TOOL_GROUP_NAME_MAP["📊 数据与文档"]
+        bare = dc._TOOL_GROUP_NAME_MAP["数据与文档"]
+        self.assertEqual(emoji, bare)
+        self.assertGreater(len(bare), 5)
+        self.assertIn("read_excel", bare)
+        self.assertIn("database_query", bare)
+
+    def test_expand_activation_group_and_single(self):
+        """activate_tools 支持组名一次激活整组 + 单个工具名。"""
+        avail = set(dc.TOOL_CALL_MAP)
+        act = set()
+        dc._expand_activation(["数据与文档", "get_weather", "不存在的工具"], avail, act)
+        self.assertIn("read_excel", act)
+        self.assertIn("database_query", act)
+        self.assertIn("get_weather", act)
+        self.assertEqual(len(act), len(dc._TOOL_GROUP_NAME_MAP["数据与文档"]) + 1)
+        self.assertNotIn("image_generate", act)  # 未混入其他组
+
+    def test_keyword_preactivation(self):
+        act = set()
+        dc._preactivate_from_messages(
+            [{"role": "system", "content": "x"}, {"role": "user", "content": "帮我搜索最新AI新闻"}], act
+        )
+        self.assertIn("search_web", act)
+        self.assertIn("search_realtime", act)
+        act2 = set()
+        dc._preactivate_from_messages([{"role": "user", "content": "今天天气怎么样"}], act2)
+        self.assertIn("get_weather", act2)
+        # 无 user 消息 → 不激活
+        act3 = set()
+        dc._preactivate_from_messages([{"role": "system", "content": "x"}], act3)
+        self.assertEqual(act3, set())
+
+    def test_keyword_preactivation_with_image_blocks(self):
+        """图片内联内容块（list content）也能被预激活扫描。"""
+        act = set()
+        dc._preactivate_from_messages(
+            [{"role": "user", "content": [{"type": "text", "text": "看看这张图表"}]}], act
+        )
+        self.assertIn("chart_read", act)
+
+    def test_build_tool_index_fingerprint_cache(self):
+        """缓存键为内容指纹：深拷贝列表（id 不同）仍命中；内容变化才重建。"""
+        i1 = dc.build_tool_index()
+        i2 = dc.build_tool_index(json.loads(json.dumps(dc.TOOLS)))  # 深拷贝，id 不同
+        i3 = dc.build_tool_index()
+        self.assertEqual(i1, i2)
+        self.assertEqual(i1, i3)
+        # 内容变化 → 重建（不命中旧缓存）
+        subset = json.loads(json.dumps(
+            [next(t for t in dc.TOOLS if t["function"]["name"] == "get_date")]
+        ))
+        self.assertNotEqual(dc.build_tool_index(subset), i1)
+
+    def test_compact_preserves_structure(self):
+        """压缩只动 description，name/required/properties/type 全部保留。"""
+        tool = next(t for t in dc.TOOLS if t["function"]["name"] == "database_query")
+        c = dc.compact_tool_schema(tool)
+        self.assertEqual(c["function"]["name"], "database_query")
+        params = c["function"]["parameters"]
+        self.assertEqual(
+            set(params["properties"].keys()),
+            set(tool["function"]["parameters"]["properties"].keys()),
+        )
+        self.assertEqual(params.get("required"), tool["function"]["parameters"].get("required"))
+        for name in params["properties"]:
+            self.assertEqual(
+                params["properties"][name].get("type"),
+                tool["function"]["parameters"]["properties"][name].get("type"),
+            )
+        # 参数描述收紧到 ≤40 + 省略号
+        for p in params["properties"].values():
+            if "description" in p:
+                self.assertLessEqual(len(p["description"]), 41)
+        # 原 schema 不被修改
+        orig = next(t for t in dc.TOOLS if t["function"]["name"] == "database_query")
+        self.assertEqual(orig["function"]["description"], tool["function"]["description"])
+
+    def test_chat_first_round_only_activate_and_preset(self):
+        """首轮请求只注入 activate_tools + 预激活工具，绝非 109 个完整 schema。"""
+        client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        client.client.chat.completions.create = mock.MagicMock()
+        calls = []
+        s_done = self._stream(content="完成", finish_reason="stop")
+        client.client.chat.completions.create.side_effect = (
+            lambda **kw: (calls.append(kw) or s_done)
+        )
+        msgs = [{"role": "user", "content": "帮我搜索最新AI新闻"}]
+        client.chat(msgs, tools_enabled=True, smart_tools=True)
+        names = [t["function"]["name"] for t in (calls[0].get("tools") or [])]
+        self.assertIn("activate_tools", names)
+        self.assertIn("search_web", names)     # 关键词预激活
+        self.assertIn("search_realtime", names)
+        self.assertLess(len(names), 40)        # 绝非 109 全量
+
+    def test_chat_group_activation_flow(self):
+        """模型按组点菜：下一轮注入整组工具，且不混入其他组。"""
+        client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        client.client.chat.completions.create = mock.MagicMock()
+        calls = []
+        streams = [
+            self._stream(tool_calls=[self._tool("t1", "activate_tools", '{"tools": ["数据与文档"]}')]),
+            self._stream(content="完成", finish_reason="stop"),
+        ]
+
+        def fake_create(**kw):
+            calls.append(kw)
+            return streams.pop(0)
+
+        client.client.chat.completions.create.side_effect = fake_create
+        msgs = [{"role": "user", "content": "分析表格"}]
+        client.chat(msgs, tools_enabled=True, smart_tools=True)
+        self.assertGreaterEqual(len(calls), 2)
+        names = {t["function"]["name"] for t in (calls[1].get("tools") or [])}
+        self.assertIn("read_excel", names)
+        self.assertIn("database_query", names)
+        self.assertNotIn("image_generate", names)   # 其他组工具不注入
+        self.assertNotIn("activate_tools", names)   # 激活后移除点菜工具
+
+    def test_non_smart_keeps_full_tools(self):
+        """非点菜模式（smart_tools=False）保持全量工具注入，不受影响。"""
+        client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        client.client.chat.completions.create = mock.MagicMock()
+        captured = {}
+        client.client.chat.completions.create.side_effect = (
+            lambda **kw: (captured.update(kw) or client.client.chat.completions.create.return_value)
+        )
+        client.client.chat.completions.create.return_value = self._stream(content="好", finish_reason="stop")
+        client.chat([{"role": "user", "content": "hi"}], tools_enabled=True, smart_tools=False)
+        names = {t["function"]["name"] for t in (captured.get("tools") or [])}
+        self.assertIn("write_file", names)
+        self.assertNotIn("activate_tools", names)
+
+
+class TestToolsDefinitionEstimate(unittest.TestCase):
+    """状态栏「工具定义≈N」真实性：按工作模式估算，而非 109 全量最坏值（≈16086）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import tkinter as tk
+
+            _probe = tk.Tk()
+            _probe.destroy()
+        except Exception:
+            raise unittest.SkipTest("tkinter 不可用")
+        cls.tmpdir = tempfile.mkdtemp(prefix="dsa_tdef_")
+        m.CONFIG_PATH = os.path.join(cls.tmpdir, "config.json")
+        m.HISTORY_DIR = cls.tmpdir
+        m.SNAPSHOT_PATH = os.path.join(cls.tmpdir, "snap.json")
+        m.SESSIONS_DIR = os.path.join(cls.tmpdir, "sessions")
+        m.STATS_PATH = os.path.join(cls.tmpdir, "stats.json")
+        m.PROMPTS_PATH = os.path.join(cls.tmpdir, "prompts.json")
+        m.USER_TOOLS_PATH = os.path.join(cls.tmpdir, "ut.json")
+        m.ARCHIVES_DIR = os.path.join(cls.tmpdir, "archives")
+        m.CLEAN_EXIT_FLAG = os.path.join(cls.tmpdir, ".clean_exit")
+        os.makedirs(m.SESSIONS_DIR, exist_ok=True)
+        os.makedirs(m.ARCHIVES_DIR, exist_ok=True)
+        with open(m.CLEAN_EXIT_FLAG, "w", encoding="utf-8") as f:
+            f.write("ok")
+        with open(m.CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"welcomed": True, "restore_session": False}, f)
+        cls.root = tk.Tk()
+        cls.root.withdraw()
+        cls.app = m.AssistantApp(cls.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.app.on_close()
+        except Exception:
+            pass
+        try:
+            cls.root.destroy()
+        except Exception:
+            pass
+
+    def setUp(self):
+        self.app.messages = [{"role": "system", "content": self.app.cfg["system_prompt"]}]
+        self.app._tools_def_cache = None
+
+    def test_smart_mode_reflects_real_injection(self):
+        """完全智能：估算 = 能力地图 + activate_tools + 预激活工具压缩版（远小于 16086）。"""
+        self.app.cfg["full_auto"] = True
+        self.app.cfg["pure_chat"] = False
+        self.app.messages.append({"role": "user", "content": "帮我搜索最新AI新闻"})
+        val = self.app._tools_definition_tokens()
+        self.assertGreater(val, 0)
+        full_raw = tokens.estimate_text_tokens(json.dumps(dc.TOOLS, ensure_ascii=False))
+        self.assertLess(val, full_raw)  # 绝非 109 全量原始 schema 最坏值
+        self.assertLess(val, 8000)
+        index_only = tokens.estimate_text_tokens(dc.build_tool_index())
+        self.assertGreater(val, index_only)  # 命中关键词 → 计入预激活工具定义
+
+    def test_pure_chat_zero(self):
+        self.app.cfg["full_auto"] = False
+        self.app.cfg["pure_chat"] = True
+        self.app.messages.append({"role": "user", "content": "你好"})
+        self.assertEqual(self.app._tools_definition_tokens(), 0)
+
+    def test_cache_follows_input_change(self):
+        """缓存键含输入文本：预激活随输入变化，估算不陈旧。"""
+        self.app.cfg["full_auto"] = True
+        self.app.cfg["pure_chat"] = False
+        self.app.messages.append({"role": "user", "content": "帮我搜索"})
+        v1 = self.app._tools_definition_tokens()
+        self.app.messages[-1]["content"] = "今天天气怎么样"
+        v2 = self.app._tools_definition_tokens()
+        self.assertNotEqual(v1, v2)
 
 
 if __name__ == "__main__":
