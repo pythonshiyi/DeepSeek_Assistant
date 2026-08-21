@@ -351,5 +351,131 @@ class TestStrictTools(unittest.TestCase):
                 self.assertNotEqual(params.get("additionalProperties"), False)
 
 
+def _make_png_bytes():
+    """生成 1x1 最小合法 PNG（魔数正确）。"""
+    import struct
+    import zlib
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    ihdr = b"\x00\x00\x00\rIHDR" + ihdr_data + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF)
+    raw = b"\x00\xff\x00\x00"
+    idat = b"\x00\x00\x00\x0dIDAT" + zlib.compress(raw) + struct.pack(">I", zlib.crc32(b"IDAT" + zlib.compress(raw)) & 0xFFFFFFFF)
+    iend = b"\x00\x00\x00\x00IEND" + struct.pack(">I", zlib.crc32(b"IEND") & 0xFFFFFFFF)
+    return sig + ihdr + idat + iend
+
+
+class TestVisionModel(unittest.TestCase):
+    """DeepSeek-V4-Flash-Vision-Exp 图像理解适配。"""
+
+    def test_vision_model_registered(self):
+        self.assertIn("deepseek-v4-flash-vision-exp", dc.MODELS)
+        info = dc.MODELS["deepseek-v4-flash-vision-exp"]
+        self.assertEqual(info["version"], "DeepSeek-V4-Flash-Vision-Exp")
+        self.assertTrue(info["vision"])
+        self.assertEqual(info["max_context_tokens"], 1_000_000)
+        self.assertEqual(info["max_output_tokens"], 384 * 1024)
+
+    def test_is_vision_model(self):
+        self.assertTrue(dc.is_vision_model("deepseek-v4-flash-vision-exp"))
+        self.assertTrue(dc.is_vision_model(dc.VISION_MODEL))
+        self.assertFalse(dc.is_vision_model("deepseek-v4-flash"))
+        self.assertFalse(dc.is_vision_model("deepseek-v4-pro"))
+        self.assertFalse(dc.is_vision_model(""))
+
+    def test_detect_image_mime(self):
+        png = _make_png_bytes()
+        self.assertEqual(dc._detect_image_mime(png[:16]), "image/png")
+        self.assertEqual(dc._detect_image_mime(b"\xff\xd8\xff\xe0" + b"\x00" * 12), "image/jpeg")
+        self.assertEqual(dc._detect_image_mime(b"GIF89a" + b"\x00" * 10), "image/gif")
+        self.assertEqual(dc._detect_image_mime(b"RIFF\x00\x00\x00\x00WEBP"), "image/webp")
+
+    def test_embed_local_image_not_pollute_original(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.png")
+            with open(p, "wb") as f:
+                f.write(_make_png_bytes())
+            msgs = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "这是什么", "images": [p], "time": "10:00"},
+            ]
+            out = dc.embed_message_images(msgs, "deepseek-v4-flash-vision-exp")
+            self.assertIsInstance(out[1]["content"], list)
+            types = [b["type"] for b in out[1]["content"]]
+            self.assertEqual(types, ["text", "image_url"])
+            url = out[1]["content"][1]["image_url"]["url"]
+            self.assertTrue(url.startswith("data:image/png;base64,"))
+            # 原消息对象不被污染（UI/存档仍为文本 + 路径）
+            self.assertEqual(msgs[1]["content"], "这是什么")
+            self.assertEqual(msgs[1]["images"], [p])
+
+    def test_embed_non_vision_model_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.png")
+            with open(p, "wb") as f:
+                f.write(_make_png_bytes())
+            msgs = [{"role": "user", "content": "hi", "images": [p]}]
+            with self.assertRaises(ValueError):
+                dc.embed_message_images(msgs, "deepseek-v4-flash")
+
+    def test_embed_missing_file_raises(self):
+        msgs = [{"role": "user", "content": "hi", "images": [os.path.join("no", "such.png")]}]
+        with self.assertRaises(ValueError):
+            dc.embed_message_images(msgs, "deepseek-v4-flash-vision-exp")
+
+    def test_restore_text_content(self):
+        msg = {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        r = dc._restore_text_content(msg)
+        self.assertEqual(r["content"], "a\nb")
+        # 无 content 列表的消息原样返回
+        plain = {"role": "user", "content": "x"}
+        self.assertIs(dc._restore_text_content(plain), plain)
+
+    def test_chat_sends_image_blocks_and_restores_history(self):
+        client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash-vision-exp")
+        client.client.chat.completions.create = mock.MagicMock()
+        captured = {}
+        client.client.chat.completions.create.side_effect = (
+            lambda **kw: (captured.update(kw) or client.client.chat.completions.create.return_value)
+        )
+        client.client.chat.completions.create.return_value = type("S", (), {
+            "__iter__": lambda self: iter([]),
+            "usage": type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                    "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 1})(),
+            "close": lambda self: None,
+        })()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.png")
+            with open(p, "wb") as f:
+                f.write(_make_png_bytes())
+            msgs = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "看下这张图", "images": [p]},
+            ]
+            client.chat(msgs, tools_enabled=False)
+        # 请求体：user 消息 content 为 text + image_url 块
+        sent = captured["messages"]
+        user_block = next(m for m in sent if m["role"] == "user")
+        self.assertIsInstance(user_block["content"], list)
+        self.assertTrue(any(
+            b.get("type") == "image_url" and str(b.get("image_url", {}).get("url", "")).startswith("data:image/png;base64,")
+            for b in user_block["content"]
+        ))
+        # 调用方历史还原为纯文本 + images 路径（不残留 base64）
+        self.assertEqual(msgs[1]["content"], "看下这张图")
+        self.assertIsInstance(msgs[1]["content"], str)
+        self.assertEqual(msgs[1]["images"], [p])
+
+    def test_chat_non_vision_with_images_raises(self):
+        client = dc.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-v4-flash")
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.png")
+            with open(p, "wb") as f:
+                f.write(_make_png_bytes())
+            msgs = [{"role": "user", "content": "hi", "images": [p]}]
+            with self.assertRaises(ValueError):
+                client.chat(msgs, tools_enabled=False)
+
+
 if __name__ == "__main__":
     unittest.main()

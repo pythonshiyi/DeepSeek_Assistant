@@ -199,7 +199,7 @@ logging.basicConfig(
 )
 # DEFAULT_SYSTEM_PROMPT / DIALOG_SYSTEM_PROMPT / BUILTIN_TOOL_NAMES / DEFAULT_CONFIG
 # 已移至 config_defaults.py
-VERSION = "2.24.0"
+VERSION = "2.25.0"
 
 # ROLES 已移至 roles.py
 # PLAYGROUND_TASKS / TASK_TEMPLATES 已移至 templates.py
@@ -347,8 +347,10 @@ class AssistantApp:
         self._ui_queue = queue.Queue()
         self._poller_id = None
         self._pending_sends = []
+        self._pending_images = []  # 输入区待发送的图片附件（本地绝对路径或 http(s) URL）
         self._needs_compression = False
         self._resend_index = None
+        self._resend_images = []  # 编辑/重发时保留原消息的图片附件
         self._edit_assistant_idx = None
         self._search_open = False
         self._search_matches = []
@@ -3222,6 +3224,19 @@ class AssistantApp:
         # 产物条显示在输入框上方（后 pack 默认在下方）
         self.recent_bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
         self.recent_bar.pack_forget()  # 默认隐藏，有产物才显示
+        # ---- 图片附件条：待发送图片常驻显示（名称 + 移除），隐藏式，有附件才出现 ----
+        self.attach_bar = tk.Frame(card, bg=t["panel"])
+        self._restyle.append((self.attach_bar, "panel"))
+        self.attach_bar_lbl = self._lbl(
+            self.attach_bar, "", role="label_accent", bg="panel", font=(FONT_FAMILY, 9)
+        )
+        self.attach_bar_lbl.pack(side="left", padx=(14, 0))
+        self.attach_bar_clear = self._mk_button(
+            self.attach_bar, "全部移除", self._clear_pending_images, fsz=9
+        )
+        self.attach_bar_clear.pack(side="right", padx=(6, 14))
+        self.attach_bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
+        self.attach_bar.pack_forget()  # 默认隐藏，有待发图片才显示
         self._refresh_line_px()
         self._restore_input_height()
         self.input_text.bind("<Return>", self.on_enter)
@@ -3284,6 +3299,8 @@ class AssistantApp:
         self.btn_prompts.pack(side="left", padx=(10, 0))
         self.btn_dir = self._mk_button(foot, "📁 目录", self.choose_working_dir, fsz=9)
         self.btn_dir.pack(side="left", padx=(6, 0))
+        self.btn_attach = self._mk_button(foot, "🖼 图片", self._attach_images_dialog, fsz=9)
+        self.btn_attach.pack(side="left", padx=(6, 0))
         self.btn_stop = self._mk_button(foot, "■ 停止", self.stop_generate, kind="danger", fsz=10)
         self.btn_stop.configure(state="disabled")
         self.btn_stop.pack(side="right")
@@ -10354,6 +10371,8 @@ class AssistantApp:
         self._ctx_counts = None  # 新会话重新计数
         self.last_usage = None
         self._pending_sends = []
+        self._pending_images = []
+        self._refresh_attach_bar()
         self._needs_compression = False
         self._round_aborted = False
         self._resend_index = None
@@ -10435,7 +10454,9 @@ class AssistantApp:
             self._flash_status("输入为空，未发送")
             return
         if self.busy:
-            self._pending_sends.append(text)
+            self._pending_sends.append((text, list(self._pending_images)))
+            self._pending_images = []
+            self._refresh_attach_bar()
             self.input_text.delete("1.0", "end")
             if self.stop_event:
                 self.stop_event.set()
@@ -10450,6 +10471,19 @@ class AssistantApp:
             self._flash_status("正在完成会话渲染，稍后自动发送…", 2000)
             return
         cfg = self.save_widgets_to_config()
+        # 待发送图片：捕获后发送；无 Key 等早退路径不消费（附件保留待重试）
+        images = list(self._ensure_pending_images())
+        if getattr(self, "_resend_images", None):
+            # 编辑重发/重新生成：保留原消息携带的图片附件
+            images = list(dict.fromkeys(list(images) + self._resend_images))
+            self._resend_images = []
+        if images and not _dc.is_vision_model(
+            self.model_combo.get().strip() or "deepseek-v4-flash"
+        ):
+            self.model_combo.set(_dc.VISION_MODEL)
+            self._flash_status(
+                f"🖼 图片输入需要视觉模型，已自动切换到 {_dc.VISION_MODEL}", 3500
+            )
         self._capture_client_params()
         if not cfg["api_key"]:
             if silent:
@@ -10519,14 +10553,33 @@ class AssistantApp:
             note = "[编辑重发] 已替换原消息，正在重新生成回复。\n"
             self._append(note, "time")
             self.blocks.append(("note", note))
-        self._append_message_block("我", text, "user")
+        # 图片附件：渲染为 [图片] 行（真实图片经 chat() 内联为内容块发送）
+        body = text
+        if images:
+            self._pending_images = []
+            self._refresh_attach_bar()
+            img_lines = []
+            for p in images:
+                if str(p).lower().startswith(("http://", "https://")):
+                    img_lines.append(f"[图片] {p}")
+                else:
+                    img_lines.append(f"[图片] {os.path.basename(p)}")
+            body = text + "\n" + "\n".join(img_lines)
+        self._append_message_block("我", body, "user")
         session_hist = self._current.setdefault("sent_history", [])
         if not session_hist or session_hist[-1] != text:
             session_hist.append(text)
             if len(session_hist) > 200:
                 del session_hist[: len(session_hist) - 200]
         self._hist_index = None
-        self.messages.append({"role": "user", "content": text, "time": datetime.now().strftime("%H:%M:%S")})
+        msg = {
+            "role": "user",
+            "content": text,
+            "time": datetime.now().strftime("%H:%M:%S"),
+        }
+        if images:
+            msg["images"] = images
+        self.messages.append(msg)
         self._maybe_auto_name(text)
         # 相关文件读取与 token 全量估算移入 worker 线程：恢复长会话后的首次发送
         # 在主线程做 tiktoken 全量编码会冻结 UI 1-2s
@@ -11485,7 +11538,14 @@ class AssistantApp:
         if self._pending_sends:
             pending = list(self._pending_sends)
             self._pending_sends = []
-            for text in pending:
+            for item in pending:
+                if isinstance(item, tuple):
+                    text, imgs = item
+                    if imgs:
+                        self._pending_images = list(imgs)
+                        self._refresh_attach_bar()
+                else:
+                    text = item
                 self.send(text=text)
 
     def _insert_content(self, text, payload, tag, msg_idx, last_code_blocks, pos):
@@ -12614,7 +12674,13 @@ class AssistantApp:
             if role == "user":
                 header = f"[{datetime.now():%H:%M:%S}] 用户\n"
                 target.append(("note", header))
-                target.append(("user", (msg.get("content") or "") + "\n"))
+                user_body = (msg.get("content") or "") + "\n"
+                for p in (msg.get("images") or []):
+                    if str(p).lower().startswith(("http://", "https://")):
+                        user_body += f"[图片] {p}\n"
+                    else:
+                        user_body += f"[图片] {os.path.basename(str(p))}\n"
+                target.append(("user", user_body))
                 target.append(("plain", "\n"))
             elif role == "assistant":
                 header = f"[{datetime.now():%H:%M:%S}] 助手\n"
@@ -12648,6 +12714,7 @@ class AssistantApp:
         for i in range(len(self.messages) - 1, 0, -1):
             if self.messages[i].get("role") == "user":
                 self._resend_index = i
+                self._resend_images = list(self.messages[i].get("images") or [])
                 self._clear_placeholder()
                 self.input_text.delete("1.0", "end")
                 self.input_text.insert("1.0", self.messages[i].get("content", ""))
@@ -12684,6 +12751,7 @@ class AssistantApp:
                 text = self.messages[i].get("content", "")
                 saved = self._save_last_assistant_variant()
                 self._resend_index = None  # 重新生成会自行裁剪，清掉残留重发索引防止 send() 二次误删
+                self._resend_images = list(self.messages[i].get("images") or [])
                 del self.messages[i:]
                 self.rebuild_view_from_messages()
                 note = (
@@ -14907,11 +14975,19 @@ class AssistantApp:
         if not paths:
             return
         self._clear_placeholder()
+        # 图片文件 → 附加为视觉输入（真实图片，非文本）
+        img_paths = [p for p in paths if p.lower().endswith(_dc.IMAGE_EXTENSIONS)]
+        if img_paths:
+            self._attach_image_paths(img_paths[:10])
+        txt_paths = [p for p in paths if not p.lower().endswith(_dc.IMAGE_EXTENSIONS)]
+        if not txt_paths:
+            self.input_text.focus_set()
+            return
         parts = []
         existing = self.input_text.get("1.0", "end-1c").strip()
         if existing:
             parts.append(existing)
-        for path in paths[:3]:
+        for path in txt_paths[:3]:
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read(8000)
@@ -14923,7 +14999,10 @@ class AssistantApp:
         self.input_text.delete("1.0", "end")
         self.input_text.insert("1.0", "\n\n".join(parts))
         self.input_text.focus_set()
-        self._flash_status(f"已附加 {len(paths)} 个文件")
+        if img_paths:
+            self._flash_status(f"已附加 {len(img_paths)} 张图片 + {len(txt_paths)} 个文件", 3000)
+        else:
+            self._flash_status(f"已附加 {len(paths)} 个文件")
         return "break"
 
     def _menu_speak_message(self):
@@ -15007,10 +15086,127 @@ class AssistantApp:
     def _hide_slash_menu(self):
         pass  # tk_popup 会自动处理；这里保留接口便于后续扩展
 
-    def _paste_image_from_clipboard(self, _event=None):
-        """把剪贴板图片保存到工作区并插入 Markdown 图片引用。"""
+    # ---- 图片附件（视觉模型输入）----
+    def _ensure_pending_images(self):
+        """确保 _pending_images 已初始化（防御：任何入口首次访问都安全）。"""
+        if not hasattr(self, "_pending_images"):
+            self._pending_images = []
+        return self._pending_images
+
+    def _attach_image_paths(self, paths):
+        """把一组图片路径加入待发送附件（去重 + 格式/大小校验）。"""
+        import os as _os
+
+        self._ensure_pending_images()
+        if not paths:
+            return
+        added = 0
+        for p in paths:
+            p = str(p).strip()
+            if not p:
+                continue
+            if p in self._pending_images:
+                continue
+            if p.lower().startswith(("http://", "https://")):
+                self._pending_images.append(p)
+                added += 1
+                continue
+            if not _os.path.isfile(p):
+                self._flash_status(f"图片不存在：{p}", 2500)
+                continue
+            low = p.lower()
+            if not low.endswith(_dc.IMAGE_EXTENSIONS):
+                self._flash_status(f"不支持的图片格式（支持 JPEG/PNG/GIF/WebP）：{_os.path.basename(p)}", 3000)
+                continue
+            try:
+                if _os.path.getsize(p) > _dc.IMAGE_MAX_BYTES:
+                    self._flash_status(
+                        f"图片超过 32MB，请先压缩：{_os.path.basename(p)}", 3000
+                    )
+                    continue
+            except OSError:
+                pass
+            self._pending_images.append(p)
+            added += 1
+        if added:
+            self._refresh_attach_bar()
+            model = self.model_combo.get().strip() or "deepseek-v4-flash"
+            if not _dc.is_vision_model(model):
+                self._flash_status(
+                    f"已附加 {added} 张图片（发送时自动切换到视觉模型 {_dc.VISION_MODEL}）", 4000
+                )
+            else:
+                self._flash_status(f"已附加 {added} 张图片", 2500)
+
+    def _attach_images_dialog(self):
+        from tkinter import filedialog
+
+        paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="选择图片（JPEG/PNG/GIF/WebP）",
+            filetypes=[
+                ("图片文件", "*.jpg *.jpeg *.png *.gif *.webp"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if paths:
+            self._attach_image_paths(list(paths))
+
+    def _remove_pending_image(self, idx):
         try:
-            from PIL import ImageGrab, Image
+            self._pending_images.pop(idx)
+        except (IndexError, ValueError):
+            return
+        self._refresh_attach_bar()
+
+    def _clear_pending_images(self):
+        if not self._pending_images:
+            return
+        n = len(self._pending_images)
+        self._pending_images = []
+        self._refresh_attach_bar()
+        self._flash_status(f"已移除 {n} 张待发送图片", 2000)
+
+    def _refresh_attach_bar(self):
+        """根据待发送图片刷新附件条（名称 + 移除按钮）。"""
+        self._ensure_pending_images()
+        try:
+            bar = getattr(self, "attach_bar", None)
+            if bar is None or not bar.winfo_exists():
+                return
+            for w in bar.winfo_children():
+                if w is not self.attach_bar_lbl and w is not self.attach_bar_clear:
+                    w.destroy()
+            if not self._pending_images:
+                bar.pack_forget()
+                return
+            n = len(self._pending_images)
+            total = 0
+            for p in self._pending_images:
+                try:
+                    total += os.path.getsize(p)
+                except OSError:
+                    pass
+            bar.pack(side="top", before=self.input_text, fill="x", padx=14, pady=(8, 0))
+            self.attach_bar_lbl.config(
+                text=f"图片 {n} 张{(' · 共 %.1f MB' % (total / 1024 / 1024)) if total else ''}："
+            )
+            for i, p in enumerate(self._pending_images):
+                name = os.path.basename(str(p)) if not str(p).lower().startswith(("http://", "https://")) else str(p)[:60]
+                tag = tk.Label(
+                    bar, text=f" {name} ✕", bg=self._theme()["surface"],
+                    fg=self._theme()["text"], cursor="hand2",
+                    font=(FONT_FAMILY, 8), padx=6, pady=1,
+                )
+                tag.pack(side="left", padx=(4, 0))
+                tag.bind("<Button-1>", lambda _e, i=i: self._remove_pending_image(i))
+        except tk.TclError:
+            pass
+
+    def _paste_image_from_clipboard(self, _event=None):
+        """把剪贴板图片保存到工作区并加入待发送图片附件（视觉模型输入）。"""
+        try:
+            from PIL import ImageGrab
         except ImportError:
             self._toast("粘贴图片需要 Pillow，请先安装：pip install Pillow")
             return
@@ -15023,10 +15219,9 @@ class AssistantApp:
             os.makedirs(img_dir, exist_ok=True)
             path = os.path.join(img_dir, f"pasted_{datetime.now():%Y%m%d_%H%M%S}.png")
             img.save(path, "PNG")
-            self._clear_placeholder()
-            self.input_text.insert("insert", f"![粘贴图片]({path})")
+            self._attach_image_paths([path])
             self.input_text.focus_set()
-            self._flash_status(f"已插入图片引用：{path}")
+            self._flash_status(f"已附加剪贴板图片：{path}")
         except Exception:
             logging.exception("粘贴剪贴板图片失败")
             self._toast("粘贴图片失败，请截图后重试（或用 Ctrl+Shift+Q 剪贴板即问）")

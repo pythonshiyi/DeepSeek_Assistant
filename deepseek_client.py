@@ -184,7 +184,143 @@ MODELS = {
         "max_context_tokens": 1_000_000,
         "max_output_tokens": 384 * 1024,
     },
+    "deepseek-v4-flash-vision-exp": {
+        "label": "DeepSeek V4 Flash Vision (实验)",
+        "version": "DeepSeek-V4-Flash-Vision-Exp",
+        "max_context_tokens": 1_000_000,
+        "max_output_tokens": 384 * 1024,
+        "vision": True,
+    },
 }
+
+VISION_MODEL = "deepseek-v4-flash-vision-exp"
+
+# 图片内联限制（官方图像理解文档）：单张 ≤ 32 MiB，请求体 ≤ 48 MiB。
+# base64 开销 4/3，留出文本/工具 schema 余量后按 40 MiB 计入。
+IMAGE_MAX_BYTES = 32 * 1024 * 1024
+IMAGE_INLINE_TOTAL_BASE64 = 40 * 1024 * 1024
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+
+def is_vision_model(model):
+    """判断模型是否支持图片输入（视觉模型）。"""
+    if not model:
+        return False
+    if "vision" in str(model).lower():
+        return True
+    return bool((MODELS.get(model) or {}).get("vision"))
+
+
+def _detect_image_mime(buf):
+    """按文件实际内容（魔数）识别图片 MIME，不依赖文件名/声明类型。"""
+    if buf[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if buf[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if buf[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+def _is_image_path(p):
+    low = str(p or "").lower()
+    return low.endswith(IMAGE_EXTENSIONS) or low.startswith(("http://", "https://"))
+
+
+def embed_message_images(messages, model, _log=None):
+    """把 user 消息中的 images（本地路径或 http(s) 图片 URL）内联为 image_url 内容块。
+
+    - 仅对消息的浅拷贝生效，不修改调用方内存中的消息对象（UI/存档保持文本 content）；
+    - 模型不支持视觉时抛 ValueError（附中文提示，UI 层会切换视觉模型）；
+    - 单张 ≤32 MiB、base64 总量 ≤40 MiB，超限抛 ValueError 提示压缩；
+    - 图片仅出现在 user 消息中（官方限制：system/assistant 携带图片返回 400）。
+    """
+    import base64
+
+    if _log is None:
+        _log = logger
+    has_image = any(
+        isinstance(m, dict) and m.get("images") and m.get("role") == "user"
+        for m in messages
+    )
+    if not has_image:
+        return messages
+    if not is_vision_model(model):
+        raise ValueError(
+            f"当前模型 {model} 不支持图片输入，请切换到视觉模型 {VISION_MODEL}"
+        )
+    out = []
+    total_b64 = 0
+    for m in messages:
+        imgs = m.get("images")
+        if not (imgs and m.get("role") == "user"):
+            out.append(m)
+            continue
+        m = dict(m)
+        blocks = []
+        text = m.get("content")
+        if text:
+            blocks.append({"type": "text", "text": str(text)})
+        for p in imgs:
+            try:
+                if str(p).strip().lower().startswith(("http://", "https://")):
+                    url = p
+                    err = _safe_url(url)
+                    if err:
+                        raise ValueError(f"图片 URL 不安全：{err}")
+                    with _safe_stream("GET", url, timeout=20) as resp:
+                        resp.raise_for_status()
+                        raw = b""
+                        for chunk in resp.iter_bytes(64 * 1024):
+                            raw += chunk
+                            if len(raw) > IMAGE_MAX_BYTES:
+                                raise ValueError(
+                                    f"图片下载超过 {IMAGE_MAX_BYTES // (1024 * 1024)}MB，请先压缩"
+                                )
+                        mime = _detect_image_mime(raw[:16])
+                        b64 = base64.b64encode(raw).decode("ascii")
+                    blocks.append(
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                    )
+                    total_b64 += len(b64)
+                else:
+                    local = p
+                    if os.path.isfile(local) and not os.path.isabs(local):
+                        local = os.path.abspath(local)
+                    if not os.path.isfile(local):
+                        raise ValueError(f"图片文件不存在：{p}")
+                    try:
+                        size = os.path.getsize(local)
+                    except OSError as e:
+                        raise ValueError(f"图片文件读取失败：{p}: {e}")
+                    if size > IMAGE_MAX_BYTES:
+                        raise ValueError(
+                            f"图片超过 {IMAGE_MAX_BYTES // (1024 * 1024)}MB，请先用 image_process 压缩：{os.path.basename(p)}"
+                        )
+                    with open(local, "rb") as f:
+                        raw = f.read()
+                    b64 = base64.b64encode(raw).decode("ascii")
+                    blocks.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{_detect_image_mime(raw[:16])};base64,{b64}"
+                            },
+                        }
+                    )
+                    total_b64 += len(b64)
+            except Exception as e:
+                raise ValueError(f"图片 {p} 处理失败: {e}")
+        if total_b64 > IMAGE_INLINE_TOTAL_BASE64:
+            raise ValueError("本轮图片总量过大（超过请求体限制），请减少图片或先压缩")
+        if not blocks:
+            blocks.append({"type": "text", "text": ""})
+        m["content"] = blocks
+        out.append(m)
+    _log.info("已内联 %d 条消息的图片（base64 共 %.1f MB）", len(out), total_b64 / 1024 / 1024)
+    return out
 
 THINKING_MODES = {
     "none": "禁用思考 (none)",
@@ -220,7 +356,15 @@ def _auto_effort(work):
     text = ""
     for m in reversed(work):
         if m.get("role") == "user" and m.get("content"):
-            text = str(m["content"])
+            c = m["content"]
+            if isinstance(c, list):
+                text = " ".join(
+                    str(b.get("text", ""))
+                    for b in c
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            else:
+                text = str(c)
             break
     score = 0
     if len(text) > 300:
@@ -1399,7 +1543,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "image_understand",
-            "description": "用多模态模型理解图片（本地文件路径或 http(s) 图片 URL，需当前端点支持视觉；不支持时提示切换模型）",
+            "description": "用多模态模型理解图片（本地文件路径或 http(s) 图片 URL）。当前模型不支持视觉时自动改用 deepseek-v4-flash-vision-exp，无需手动切换",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -6108,7 +6252,11 @@ def batch_rename(directory, pattern, replacement, dry_run=False):
 
 # ---------- 媒体感知：图片理解 / 屏幕截图 / 语音识别 ----------
 def image_understand(path, question=""):
-    """用多模态模型理解图片（本地文件或 http(s) 图片 URL）。"""
+    """用多模态模型理解图片（本地文件或 http(s) 图片 URL）。
+
+    自动适配视觉模型：当前客户端模型不支持图片时，自动改用
+    deepseek-v4-flash-vision-exp（同一 API Key / 端点），无需手动切换。
+    """
     if not str(path or "").strip():
         return "错误：path 必填"
     import base64
@@ -6126,8 +6274,8 @@ def image_understand(path, question=""):
         if not ok:
             return reason
         try:
-            if os.path.getsize(p) > 8 * 1024 * 1024:
-                return "错误：图片超过 8MB，请先用 image_process 压缩"
+            if os.path.getsize(p) > 32 * 1024 * 1024:
+                return "错误：图片超过 32MB，请先用 image_process 压缩"
         except OSError:
             pass
     try:
@@ -6136,41 +6284,41 @@ def image_understand(path, question=""):
                 # stream 边读边断：URL 图片大小不可信，防恶意/超大图全量进内存
                 with _safe_stream("GET", path, timeout=20) as resp:
                     resp.raise_for_status()
-                    mime = (resp.headers.get("content-type") or "").split(";")[0] or "image/png"
                     img_buf = b""
                     truncated = False
                     for chunk in resp.iter_bytes(64 * 1024):
                         img_buf += chunk
-                        if len(img_buf) > 8 * 1024 * 1024:
+                        if len(img_buf) > 32 * 1024 * 1024:
                             truncated = True
                             break
                 if truncated:
-                    return "错误：图片下载超过 8MB，请先用 image_process 压缩"
+                    return "错误：图片下载超过 32MB，请先用 image_process 压缩"
                 b64 = base64.b64encode(img_buf).decode("ascii")
+                # 格式按文件实际内容（魔数）识别，而非声明的 MIME
+                mime = _detect_image_mime(img_buf[:16])
             except Exception as e:
                 return f"错误：图片下载失败: {e}"
         else:
             with open(p, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            mime = "image/png"
-            low = p.lower()
-            if low.endswith((".jpg", ".jpeg")):
-                mime = "image/jpeg"
-            elif low.endswith(".gif"):
-                mime = "image/gif"
-            elif low.endswith(".webp"):
-                mime = "image/webp"
+                raw = f.read()
+            b64 = base64.b64encode(raw).decode("ascii")
+            # 格式按文件实际内容（魔数）识别，而非文件名/扩展名
+            mime = _detect_image_mime(raw[:16])
         client = _CLIENT_HOLDER.get("client")
         if client is None:
             return "错误：没有可用客户端（请先完成一次对话建立连接）"
+        model, switched = client.model, False
+        if not is_vision_model(model):
+            model = VISION_MODEL
+            switched = True
         resp = client.client.chat.completions.create(
-            model=client.model,
+            model=model,
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
                         {"type": "text", "text": str(question or "请描述这张图片的内容")},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
                     ],
                 }
             ],
@@ -6181,6 +6329,8 @@ def image_understand(path, question=""):
         out = (resp.choices[0].message.content or "").strip()
         if not out:
             return "模型未返回内容（当前模型可能不支持图片输入，可配置支持视觉的模型端点）"
+        if switched:
+            out += f"\n\n（注：当前模型不支持图片，已自动改用视觉模型 {VISION_MODEL}）"
         return out
     except Exception as e:
         return f"错误：图片理解失败: {e}（当前模型可能不支持视觉输入，可切换支持视觉的模型端点）"
@@ -8861,6 +9011,19 @@ def check_balance(api_key, base_url=DEFAULT_BASE_URL, timeout=10.0):
     return response.json()
 
 
+def _restore_text_content(m):
+    """把发送时内联的图片内容块还原为纯文本 content（UI/存档只保留文本与图片路径）。"""
+    if not (isinstance(m, dict) and isinstance(m.get("content"), list)):
+        return m
+    text_parts = []
+    for b in m["content"]:
+        if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+            text_parts.append(b["text"])
+    m = dict(m)
+    m["content"] = "\n".join(text_parts)
+    return m
+
+
 def _prune_reasoning_for_send(messages):
     """发送时剥离「无工具调用轮次」的思考内容（官方多轮拼接规则）。
 
@@ -9044,7 +9207,9 @@ class DeepSeekClient:
         thinking_key = thinking if thinking in THINKING_MODES else "high"
 
         messages[:] = self._sanitize_messages(messages)
-        work = messages
+        # 图片内联：仅替换受影响的 user 消息副本；原始消息对象（content 文本 +
+        # images 路径）不受影响，chat() 结束时再同步回调用方（含新增 assistant/tool 消息）。
+        work = embed_message_images(messages, self.model)
         json_hint = None
         memory_msg = None
         # 缓存友好消息布局（官方硬盘缓存按「前缀完整匹配」命中）：
@@ -9054,7 +9219,7 @@ class DeepSeekClient:
         #   记忆刷新只破坏尾部单元，稳定前缀继续命中
         if json_output:
             json_hint = {"role": "system", "content": JSON_HINT_MESSAGE}
-            work = [json_hint] + messages
+            work = [json_hint] + work
         if memory_text:
             memory_msg = {"role": "system", "content": memory_text}
             work = work + [memory_msg]
@@ -9188,7 +9353,13 @@ class DeepSeekClient:
                     for i in range(len(req_msgs) - 1, -1, -1):
                         if req_msgs[i].get("role") == "user":
                             last = dict(req_msgs[i])
-                            last["content"] = str(last.get("content") or "") + "\n\n" + trailing
+                            if isinstance(last.get("content"), list):
+                                # 图片内联消息：动态上下文追加为 text 块
+                                last["content"] = list(last["content"]) + [
+                                    {"type": "text", "text": trailing}
+                                ]
+                            else:
+                                last["content"] = str(last.get("content") or "") + "\n\n" + trailing
                             req_msgs[i] = last
                             break
                     else:
@@ -9582,16 +9753,13 @@ class DeepSeekClient:
                 )
             return True
         finally:
-            if json_hint is not None or memory_msg is not None:
-                messages[:] = [
-                    (
-                        {k: v for k, v in m.items() if k != "prefix"}
-                        if isinstance(m, dict)
-                        else m
-                    )
-                    for m in work
-                    if m is not json_hint and m is not memory_msg
-                ]
+            # work 恒为独立列表：把新增的 assistant/tool 消息同步回调用方，
+            # 并将图片内联的消息还原为纯文本 content（UI/存档只保留文本 + images 路径）
+            messages[:] = [
+                _restore_text_content(m)
+                for m in work
+                if m is not json_hint and m is not memory_msg
+            ]
             for m in messages:
                 if isinstance(m, dict):
                     m.pop("prefix", None)

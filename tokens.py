@@ -42,6 +42,8 @@ def _message_tokens(msg):
     total = PER_MESSAGE_OVERHEAD
     total += estimate_text_tokens(msg.get("content") or "")
     total += estimate_text_tokens(msg.get("reasoning_content") or "")
+    # 视觉图片 token 估算：官方规则每张图片缩放后上限 384 token
+    total += 384 * (len(msg.get("images") or ()) if msg.get("images") else 0)
     for tc in msg.get("tool_calls") or ():
         if isinstance(tc, dict):
             fn = tc.get("function") or {}
