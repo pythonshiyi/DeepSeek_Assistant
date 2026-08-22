@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -1096,6 +1097,35 @@ class TestChatViewOptimization(unittest.TestCase):
             app._flush_files_panel_sync()
             rf.assert_called_once()
             self.assertIsNone(app._files_panel_sync_after)
+
+    # ---- 拖拽文件：引用不截断，模型自行读取 ----
+    def test_on_drop_reference_not_truncated(self):
+        """拖拽文本文件：仅插入路径引用，不读取不截断。"""
+        app = self.app
+        work = os.path.join(self.tmpdir, "drop")
+        os.makedirs(work, exist_ok=True)
+        p = os.path.join(work, "big.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("内容" * 5000)  # 远超 8000 字符
+        ev = types.SimpleNamespace(data=f"{{{p}}}")
+        app._on_drop(ev)
+        content = app.input_text.get("1.0", "end-1c")
+        self.assertIn(f"[文件] {p}", content)
+        self.assertNotIn("内容内容", content)      # 未内联文件内容
+        self.assertNotIn("截断前 8000", content)   # 不再截断提示
+
+    def test_relevant_files_skips_drop_marker(self):
+        """拖拽引用（[文件] 标记）不自动截断注入；普通路径提及仍注入。"""
+        app = self.app
+        work = os.path.join(self.tmpdir, "rel")
+        os.makedirs(work, exist_ok=True)
+        p = os.path.join(work, "a.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("内容" * 5000)  # > 6000 字符（原注入上限）
+        self.assertEqual(app._relevant_files_text(f"[文件] {p}"), "")
+        self.assertEqual(app._relevant_files_text(f"请看这个 [文件] {p} 的内容"), "")
+        r = app._relevant_files_text(f"帮我看看 {p} 的问题")
+        self.assertIn("a.md", r)
 
 
 if __name__ == "__main__":

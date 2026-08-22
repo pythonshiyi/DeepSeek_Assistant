@@ -6434,13 +6434,23 @@ class AssistantApp:
             pass
 
     def _relevant_files_text(self, text):
-        """从用户消息提取引用的本地文件（工作目录内优先），读取内容注入上下文。"""
+        """从用户消息提取引用的本地文件（工作目录内优先），读取内容注入上下文。
+
+        「[文件] 路径」拖拽引用不在此自动读取：由模型用 read_file 工具读取
+        完整内容（避免主动截断丢失信息）；其他路径提及仍自动注入（6000 字符上限）。
+        """
         base = self._get_active_dir()
         hits = []
         for mm in PATH_RE.finditer(text or ""):
             p = mm.group(0).rstrip("。.,;: \t")
-            if os.path.isfile(p) and permissions.check_filesystem(p, write=False)[0]:
-                hits.append(p)
+            if not os.path.isfile(p) or not permissions.check_filesystem(p, write=False)[0]:
+                continue
+            # 拖拽引用标记：跳过自动读取，交给模型 read_file（同行的多路径一并跳过）
+            line_start = text.rfind("\n", 0, mm.start()) + 1
+            prefix = text[line_start:mm.start()].lstrip()
+            if "[文件]" in prefix:
+                continue
+            hits.append(p)
         for mm in re.finditer(
             r"[\w\-\u4e00-\u9fff]+\.(?:md|py|txt|json|html|css|js|ts|yaml|yml|toml|ini|csv)",
             text or "",
@@ -15284,23 +15294,18 @@ class AssistantApp:
         existing = self.input_text.get("1.0", "end-1c").strip()
         if existing:
             parts.append(existing)
+        # 文本/文档文件：仅插入路径引用（不读取、不截断）——模型用 read_file
+        # 自行读取完整内容，避免「截断前 8000 字符」丢失信息
         for path in txt_paths[:3]:
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read(8000)
-                if len(content) >= 8000:
-                    content += "\n[文件较大，已截断前 8000 字符]"
-                parts.append(f"[文件] {os.path.basename(path)}:\n{content}")
-            except Exception as e:
-                parts.append(f"[文件] {path}: 读取失败: {e}")
+            parts.append(f"[文件] {path}")
         self.input_text.delete("1.0", "end")
         self.input_text.insert("1.0", "\n\n".join(parts))
         self.input_text.focus_set()
         if img_paths:
             extra = "" if img_attached >= len(img_paths) else f"（最多附加 10 张）"
-            self._flash_status(f"已附加 {img_attached} 张图片{extra} + {len(txt_paths)} 个文件", 3000)
+            self._flash_status(f"已附加 {img_attached} 张图片{extra} + {len(txt_paths)} 个文件引用（AI 将用 read_file 读取）", 3000)
         else:
-            self._flash_status(f"已附加 {len(paths)} 个文件")
+            self._flash_status(f"已添加 {len(txt_paths)} 个文件引用（AI 将用 read_file 读取，不再截断）", 3000)
         return "break"
 
     def _menu_speak_message(self):
