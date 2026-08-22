@@ -1020,6 +1020,83 @@ class TestChatViewOptimization(unittest.TestCase):
         self.assertEqual(app.btn_send.winfo_manager(), "pack")
         self.assertIsNone(app._stop_pulse_after)
 
+    # ---- 文件面板：跟踪最新产物 ----
+    def test_files_panel_retracks_new_files(self):
+        """展开目录能见到最新文件；新文件生成后再次展开可见（修复懒加载不刷新）。"""
+        app = self.app
+        work = os.path.join(self.tmpdir, "work")
+        os.makedirs(work, exist_ok=True)
+        with mock.patch.object(m, "WORKSPACE_DIR", work):
+            tree = app.files_tree
+            tree.delete(*tree.get_children())
+            tree.insert("", "end", iid="ws", text="📁 工作区", tags=("dir",))
+            tree.insert("ws", "end", text="…", tags=("placeholder",))
+            tree.selection_set("ws")
+            tree.focus("ws")
+            tree.item("ws", open=True)
+            app._on_files_open()
+            self.assertEqual(len(tree.get_children("ws")), 0)  # 空目录
+            # 生成新文件 → 收起再展开 → 可见
+            p = os.path.join(work, "report.md")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("# 报告")
+            tree.item("ws", open=False)
+            tree.item("ws", open=True)
+            app._on_files_open()
+            kids = tree.get_children("ws")
+            self.assertTrue(any(tree.item(k, "text") == "report.md" for k in kids))
+
+    def test_files_panel_recent_resync(self):
+        """最近产物节点重新展开包含新产物。"""
+        app = self.app
+        app._recent_cache = []
+        tree = app.files_tree
+        tree.delete(*tree.get_children())
+        tree.insert("", "end", iid="recent", text="⭐ 最近产物", tags=("dir",))
+        tree.insert("recent", "end", text="…", tags=("placeholder",))
+        tree.selection_set("recent")
+        tree.focus("recent")
+        tree.item("recent", open=True)
+        app._on_files_open()
+        self.assertEqual(len(tree.get_children("recent")), 0)
+        # 新产物入列 → 再展开可见
+        p = os.path.join(self.tmpdir, "gen.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("x")
+        app._recent_cache.insert(0, p)
+        tree.item("recent", open=False)
+        tree.item("recent", open=True)
+        app._on_files_open()
+        kids = tree.get_children("recent")
+        self.assertTrue(any(tree.item(k, "text") == "gen.txt" for k in kids))
+
+    def test_recent_output_schedules_panel_sync(self):
+        """新产物入列 → 安排文件面板自动同步；同路径已在首位则不再安排。"""
+        app = self.app
+        app._recent_cache = []
+        app._files_panel_sync_after = None
+        app._files_panel_dirty = False
+        p = os.path.join(self.tmpdir, "a.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("x")
+        with mock.patch.object(app, "_schedule_files_panel_sync") as sched:
+            app._record_recent_output(f"已保存至 {p}")
+        self.assertTrue(sched.called)
+        with mock.patch.object(app, "_schedule_files_panel_sync") as sched2:
+            app._record_recent_output(f"已保存至 {p}")
+        self.assertFalse(sched2.called)
+
+    def test_panel_sync_debounce(self):
+        """自动同步防抖：多次调度只刷新一次。"""
+        app = self.app
+        with mock.patch.object(app, "_refresh_files_open_nodes") as rf:
+            app._schedule_files_panel_sync()
+            app._schedule_files_panel_sync()
+            self.assertIsNotNone(app._files_panel_sync_after)
+            app._flush_files_panel_sync()
+            rf.assert_called_once()
+            self.assertIsNone(app._files_panel_sync_after)
+
 
 if __name__ == "__main__":
     unittest.main()

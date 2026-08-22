@@ -2089,6 +2089,8 @@ class AssistantApp:
                 self.panel_settings_body.pack_forget()
                 self.panel_files_body.pack(fill="both", expand=True, padx=8, pady=8)
                 self.side_panel.configure(width=LAYOUT["panel_files_w"])  # pack_propagate(False)：widget width 生效
+                # 切到「文件」Tab：同步已展开节点，展示最新文件（含工具刚生成的产物）
+                self._refresh_files_open_nodes()
             else:
                 self.panel_files_body.pack_forget()
                 self.panel_settings_body.pack(fill="both", expand=True, padx=14, pady=10)
@@ -2243,7 +2245,11 @@ class AssistantApp:
         return None
 
     def _on_files_open(self, event=None):
-        """展开目录时懒加载子项（占位节点替换为真实内容）。"""
+        """展开目录时懒加载子项（占位节点替换为真实内容）。
+
+        每次展开都重新同步（而非仅在占位符存在时填充）：工具生成新文件后，
+        重新展开即可看到最新内容，避免「文件区找不到新产物」。
+        """
         try:
             tree = self.files_tree
             sel = tree.selection()
@@ -2251,25 +2257,76 @@ class AssistantApp:
             if not iid:
                 return
             if iid == "recent":
-                # 最近产物：填充真实存在的文件。
+                # 最近产物：每次展开都从 _recent_cache 重新同步（含新产物）。
                 # iid 直接存完整路径（绝对路径）：_files_entry_path 能直接解析，
                 # 否则 parent=recent 返回 None 导致双击无反应（真实 bug）
                 children = tree.get_children(iid)
-                if children and tree.item(children[0], "tags") == ("placeholder",):
+                if children:
                     tree.delete(*children)
-                    for p in self._recent_cache:
-                        if os.path.exists(p):
-                            tree.insert(iid, "end", iid=p, text=os.path.basename(p), tags=("file",))
+                for p in self._recent_cache:
+                    if os.path.exists(p):
+                        tree.insert(iid, "end", iid=p, text=os.path.basename(p), tags=("file",))
                 return
             path = self._files_entry_path(iid)
             if not path or not os.path.isdir(path):
                 return
             children = tree.get_children(iid)
-            if children and tree.item(children[0], "tags") == ("placeholder",):
+            if children:
                 tree.delete(*children)
-                self._fill_files_dir(iid, path)
+            self._fill_files_dir(iid, path)
         except tk.TclError:
             pass
+
+    def _refresh_files_open_nodes(self):
+        """同步文件面板中已展开的节点（保持展开状态，不重建整树）。
+
+        用于：切换到「文件」Tab 时、以及工具产出新文件后的自动跟踪。
+        仅刷新展开的根节点（工作区/草稿箱/最近产物/数据目录）——用户看哪
+        刷新哪，避免整树重建导致折叠状态丢失。
+        """
+        tree = getattr(self, "files_tree", None)
+        if tree is None:
+            return
+        for iid in tree.get_children(""):
+            try:
+                if not tree.item(iid, "open"):
+                    continue
+                if iid == "recent":
+                    children = tree.get_children(iid)
+                    if children:
+                        tree.delete(*children)
+                    for p in self._recent_cache:
+                        if os.path.exists(p):
+                            tree.insert(iid, "end", iid=p, text=os.path.basename(p), tags=("file",))
+                    continue
+                path = self._files_entry_path(iid)
+                if path and os.path.isdir(path):
+                    children = tree.get_children(iid)
+                    if children:
+                        tree.delete(*children)
+                    self._fill_files_dir(iid, path)
+            except tk.TclError:
+                pass
+
+    def _schedule_files_panel_sync(self):
+        """工具产出新文件后的自动跟踪（防抖 500ms，避免工具链高频触发）。"""
+        self._files_panel_dirty = True
+        if getattr(self, "_files_panel_sync_after", None) is not None:
+            return
+        try:
+            self._files_panel_sync_after = self.root.after(500, self._flush_files_panel_sync)
+        except Exception:
+            self._files_panel_sync_after = None
+
+    def _flush_files_panel_sync(self):
+        self._files_panel_sync_after = None
+        if not getattr(self, "_files_panel_dirty", False):
+            return
+        self._files_panel_dirty = False
+        try:
+            self._refresh_files_open_nodes()
+        except Exception:
+            logging.exception("文件面板自动同步失败")
 
     def _fill_files_dir(self, iid, path):
         """填充目录子项（目录/文件混排，跳过隐藏项）。"""
@@ -5648,11 +5705,13 @@ class AssistantApp:
 
         进程内缓存 + 标记脏位：只改内存，由 _flush_recent 统一落盘，
         避免每个工具结果在主线程做 2 读 1 写文件 IO（Agent 一轮几十次）。
+        有新路径入列时安排文件面板自动同步（防抖），让「文件区」跟上最新产物。
         """
         if self.cfg.get("privacy_mode"):
             return
         try:
             recent = self._recent_cache
+            new_paths = []
             for mm in PATH_RE.finditer(text or ""):
                 p = mm.group(0).rstrip("。.,;: \t")
                 if not os.path.exists(p):
@@ -5662,9 +5721,12 @@ class AssistantApp:
                         continue
                     recent.remove(p)
                 recent.insert(0, p)
+                new_paths.append(p)
             if len(recent) > 20:
                 del recent[20:]
-            self._recent_dirty = True
+            if new_paths:
+                self._recent_dirty = True
+                self._schedule_files_panel_sync()  # 文件面板自动跟踪新产物
             self._update_recent_bar()
         except Exception:
             pass
